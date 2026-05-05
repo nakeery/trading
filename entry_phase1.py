@@ -16,7 +16,9 @@ Usage:
     python amd_indicators.py
 """
 
+import sys
 import datetime
+import os
 import yfinance as yf
 import pandas as pd
 import ta
@@ -30,6 +32,7 @@ from matplotlib.gridspec import GridSpec
 TICKER       = "AMD"
 START_DATE   = "2018-01-01"
 END_DATE     = datetime.date.today().strftime("%Y-%m-%d")
+DATA_DIR     = "data"
 
 RSI_PERIODS  = [6, 14, 23]         # RSI periods
 MA_PERIODS   = [20, 50, 100, 200]       # Simple moving averages
@@ -117,6 +120,7 @@ def add_indicators(df):
 # 3. SIGNAL SUMMARY (latest bar)
 # ─────────────────────────────────────────
 def print_signal_summary(df):
+    
     latest = df.iloc[-1]
     date   = df.index[-1].strftime("%Y-%m-%d")
 
@@ -268,10 +272,11 @@ def plot_dashboard(df):
         rotation=30, ha="right", color="#8b949e", fontsize=7
     )
 
-    plt.savefig(f"{TICKER.lower()}_dashboard.png", dpi=150, bbox_inches="tight",
-                facecolor="#0d1117")
-    print(f"Chart saved → {TICKER.lower()}_dashboard.png")
-    plt.show()
+    plt.savefig(os.path.join(DATA_DIR, f"{TICKER.lower()}_dashboard.png"), dpi=150,
+                bbox_inches="tight", facecolor="#0d1117")
+    print(f"Chart saved -> {os.path.join(DATA_DIR, f'{TICKER.lower()}_dashboard.png')}")
+    if input("Show chart? (y/n): ").strip().lower() == "y":
+        plt.show()
 
 
 # ─────────────────────────────────────────
@@ -288,12 +293,17 @@ if __name__ == "__main__":
     START_DATE = start_in      or START_DATE
     END_DATE   = end_in        or END_DATE
 
-    df = fetch_data(TICKER, START_DATE, END_DATE)
+    try:
+        df = fetch_data(TICKER, START_DATE, END_DATE)
+    except Exception as e:
+        print(f"  ERROR: Failed to fetch data for {TICKER} -> {e}")
+        sys.exit(1)
+
     df = add_indicators(df)
     print_signal_summary(df)
     plot_dashboard(df)
 
     # Save full indicator table to CSV for Phase 2
     df["Ticker"] = TICKER
-    df.to_csv(f"{TICKER.lower()}_indicators.csv")
-    print(f"Full indicator data saved → {TICKER.lower()}_indicators.csv")
+    df.to_csv(os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv"))
+    print(f"Full indicator data saved -> {os.path.join(DATA_DIR, f'{TICKER.lower()}_indicators.csv')}")

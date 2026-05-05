@@ -16,6 +16,7 @@ Requirements:
     pip install yfinance pandas scikit-learn matplotlib
 """
 
+import os
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -30,7 +31,8 @@ from sklearn.metrics import classification_report, confusion_matrix, ConfusionMa
 TICKER         = "AMD"
 START_DATE     = "2018-01-01"
 END_DATE       = ""  # set automatically from CSV
-INDICATORS_CSV = f"{TICKER.lower()}_indicators.csv"
+DATA_DIR       = "data"
+INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 
 HV_WINDOW      = 20     # Rolling window for realized vol (trading days)
 FORWARD_DAYS   = 15     # Days ahead to evaluate win/loss
@@ -304,8 +306,9 @@ def plot_results(clf, X_test, y_test, y_pred, feature_cols):
     ax2.xaxis.label.set_color("#8b949e")
 
     plt.tight_layout()
-    plt.savefig(f"{TICKER.lower()}_ml_results.png", dpi=150, bbox_inches="tight", facecolor="#0d1117")
-    print(f"Results chart saved → {TICKER.lower()}_ml_results.png")
+    plt.savefig(os.path.join(DATA_DIR, f"{TICKER.lower()}_ml_results.png"), dpi=150,
+                bbox_inches="tight", facecolor="#0d1117")
+    print(f"Results chart saved -> {os.path.join(DATA_DIR, f'{TICKER.lower()}_ml_results.png')}")
     plt.show()
 
 
@@ -316,7 +319,7 @@ if __name__ == "__main__":
     ticker_in = input(f"  Ticker [{TICKER}]: ").strip().upper()
     if ticker_in:
         TICKER         = ticker_in
-        INDICATORS_CSV = f"{TICKER.lower()}_indicators.csv"
+        INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 
     df = load_indicators(INDICATORS_CSV)
 
@@ -331,5 +334,5 @@ if __name__ == "__main__":
     clf, X_test, y_test, y_pred, y_prob, feature_cols = train_model(df)
     plot_results(clf, X_test, y_test, y_pred, feature_cols)
 
-    df.to_csv(f"{TICKER.lower()}_ml_features.csv")
-    print(f"Enriched feature dataset saved → {TICKER.lower()}_ml_features.csv")
+    df.to_csv(os.path.join(DATA_DIR, f"{TICKER.lower()}_ml_features.csv"))
+    print(f"Enriched feature dataset saved -> {os.path.join(DATA_DIR, f'{TICKER.lower()}_ml_features.csv')}")

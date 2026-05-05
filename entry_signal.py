@@ -14,10 +14,13 @@ Requirements:
     pip install yfinance pandas scikit-learn
 """
 
+import sys
+import os
 import numpy as np
 import pandas as pd
 import yfinance as yf
 from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import precision_score
 from sklearn.preprocessing import StandardScaler
 
 # ─────────────────────────────────────────
@@ -26,7 +29,8 @@ from sklearn.preprocessing import StandardScaler
 TICKER         = "AMD"
 START_DATE     = "2018-01-01"
 END_DATE       = ""  # set automatically from CSV
-INDICATORS_CSV = f"{TICKER.lower()}_indicators.csv"
+DATA_DIR       = "data"
+INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 
 HV_WINDOW           = 20
 IV_RANK_WINDOW      = 252
@@ -46,7 +50,11 @@ RANDOM_STATE        = 42
 def load_indicators(path):
     global TICKER, START_DATE, END_DATE
     print(f"Loading indicators from {path}...")
-    df = pd.read_csv(path, index_col=0, parse_dates=True)
+    try:
+        df = pd.read_csv(path, index_col=0, parse_dates=True)
+    except FileNotFoundError:
+        print(f"  ERROR: File not found -> {path}")
+        sys.exit(1)
     df = df.sort_index()
     if "Adj Close" in df.columns:
         df.drop(columns=["Adj Close"], inplace=True)
@@ -56,7 +64,13 @@ def load_indicators(path):
     START_DATE = df.index.min().strftime("%Y-%m-%d")
     END_DATE   = df.index.max().strftime("%Y-%m-%d")
     print(f"  → Ticker: {TICKER} | {START_DATE} to {END_DATE}")
-    print(f"  → {len(df)} rows, {len(df.columns)} columns\n")
+    print(f"  → {len(df)} rows, {len(df.columns)} columns")
+    last_date = df.index.max()
+    today = pd.Timestamp.today().normalize()
+    days_old = np.busday_count(last_date.date(), today.date())
+    if days_old > 1:
+        print(f"  WARNING: CSV data is {days_old} trading day(s) old (last: {last_date.date()}). Re-run Phase 1 for a fresh signal.")
+    print()
     return df
 
 
@@ -172,10 +186,11 @@ def train(df, target_col):
                              max_iter=1000, random_state=RANDOM_STATE)
     clf.fit(X_train_s, y_train)
 
-    train_acc = (clf.predict(X_train_s) == y_train).mean()
-    test_acc  = (clf.predict(X_test_s)  == y_test).mean()
+    train_prec = precision_score(y_train, clf.predict(X_train_s), zero_division=0)
+    test_prec  = precision_score(y_test,  clf.predict(X_test_s),  zero_division=0)
+    base_rate  = y_train.mean()
 
-    return clf, scaler, feature_cols, train_acc, test_acc
+    return clf, scaler, feature_cols, train_prec, test_prec, base_rate
 
 
 def get_current_prob(df_full, clf, scaler, feature_cols):
@@ -184,10 +199,19 @@ def get_current_prob(df_full, clf, scaler, feature_cols):
     return clf.predict_proba(scaler.transform(X))[0, 1]
 
 
+def get_top_contributors(df_full, clf, scaler, feature_cols, n=3):
+    latest = df_full[feature_cols].dropna().iloc[-1]
+    X_scaled = scaler.transform(pd.DataFrame([latest], columns=feature_cols))[0]
+    contributions = clf.coef_[0] * X_scaled
+    top_idx = np.argsort(np.abs(contributions))[::-1][:n]
+    return [(feature_cols[i], contributions[i]) for i in top_idx]
+
+
 # ─────────────────────────────────────────
 # 4. COMBINED SIGNAL OUTPUT
 # ─────────────────────────────────────────
-def print_combined_signal(df_full, direction_prob, expansion_prob, iv_rank, iv_pct, hv_20):
+def print_combined_signal(df_full, direction_prob, expansion_prob, iv_rank, iv_pct, hv_20,
+                          dir_base_rate, exp_base_rate, dir_contributors, exp_contributors):
     latest_date = df_full.dropna().index[-1].strftime("%Y-%m-%d")
 
     dir_signal = direction_prob >= P2_THRESHOLD
@@ -200,7 +224,8 @@ def print_combined_signal(df_full, direction_prob, expansion_prob, iv_rank, iv_p
         detail = "Direction and IV both favorable — options cheap and vol likely rising."
     elif dir_signal and not exp_signal:
         recommendation = "CAUTION"
-        detail = "Direction favorable but IV crush risk — consider smaller size or wait for vol to fall."
+        contraction_prob = 1 - expansion_prob
+        detail = f"Direction favorable but IV crush risk ({contraction_prob:.0%} contraction probability) — consider smaller size or wait for vol to fall."
     elif not dir_signal and exp_signal:
         recommendation = "STAY OUT"
         detail = "Vol rising but no directional edge — wait for direction signal."
@@ -208,19 +233,28 @@ def print_combined_signal(df_full, direction_prob, expansion_prob, iv_rank, iv_p
         recommendation = "STAY OUT"
         detail = "Direction and IV both unfavorable — no entry."
 
-    w = 54
+    def fmt_contributors(contributors):
+        parts = []
+        for name, val in contributors:
+            direction = "+" if val > 0 else "-"
+            parts.append(f"{name} ({direction})")
+        return ", ".join(parts)
+
+    w = 58
     print(f"\n{'═'*w}")
     print(f"  COMBINED ENTRY SIGNAL — {TICKER} as of {latest_date}")
     print(f"{'═'*w}")
     print(f"\n  DIRECTION (Phase 2)  [threshold: {P2_THRESHOLD}]")
-    print(f"  Win Probability:    {direction_prob:.1%}")
+    print(f"  Win Probability:    {direction_prob:.1%}  (base rate: {dir_base_rate:.1%})")
     print(f"  Signal:             {'WIN ✓' if dir_signal else 'NO SIGNAL ✗'}")
+    print(f"  Drivers:            {fmt_contributors(dir_contributors)}")
     print(f"\n  IV TIMING (Phase 3)  [threshold: {P3_THRESHOLD}]")
     print(f"  HV (20-day):        {hv_20:.1%}")
     print(f"  IV Rank:            {iv_rank:.2f}  ({iv_regime})")
     print(f"  IV Percentile:      {iv_pct:.1%}")
-    print(f"  Expansion Prob:     {expansion_prob:.1%}")
+    print(f"  Expansion Prob:     {expansion_prob:.1%}  (base rate: {exp_base_rate:.1%})")
     print(f"  Signal:             {'EXPANSION ✓' if exp_signal else 'CONTRACTION ✗'}")
+    print(f"  Drivers:            {fmt_contributors(exp_contributors)}")
     print(f"\n  {'─'*w}")
     print(f"  RECOMMENDATION:     {recommendation}")
     print(f"  {detail}")
@@ -234,7 +268,7 @@ if __name__ == "__main__":
     ticker_in = input(f"  Ticker [{TICKER}]: ").strip().upper()
     if ticker_in:
         TICKER         = ticker_in
-        INDICATORS_CSV = f"{TICKER.lower()}_indicators.csv"
+        INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 
     df = load_indicators(INDICATORS_CSV)
     df_full = build_features(df)
@@ -244,20 +278,22 @@ if __name__ == "__main__":
     future_close = df_p2["Close"].shift(-P2_FORWARD_DAYS)
     df_p2["direction_target"] = ((future_close / df_p2["Close"] - 1) >= WIN_THRESHOLD).astype(int)
     df_p2 = df_p2.iloc[:-P2_FORWARD_DAYS]
-    clf2, scaler2, fcols2, tr2, te2 = train(df_p2, "direction_target")
-    print(f"Phase 2 (direction)  — train: {tr2:.1%}  test: {te2:.1%}")
+    clf2, scaler2, fcols2, tr2, te2, base2 = train(df_p2, "direction_target")
+    print(f"Phase 2 (direction)  — train precision: {tr2:.1%}  test precision: {te2:.1%}  base rate: {base2:.1%}")
 
     # Phase 3 — IV expansion target
     df_p3 = df_full.copy()
     future_hv = df_p3["HV_20"].shift(-P3_FORWARD_DAYS)
     df_p3["iv_target"] = ((future_hv / df_p3["HV_20"] - 1) >= EXPANSION_THRESHOLD).astype(int)
     df_p3 = df_p3.iloc[:-P3_FORWARD_DAYS]
-    clf3, scaler3, fcols3, tr3, te3 = train(df_p3, "iv_target")
-    print(f"Phase 3 (IV timing)  — train: {tr3:.1%}  test: {te3:.1%}\n")
+    clf3, scaler3, fcols3, tr3, te3, base3 = train(df_p3, "iv_target")
+    print(f"Phase 3 (IV timing)  — train precision: {tr3:.1%}  test precision: {te3:.1%}  base rate: {base3:.1%}\n")
 
     # Current signals
     direction_prob = get_current_prob(df_full, clf2, scaler2, fcols2)
     expansion_prob = get_current_prob(df_full, clf3, scaler3, fcols3)
+    dir_contributors = get_top_contributors(df_full, clf2, scaler2, fcols2)
+    exp_contributors = get_top_contributors(df_full, clf3, scaler3, fcols3)
 
     latest = df_full[["HV_20", "IV_rank", "IV_pct"]].dropna().iloc[-1]
     print_combined_signal(
@@ -267,4 +303,8 @@ if __name__ == "__main__":
         latest["IV_rank"],
         latest["IV_pct"],
         latest["HV_20"],
+        base2,
+        base3,
+        dir_contributors,
+        exp_contributors,
     )

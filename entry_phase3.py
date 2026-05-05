@@ -16,6 +16,7 @@ Requirements:
     pip install yfinance pandas scikit-learn matplotlib
 """
 
+import os
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -30,7 +31,8 @@ from sklearn.metrics import classification_report
 TICKER         = "AMD"
 START_DATE     = "2018-01-01"
 END_DATE       = ""  # set automatically from CSV
-INDICATORS_CSV = f"{TICKER.lower()}_indicators.csv"
+DATA_DIR       = "data"
+INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 
 HV_WINDOW           = 20    # Days for realized vol calculation
 IV_RANK_WINDOW      = 252   # 1 trading year lookback for IV rank/percentile
@@ -353,8 +355,9 @@ def plot_results(df_full, clf, feature_cols):
     ax2.xaxis.label.set_color("#8b949e")
 
     plt.tight_layout()
-    plt.savefig(f"{TICKER.lower()}_phase3_results.png", dpi=150, bbox_inches="tight", facecolor="#0d1117")
-    print(f"Results chart saved → {TICKER.lower()}_phase3_results.png")
+    plt.savefig(os.path.join(DATA_DIR, f"{TICKER.lower()}_phase3_results.png"), dpi=150,
+                bbox_inches="tight", facecolor="#0d1117")
+    print(f"Results chart saved -> {os.path.join(DATA_DIR, f'{TICKER.lower()}_phase3_results.png')}")
     plt.show()
 
 
@@ -365,7 +368,7 @@ if __name__ == "__main__":
     ticker_in = input(f"  Ticker [{TICKER}]: ").strip().upper()
     if ticker_in:
         TICKER         = ticker_in
-        INDICATORS_CSV = f"{TICKER.lower()}_indicators.csv"
+        INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 
     df = load_indicators(INDICATORS_CSV)
 
@@ -384,5 +387,5 @@ if __name__ == "__main__":
     print_signal_summary(df_full, clf, scaler, feature_cols)
     plot_results(df_full, clf, feature_cols)
 
-    df.to_csv(f"{TICKER.lower()}_phase3_features.csv")
-    print(f"Feature dataset saved → {TICKER.lower()}_phase3_features.csv")
+    df.to_csv(os.path.join(DATA_DIR, f"{TICKER.lower()}_phase3_features.csv"))
+    print(f"Feature dataset saved -> {os.path.join(DATA_DIR, f'{TICKER.lower()}_phase3_features.csv')}")
