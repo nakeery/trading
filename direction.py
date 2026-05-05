@@ -7,7 +7,7 @@ identify high-probability entry points for AMD 6-12 month call options.
 New features added:
   - HV_20: 20-day historical (realized) volatility, annualized
   - VIX level, 5-day change, distance from 20-day MA
-  - SOX relative strength vs AMD over 5 and 20 days
+  - Sector/industry benchmark relative strength over 5 and 20 days
   - Days to next earnings
 
 Target: Binary — AMD closes >= 5% higher 15 trading days from signal date
@@ -24,6 +24,7 @@ import matplotlib.pyplot as plt
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
+from benchmarks import detect_benchmarks
 
 # ─────────────────────────────────────────
 # CONFIG
@@ -87,17 +88,18 @@ def add_vix(df):
     return df
 
 
-def add_sox(df):
-    raw = yf.download("^SOX", start=START_DATE, end=END_DATE, progress=False)
-    raw.columns = raw.columns.get_level_values(0)
-    sox = raw[["Close"]].rename(columns={"Close": "SOX"})
-    df = df.join(sox, how="left")
-    df["SOX"] = df["SOX"].ffill()
-    # AMD excess return vs SOX — positive means AMD outperforming
-    for window in [5, 20]:
-        df[f"SOX_RS_{window}d"] = df["Close"].pct_change(window) - df["SOX"].pct_change(window)
-    df.drop(columns=["SOX"], inplace=True)
-    print("  ✓ SOX_RS_5d, SOX_RS_20d")
+def add_benchmarks(df, benchmarks):
+    for bench_ticker, bench_name in benchmarks:
+        raw = yf.download(bench_ticker, start=START_DATE, end=END_DATE, progress=False)
+        raw.columns = raw.columns.get_level_values(0)
+        col = f"_BENCH_{bench_name}"
+        bench = raw[["Close"]].rename(columns={"Close": col})
+        df = df.join(bench, how="left")
+        df[col] = df[col].ffill()
+        for window in [5, 20]:
+            df[f"{bench_name}_RS_{window}d"] = df["Close"].pct_change(window) - df[col].pct_change(window)
+        df.drop(columns=[col], inplace=True)
+        print(f"  ✓ {bench_name}_RS_5d, {bench_name}_RS_20d")
     return df
 
 
@@ -237,7 +239,7 @@ def train_model(df):
     # Threshold sweep — shows precision/recall tradeoff across candidate cutoffs
     print("─" * 60)
     print(f"THRESHOLD SWEEP  (base win rate: {y_test.mean():.1%})")
-    print(f"{'Threshold':>10}  {'Win Prec':>9}  {'Win Recall':>10}  {'Win F1':>7}  {'Signals':>8}")
+    print(f"{'Confidence':>10}  {'Win Prec':>9}  {'Win Recall':>10}  {'Win F1':>7}  {'Signals':>8}")
     print("─" * 60)
     thresholds = [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60]
     rows = []
@@ -251,9 +253,13 @@ def train_model(df):
         f1     = 2 * prec * recall / (prec + recall) if (prec + recall) > 0 else 0
         rows.append((t, prec, recall, f1, int(yp.sum())))
 
-    best_prec_threshold = max(rows, key=lambda r: r[1])[0]
+    base_rate = y_test.mean()
+    best_threshold = max(
+        rows,
+        key=lambda r: (r[1] - base_rate) * np.log(r[4] + 1) if r[1] > base_rate else 0
+    )[0]
     for t, prec, recall, f1, signals in rows:
-        marker = "  ◄ best precision" if t == best_prec_threshold else ""
+        marker = "  ◄ optimal" if t == best_threshold else ""
         print(f"{t:>10.2f}  {prec:>9.1%}  {recall:>10.1%}  {f1:>7.3f}  {signals:>8}{marker}")
     print("─" * 60)
 
@@ -323,10 +329,20 @@ if __name__ == "__main__":
 
     df = load_indicators(INDICATORS_CSV)
 
+    print(f"  Detecting benchmarks for {TICKER}...")
+    benchmarks = detect_benchmarks(TICKER)
+    for bt, bn in benchmarks:
+        print(f"    {bn} ({bt})")
+    default_str = ",".join(bt for bt, bn in benchmarks)
+    override = input(f"  Benchmarks [{default_str}]: ").strip().upper()
+    if override:
+        benchmarks = [(t.strip(), t.strip().lstrip("^")) for t in override.split(",")]
+    print()
+
     print("Building features...")
     df = add_hv(df)
     df = add_vix(df)
-    df = add_sox(df)
+    df = add_benchmarks(df, benchmarks)
     df = add_earnings_proximity(df)
     df = normalize_features(df)
     df = add_target(df)

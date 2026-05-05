@@ -22,6 +22,7 @@ import yfinance as yf
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import precision_score
 from sklearn.preprocessing import StandardScaler
+from benchmarks import detect_benchmarks
 
 # ─────────────────────────────────────────
 # CONFIG
@@ -77,7 +78,7 @@ def load_indicators(path):
 # ─────────────────────────────────────────
 # 2. FEATURE ENGINEERING
 # ─────────────────────────────────────────
-def build_features(df):
+def build_features(df, benchmarks):
     close = df["Close"]
 
     # HV and IV features
@@ -102,15 +103,17 @@ def build_features(df):
     df = df.join(vix, how="left")
     df[["VIX", "VIX_chg_5d", "VIX_vs_ma20"]] = df[["VIX", "VIX_chg_5d", "VIX_vs_ma20"]].ffill()
 
-    # SOX relative strength
-    raw = yf.download("^SOX", start=START_DATE, end=END_DATE, progress=False)
-    raw.columns = raw.columns.get_level_values(0)
-    sox = raw[["Close"]].rename(columns={"Close": "SOX"})
-    df = df.join(sox, how="left")
-    df["SOX"] = df["SOX"].ffill()
-    for window in [5, 20]:
-        df[f"SOX_RS_{window}d"] = close.pct_change(window) - df["SOX"].pct_change(window)
-    df.drop(columns=["SOX"], inplace=True)
+    # Sector/industry benchmark relative strength
+    for bench_ticker, bench_name in benchmarks:
+        raw = yf.download(bench_ticker, start=START_DATE, end=END_DATE, progress=False)
+        raw.columns = raw.columns.get_level_values(0)
+        col = f"_BENCH_{bench_name}"
+        bench = raw[["Close"]].rename(columns={"Close": col})
+        df = df.join(bench, how="left")
+        df[col] = df[col].ffill()
+        for window in [5, 20]:
+            df[f"{bench_name}_RS_{window}d"] = close.pct_change(window) - df[col].pct_change(window)
+        df.drop(columns=[col], inplace=True)
 
     # Earnings proximity
     ticker = yf.Ticker(TICKER)
@@ -216,22 +219,24 @@ def print_combined_signal(df_full, direction_prob, expansion_prob, iv_rank, iv_p
 
     dir_signal = direction_prob >= P2_THRESHOLD
     exp_signal = expansion_prob >= P3_THRESHOLD
+    contraction_prob = 1 - expansion_prob
 
     iv_regime = "Low IV" if iv_rank < 0.33 else "High IV" if iv_rank > 0.67 else "Mid IV"
 
-    if dir_signal and exp_signal:
-        recommendation = "STRONG ENTRY"
-        detail = "Direction and IV both favorable — options cheap and vol likely rising."
-    elif dir_signal and not exp_signal:
-        recommendation = "CAUTION"
-        contraction_prob = 1 - expansion_prob
-        detail = f"Direction favorable but IV crush risk ({contraction_prob:.0%} contraction probability) — consider smaller size or wait for vol to fall."
-    elif not dir_signal and exp_signal:
-        recommendation = "STAY OUT"
-        detail = "Vol rising but no directional edge — wait for direction signal."
+    # Entry decision driven by Phase 2 alone
+    entry = "ENTER" if dir_signal else "STAY OUT"
+
+    # Position sizing driven by Phase 3
+    if dir_signal:
+        if exp_signal:
+            sizing      = "FULL"
+            sizing_note = f"IV {iv_regime.lower()} and vol likely rising — premium affordable and expanding."
+        else:
+            sizing      = "REDUCED"
+            sizing_note = f"IV {iv_regime.lower()} with {contraction_prob:.0%} contraction probability — limit exposure to premium decay."
     else:
-        recommendation = "STAY OUT"
-        detail = "Direction and IV both unfavorable — no entry."
+        sizing      = "N/A"
+        sizing_note = "No directional edge — wait for Phase 2 signal before sizing."
 
     def fmt_contributors(contributors):
         parts = []
@@ -256,8 +261,9 @@ def print_combined_signal(df_full, direction_prob, expansion_prob, iv_rank, iv_p
     print(f"  Signal:             {'EXPANSION ✓' if exp_signal else 'CONTRACTION ✗'}")
     print(f"  Drivers:            {fmt_contributors(exp_contributors)}")
     print(f"\n  {'─'*w}")
-    print(f"  RECOMMENDATION:     {recommendation}")
-    print(f"  {detail}")
+    print(f"  ENTRY DECISION:     {entry}")
+    print(f"  POSITION SIZING:    {sizing}")
+    print(f"  {sizing_note}")
     print(f"{'═'*w}\n")
 
 
@@ -271,7 +277,18 @@ if __name__ == "__main__":
         INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 
     df = load_indicators(INDICATORS_CSV)
-    df_full = build_features(df)
+
+    print(f"  Detecting benchmarks for {TICKER}...")
+    benchmarks = detect_benchmarks(TICKER)
+    for bt, bn in benchmarks:
+        print(f"    {bn} ({bt})")
+    default_str = ",".join(bt for bt, bn in benchmarks)
+    override = input(f"  Benchmarks [{default_str}]: ").strip().upper()
+    if override:
+        benchmarks = [(t.strip(), t.strip().lstrip("^")) for t in override.split(",")]
+    print()
+
+    df_full = build_features(df, benchmarks)
 
     # Phase 2 — direction target
     df_p2 = df_full.copy()

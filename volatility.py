@@ -237,7 +237,7 @@ def train_model(df):
     # Threshold sweep
     print("─" * 65)
     print(f"THRESHOLD SWEEP  (base expansion rate: {test_base:.1%})")
-    print(f"{'Threshold':>10}  {'Exp Prec':>9}  {'Exp Recall':>10}  {'Exp F1':>7}  {'Signals':>8}")
+    print(f"{'Confidence':>10}  {'Exp Prec':>9}  {'Exp Recall':>10}  {'Exp F1':>7}  {'Signals':>8}")
     print("─" * 65)
     thresholds = [0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60]
     rows = []
@@ -251,9 +251,13 @@ def train_model(df):
         f1     = 2 * prec * recall / (prec + recall) if (prec + recall) > 0 else 0
         rows.append((t, prec, recall, f1, int(yp.sum())))
 
-    best_prec_threshold = max(rows, key=lambda r: r[1])[0]
+    base_rate = y_test.mean()
+    best_threshold = max(
+        rows,
+        key=lambda r: (r[1] - base_rate) * np.log(r[4] + 1) if r[1] > base_rate else 0
+    )[0]
     for t, prec, recall, f1, signals in rows:
-        marker = "  ◄ best precision" if t == best_prec_threshold else ""
+        marker = "  ◄ optimal" if t == best_threshold else ""
         print(f"{t:>10.2f}  {prec:>9.1%}  {recall:>10.1%}  {f1:>7.3f}  {signals:>8}{marker}")
     print("─" * 65)
 
