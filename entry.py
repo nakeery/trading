@@ -37,8 +37,10 @@ HV_WINDOW           = 20
 IV_RANK_WINDOW      = 252
 P2_FORWARD_DAYS     = 15    # Phase 2: direction window
 P3_FORWARD_DAYS     = 10    # Phase 3: IV expansion window
-WIN_THRESHOLD       = 0.05  # Phase 2: 5% gain = win
-EXPANSION_THRESHOLD = 0.10  # Phase 3: 10% HV rise = expansion
+WIN_THRESHOLD       = 0.05  # Default (AMD). Overridden at runtime by compute_vol_thresholds()
+P2_VOL_MULTIPLE     = 0.41  # 0.41 sigma bar — practical range: 0.25 (aggressive) to 1.0 (conservative)
+EXPANSION_THRESHOLD = 0.10  # Default (AMD). Overridden at runtime by compute_vol_thresholds()
+P3_VOL_MULTIPLE     = 0.20  # Sets expansion bar at 20% of median HV — practical range: 0.10 to 0.40
 TEST_SIZE           = 0.20
 P2_THRESHOLD        = 0.55  # Direction signal cutoff (best precision from Phase 2)
 P3_THRESHOLD        = 0.60  # IV expansion cutoff (best precision from Phase 3)
@@ -215,7 +217,8 @@ def get_top_contributors(df_full, clf, scaler, feature_cols, n=3):
 # ─────────────────────────────────────────
 def print_combined_signal(df_full, direction_prob, expansion_prob, iv_rank, iv_pct, hv_20,
                           dir_base_rate, exp_base_rate, dir_contributors, exp_contributors):
-    latest_date = df_full.dropna().index[-1].strftime("%Y-%m-%d")
+    latest_date   = df_full.dropna().index[-1].strftime("%Y-%m-%d")
+    days_to_earn  = int(df_full.dropna().iloc[-1].get("Days_to_earnings", 45))
 
     dir_signal = direction_prob >= P2_THRESHOLD
     exp_signal = expansion_prob >= P3_THRESHOLD
@@ -253,6 +256,7 @@ def print_combined_signal(df_full, direction_prob, expansion_prob, iv_rank, iv_p
     print(f"  Win Probability:    {direction_prob:.1%}  (base rate: {dir_base_rate:.1%})")
     print(f"  Signal:             {'WIN ✓' if dir_signal else 'NO SIGNAL ✗'}")
     print(f"  Drivers:            {fmt_contributors(dir_contributors)}")
+    print(f"  Days to Earnings:   {days_to_earn}d")
     print(f"\n  IV TIMING (Phase 3)  [threshold: {P3_THRESHOLD}]")
     print(f"  HV (20-day):        {hv_20:.1%}")
     print(f"  IV Rank:            {iv_rank:.2f}  ({iv_regime})")
@@ -268,6 +272,33 @@ def print_combined_signal(df_full, direction_prob, expansion_prob, iv_rank, iv_p
 
 
 # ─────────────────────────────────────────
+# VOL-ADJUSTED THRESHOLDS
+# ─────────────────────────────────────────
+def compute_vol_thresholds(df):
+    global WIN_THRESHOLD, EXPANSION_THRESHOLD
+    log_ret   = np.log(df["Close"] / df["Close"].shift(1))
+    hv_series = log_ret.rolling(HV_WINDOW).std() * np.sqrt(252)
+    hv_valid  = hv_series.dropna()
+
+    print("\nVol-Adjusted Threshold Calibration")
+    print("─" * 42)
+    if len(hv_valid) < 20 or hv_valid.median() < 0.05:
+        print("  WARNING: Insufficient/invalid HV data — using AMD defaults.")
+        print("─" * 42)
+        return
+
+    median_hv     = hv_valid.median()
+    new_win       = P2_VOL_MULTIPLE * median_hv * np.sqrt(P2_FORWARD_DAYS / 252)
+    new_expansion = P3_VOL_MULTIPLE * median_hv
+    print(f"  Ticker median HV (20-day, annualized): {median_hv:.1%}")
+    print(f"  WIN_THRESHOLD:       0.05 (AMD default)  ->  {new_win:.1%}  [computed]")
+    print(f"  EXPANSION_THRESHOLD: 0.10 (AMD default)  ->  {new_expansion:.1%}  [computed]")
+    print("─" * 42)
+    WIN_THRESHOLD       = new_win
+    EXPANSION_THRESHOLD = new_expansion
+
+
+# ─────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────
 if __name__ == "__main__":
@@ -277,6 +308,7 @@ if __name__ == "__main__":
         INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 
     df = load_indicators(INDICATORS_CSV)
+    compute_vol_thresholds(df)
 
     print(f"  Detecting benchmarks for {TICKER}...")
     benchmarks = detect_benchmarks(TICKER)

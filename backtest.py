@@ -18,6 +18,7 @@ Requirements:
 """
 
 import os
+import sys
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -39,14 +40,17 @@ HV_WINDOW           = 20
 IV_RANK_WINDOW      = 252
 P2_FORWARD_DAYS     = 15
 P3_FORWARD_DAYS     = 10
-WIN_THRESHOLD       = 0.05
-EXPANSION_THRESHOLD = 0.10
+WIN_THRESHOLD       = 0.05  # Default (AMD). Overridden at runtime by compute_vol_thresholds()
+P2_VOL_MULTIPLE     = 0.41  # 0.41 sigma bar — practical range: 0.25 (aggressive) to 1.0 (conservative)
+EXPANSION_THRESHOLD = 0.10  # Default (AMD). Overridden at runtime by compute_vol_thresholds()
+P3_VOL_MULTIPLE     = 0.20  # Sets expansion bar at 20% of median HV — practical range: 0.10 to 0.40
 P2_THRESHOLD        = 0.55
 P3_THRESHOLD        = 0.60
 RANDOM_STATE        = 42
 
 # Walk-forward parameters
-MIN_TRAIN_DAYS = 504   # ~2 years minimum training window
+# MIN_TRAIN_DAYS = 504   # ~2 years minimum training window
+MIN_TRAIN_DAYS = 252   # ~1 year minimum training window
 STEP_DAYS      = 126   # ~6 months between retrains
 
 
@@ -56,7 +60,11 @@ STEP_DAYS      = 126   # ~6 months between retrains
 def load_indicators(path):
     global TICKER, START_DATE, END_DATE
     print(f"Loading indicators from {path}...")
-    df = pd.read_csv(path, index_col=0, parse_dates=True)
+    try:
+        df = pd.read_csv(path, index_col=0, parse_dates=True)
+    except FileNotFoundError:
+        print(f"  ERROR: File not found -> {path}")
+        sys.exit(1)
     df = df.sort_index()
     if "Adj Close" in df.columns:
         df.drop(columns=["Adj Close"], inplace=True)
@@ -382,6 +390,33 @@ def plot_results(df_stats, order, colors, results):
 
 
 # ─────────────────────────────────────────
+# VOL-ADJUSTED THRESHOLDS
+# ─────────────────────────────────────────
+def compute_vol_thresholds(df):
+    global WIN_THRESHOLD, EXPANSION_THRESHOLD
+    log_ret   = np.log(df["Close"] / df["Close"].shift(1))
+    hv_series = log_ret.rolling(HV_WINDOW).std() * np.sqrt(252)
+    hv_valid  = hv_series.dropna()
+
+    print("\nVol-Adjusted Threshold Calibration")
+    print("─" * 42)
+    if len(hv_valid) < 20 or hv_valid.median() < 0.05:
+        print("  WARNING: Insufficient/invalid HV data — using AMD defaults.")
+        print("─" * 42)
+        return
+
+    median_hv     = hv_valid.median()
+    new_win       = P2_VOL_MULTIPLE * median_hv * np.sqrt(P2_FORWARD_DAYS / 252)
+    new_expansion = P3_VOL_MULTIPLE * median_hv
+    print(f"  Ticker median HV (20-day, annualized): {median_hv:.1%}")
+    print(f"  WIN_THRESHOLD:       0.05 (AMD default)  ->  {new_win:.1%}  [computed]")
+    print(f"  EXPANSION_THRESHOLD: 0.10 (AMD default)  ->  {new_expansion:.1%}  [computed]")
+    print("─" * 42)
+    WIN_THRESHOLD       = new_win
+    EXPANSION_THRESHOLD = new_expansion
+
+
+# ─────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────
 if __name__ == "__main__":
@@ -391,6 +426,7 @@ if __name__ == "__main__":
         INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 
     df = load_indicators(INDICATORS_CSV)
+    compute_vol_thresholds(df)
 
     print(f"  Detecting benchmarks for {TICKER}...")
     benchmarks = detect_benchmarks(TICKER)

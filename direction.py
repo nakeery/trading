@@ -17,6 +17,7 @@ Requirements:
 """
 
 import os
+import sys
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -37,7 +38,8 @@ INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 
 HV_WINDOW      = 20     # Rolling window for realized vol (trading days)
 FORWARD_DAYS   = 15     # Days ahead to evaluate win/loss
-WIN_THRESHOLD  = 0.05   # Minimum gain to count as a win (5%)
+WIN_THRESHOLD   = 0.05  # Default (AMD). Overridden at runtime by compute_vol_thresholds()
+P2_VOL_MULTIPLE = 0.41  # 0.41 sigma bar — practical range: 0.25 (aggressive) to 1.0 (conservative)
 TEST_SIZE      = 0.20   # Fraction of data held out as test set (time-based)
 N_ESTIMATORS       = 200    # Random forest trees
 DECISION_THRESHOLD = 0.55   # Probability cutoff for predicting Win (lower = more wins predicted)
@@ -50,7 +52,11 @@ RANDOM_STATE       = 42
 def load_indicators(path):
     global TICKER, START_DATE, END_DATE
     print(f"Loading indicators from {path}...")
-    df = pd.read_csv(path, index_col=0, parse_dates=True)
+    try:
+        df = pd.read_csv(path, index_col=0, parse_dates=True)
+    except FileNotFoundError:
+        print(f"  ERROR: File not found -> {path}")
+        sys.exit(1)
     df = df.sort_index()
     if "Adj Close" in df.columns:
         df.drop(columns=["Adj Close"], inplace=True)
@@ -228,8 +234,12 @@ def train_model(df):
 
     train_base = y_train.mean()
     test_base  = y_test.mean()
+    from sklearn.metrics import precision_score
+    train_prec = precision_score(y_train, y_pred_train, zero_division=0)
+    test_prec  = precision_score(y_test,  y_pred,       zero_division=0)
     print(f"Base rate  — train: {train_base:.1%}  |  test: {test_base:.1%}")
-    print(f"Accuracy   — train: {(y_pred_train == y_train).mean():.1%}  |  test: {(y_pred == y_test).mean():.1%}\n")
+    print(f"Accuracy   — train: {(y_pred_train == y_train).mean():.1%}  |  test: {(y_pred == y_test).mean():.1%}\n\n"
+          f"Precision  — train: {train_prec:.1%}  |  test: {test_prec:.1%}  (when model says WIN, how often correct) ***\n")
 
     print("─" * 50)
     print(f"CLASSIFICATION REPORT (test set, threshold={DECISION_THRESHOLD})")
@@ -319,6 +329,30 @@ def plot_results(clf, X_test, y_test, y_pred, feature_cols):
 
 
 # ─────────────────────────────────────────
+# VOL-ADJUSTED THRESHOLD
+# ─────────────────────────────────────────
+def compute_vol_thresholds(df):
+    global WIN_THRESHOLD
+    log_ret   = np.log(df["Close"] / df["Close"].shift(1))
+    hv_series = log_ret.rolling(HV_WINDOW).std() * np.sqrt(252)
+    hv_valid  = hv_series.dropna()
+
+    print("\nVol-Adjusted Threshold Calibration")
+    print("─" * 42)
+    if len(hv_valid) < 20 or hv_valid.median() < 0.05:
+        print("  WARNING: Insufficient/invalid HV data — using AMD default.")
+        print("─" * 42)
+        return
+
+    median_hv = hv_valid.median()
+    new_win   = P2_VOL_MULTIPLE * median_hv * np.sqrt(FORWARD_DAYS / 252)
+    print(f"  Ticker median HV (20-day, annualized): {median_hv:.1%}")
+    print(f"  WIN_THRESHOLD:  0.05 (AMD default)  ->  {new_win:.1%}  [computed]")
+    print("─" * 42)
+    WIN_THRESHOLD = new_win
+
+
+# ─────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────
 if __name__ == "__main__":
@@ -328,6 +362,7 @@ if __name__ == "__main__":
         INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 
     df = load_indicators(INDICATORS_CSV)
+    compute_vol_thresholds(df)
 
     print(f"  Detecting benchmarks for {TICKER}...")
     benchmarks = detect_benchmarks(TICKER)

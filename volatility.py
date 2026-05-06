@@ -17,6 +17,7 @@ Requirements:
 """
 
 import os
+import sys
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -37,7 +38,8 @@ INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 HV_WINDOW           = 20    # Days for realized vol calculation
 IV_RANK_WINDOW      = 252   # 1 trading year lookback for IV rank/percentile
 FORWARD_DAYS        = 10    # Days ahead to evaluate expansion
-EXPANSION_THRESHOLD = 0.10  # HV must rise >= 10% to count as expansion
+EXPANSION_THRESHOLD = 0.10  # Default (AMD). Overridden at runtime by compute_vol_thresholds()
+P3_VOL_MULTIPLE     = 0.20  # Sets expansion bar at 20% of median HV — practical range: 0.10 to 0.40
 TEST_SIZE           = 0.20
 DECISION_THRESHOLD  = 0.50
 RANDOM_STATE        = 42
@@ -49,7 +51,11 @@ RANDOM_STATE        = 42
 def load_indicators(path):
     global TICKER, START_DATE, END_DATE
     print(f"Loading indicators from {path}...")
-    df = pd.read_csv(path, index_col=0, parse_dates=True)
+    try:
+        df = pd.read_csv(path, index_col=0, parse_dates=True)
+    except FileNotFoundError:
+        print(f"  ERROR: File not found -> {path}")
+        sys.exit(1)
     df = df.sort_index()
     if "Adj Close" in df.columns:
         df.drop(columns=["Adj Close"], inplace=True)
@@ -226,8 +232,12 @@ def train_model(df):
 
     train_base = y_train.mean()
     test_base  = y_test.mean()
+    from sklearn.metrics import precision_score
+    train_prec = precision_score(y_train, y_pred_train, zero_division=0)
+    test_prec  = precision_score(y_test,  y_pred,       zero_division=0)
     print(f"Base rate  — train: {train_base:.1%}  |  test: {test_base:.1%}")
-    print(f"Accuracy   — train: {(y_pred_train == y_train).mean():.1%}  |  test: {(y_pred == y_test).mean():.1%}\n")
+    print(f"Accuracy   — train: {(y_pred_train == y_train).mean():.1%}  |  test: {(y_pred == y_test).mean():.1%}\n\n"
+          f"Precision  — train: {train_prec:.1%}  |  test: {test_prec:.1%}  (when model says EXPANSION, how often correct) ***\n")
 
     print("─" * 50)
     print(f"CLASSIFICATION REPORT (test set, threshold={DECISION_THRESHOLD})")
@@ -299,6 +309,7 @@ def print_signal_summary(df_full, clf, scaler, feature_cols):
     print(f"  IV Percentile:    {iv_pct:.1%}")
     print(f"  Expansion Prob:   {exp_prob:.1%}")
     print(f"  Signal:           {signal}")
+    print(f"  Days to Earnings: {int(latest_row['Days_to_earnings'])}d")
     print()
     if iv_rank < 0.33 and signal == "EXPANSION":
         print("  → Options cheap and vol likely rising — favorable entry")
@@ -366,6 +377,30 @@ def plot_results(df_full, clf, feature_cols):
 
 
 # ─────────────────────────────────────────
+# VOL-ADJUSTED THRESHOLD
+# ─────────────────────────────────────────
+def compute_vol_thresholds(df):
+    global EXPANSION_THRESHOLD
+    log_ret   = np.log(df["Close"] / df["Close"].shift(1))
+    hv_series = log_ret.rolling(HV_WINDOW).std() * np.sqrt(252)
+    hv_valid  = hv_series.dropna()
+
+    print("\nVol-Adjusted Threshold Calibration")
+    print("─" * 42)
+    if len(hv_valid) < 20 or hv_valid.median() < 0.05:
+        print("  WARNING: Insufficient/invalid HV data — using AMD default.")
+        print("─" * 42)
+        return
+
+    median_hv     = hv_valid.median()
+    new_expansion = P3_VOL_MULTIPLE * median_hv
+    print(f"  Ticker median HV (20-day, annualized): {median_hv:.1%}")
+    print(f"  EXPANSION_THRESHOLD:  0.10 (AMD default)  ->  {new_expansion:.1%}  [computed]")
+    print("─" * 42)
+    EXPANSION_THRESHOLD = new_expansion
+
+
+# ─────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────
 if __name__ == "__main__":
@@ -375,6 +410,7 @@ if __name__ == "__main__":
         INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 
     df = load_indicators(INDICATORS_CSV)
+    compute_vol_thresholds(df)
 
     print("Building features...")
     df = add_iv_features(df)
