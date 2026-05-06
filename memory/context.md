@@ -198,6 +198,15 @@ Backtest Results (SOFI, Session 4 — MIN_TRAIN_DAYS=252, 9 windows, 2022-2026) 
   STAY OUT          578     3.2%     0.9%   52.8%    34.8%   15.2%   -10.2%
   ALL DAYS          946     2.9%     0.9%   52.0%    35.1%   14.6%    -9.8%
 
+Backtest Results (SOFI, Session 6 — MIN_TRAIN_DAYS=252, 9 windows, 2022-2026) [best result to date]
+  Signal          Count   Avg Ret   Median  Win%    Strong%  AvgWin   AvgLoss
+  STRONG ENTRY       54     3.3%     0.2%   50.0%    40.7%   14.1%    -7.5%  <- best avg return
+  CAUTION            72     0.9%    -2.5%   40.3%    26.4%   15.1%    -8.7%
+  STAY OUT          821     3.0%     1.2%   53.1%    35.4%   14.6%   -10.1%
+  ALL DAYS          947     2.9%     0.9%   52.0%    35.1%   14.6%    -9.8%
+  Note: STRONG ENTRY count dropped from 205 to 54 — universal features shifted model thresholds;
+  gap over STAY OUT widened from +0.1pt to +0.3pt; AvgLoss improved -9.2% -> -7.5% (key signal)
+
 Work Done — Session 4 (This Device)
 14. Confirmed Claude Code can run scripts directly via:
     cmd /c "(echo TICKER && echo.) | python -X utf8 script.py"
@@ -289,10 +298,130 @@ Backtest Results (CRSP, Session 5 — 2398 rows, 17 windows, 2018-2026) [INVERTE
   STAY OUT         1502     1.3%    -0.7%   47.9%    32.2%   13.8%   -10.1%  <- best avg return
   ALL DAYS         2005     1.2%    -0.8%   47.7%    32.1%   13.8%   -10.3%
 
+Work Done — Session 6 (This Device)
+23. Added Days_to_catalyst output line to entry.py and volatility.py:
+    - entry.py: shown in Direction section after Days_to_earnings as "Days to Catalyst: Xd"
+      Extracted via df_full.dropna().iloc[-1].get("Days_to_catalyst", 90)
+      Shows "N/A" when value >= 90 (sentinel for no known upcoming catalyst)
+    - volatility.py: same logic after Days_to_earnings line in print_signal_summary()
+    - AMD/SOFI show "N/A"; CRSP shows actual countdown (e.g. "88d" to Aug 1 pediatric PDUFA)
+
+24. Investigated CRSP catalyst data and populated catalysts.csv with full history:
+    - Researched and added 11 confirmed historical events (2019-2024) + 3 future approximates
+    - Sources: CRSP IR press releases page, GlobeNewswire, Vertex IR, FDA.gov
+    Historical events added:
+      2019-11-19  CTX001 first two patients - SCD and TDT (first human CRISPR gene editing data)
+      2020-06-12  CTX001 EHA 2020 - CLIMB-111 and CLIMB-121 trial data
+      2020-10-21  CTX110 CARBON Phase 1 top-line results - B-cell malignancies
+      2020-12-05  CTX001 ASH 2020 + NEJM publication
+      2021-06-11  CTX001 EHA 2021 - 22 patients with 3+ month follow-up (approximate)
+      2021-10-12  CTX110 CARBON Phase 1 positive update
+      2022-06-11  Exa-cel EHA 2022 - extended follow-up SCD and TDT
+      2022-12-10  Exa-cel ASH 2022 data readout
+      2022-12-12  CTX110 CARBON ASH 2022 update
+      2023-06-09  Exa-cel EHA 2023 - pivotal trial results
+      2023-10-31  FDA advisory committee meeting - exa-cel SCD (trading halt; adcom voted in favor)
+      2023-11-16  UK MHRA authorization - Casgevy SCD and TDT
+      2023-12-08  Casgevy FDA approval SCD (already present)
+      2024-01-16  Casgevy FDA approval TDT (approved ahead of March 2024 PDUFA)
+      2024-02-13  Casgevy European Commission approval
+    Upcoming (approximate dates):
+      2026-08-01  Casgevy pediatric label expansion ages 5-11 - Priority Review Voucher
+      2026-09-30  Zugo-cel (CTX112) autoimmune/oncology data update
+      2026-11-30  CTX611 Phase 2 topline data - anticoagulant
+
+24. Backtest progression testing effect of catalyst data quantity on CRSP direction model:
+    - 1 event (Dec 2023 only):    STRONG ENTRY -0.6%  AvgLoss -13.0%
+    - 4 events (+3 future approx): STRONG ENTRY +0.1%  AvgLoss -13.0%
+    - 18 events (full history):   STRONG ENTRY -1.2%  AvgLoss -14.0%
+    - STAY OUT held steady at +1.5% across all three runs
+    - Conclusion: inversion is structural — more catalyst data deepened it rather than fixed it
+    - The model cannot learn direction of binary events from price/volume features
+    - Days_to_catalyst as a feature only signals "event approaching" not "event will be positive"
+    - AvgLoss widening to -14.0% with dense catalyst history reflects larger losses near events
+      when the model fires STRONG ENTRY and the binary outcome is negative
+
+Backtest Results (CRSP, Session 6 — 18 events in catalysts.csv) [INVERTED — structural not fixable]
+  Signal          Count   Avg Ret   Median  Win%    Strong%  AvgWin   AvgLoss
+  STRONG ENTRY      102    -1.2%    -0.6%   46.1%    32.4%   13.8%   -14.0%
+  CAUTION           366     0.5%    -1.6%   44.3%    29.8%   13.7%    -9.9%
+  STAY OUT         1537     1.5%    -0.5%   48.6%    32.7%   13.9%   -10.2%  <- best avg return
+  ALL DAYS         2005     1.2%    -0.8%   47.7%    32.1%   13.8%   -10.3%
+
+25. Implemented Phase 2B — 63-day direction model (entry.py, direction.py, backtest.py):
+    - Added P2B_FORWARD_DAYS = 63 and WIN_THRESHOLD_63 to all three scripts
+    - WIN_THRESHOLD_63 = P2_VOL_MULTIPLE x median_HV x sqrt(63/252) — same 0.41-sigma bar
+      AMD: 9.9% gain required in 63 days; SOFI: 12.7%; CRSP: 12.0%; QQQ: 3.6%
+    - entry.py: Phase 2B trained on df_full.copy() (no leakage from 15-day target)
+      Output now shows two direction sections: "15d entry timing" and "63d thesis"
+      Sizing logic updated: FULL only when 15d + 63d + expansion all agree
+      If 15d fires but 63d doesn't: REDUCED + warning note
+    - backtest.py: new signal labels — STRONG ENTRY (both fire), SHORT-TERM ONLY (15d only),
+      CAUTION (neither direction, Phase 3 expansion), STAY OUT (15d doesn't fire)
+    - direction.py: trains both models, prints precision for each
+
+    AMD Phase 2B test results:
+      Phase 2  (15d): test precision 33.2% vs 39.4% base rate (below base — poor test period)
+      Phase 2B (63d): test precision 56.8% vs 48.3% base rate (+8.5pt — stronger signal)
+    CRSP Phase 2B: test precision 61.7% vs 39.2% base rate (+22.5pt — meaningful even though
+      15-day model is inverted; 63-day model learns longer-horizon patterns less contaminated
+      by individual binary event noise)
+    SOFI Phase 2B: test precision 100% — suspicious (too few test positives); treat as unreliable
+
+    AMD backtest with Phase 2B (15 windows):
+      Signal           Count   Avg Ret   Median  Win%   AvgLoss
+      STRONG ENTRY       211     2.6%     3.4%   59.7%   -9.6%
+      CAUTION            288     1.1%    -0.8%   46.2%   -9.4%
+      SHORT-TERM ONLY     59    12.2%    10.8%   66.1%   -9.3%  <- best avg return (surprising)
+      STAY OUT          1019     2.5%     0.1%   50.3%   -7.4%
+      ALL DAYS          1577     2.7%     0.3%   51.4%   -8.1%
+    Note: SHORT-TERM ONLY best for AMD because short-burst momentum trades pay off in 15 days
+    even without 63-day confirmation. Behavior differs by ticker (see QQQ below).
+
+26. Re-ran SOFI pipeline (Session 6):
+    - indicators.py: price $16.02 (down from $16.20), below KC lower band, MACD bearish,
+      Stoch oversold (11.2/15.5) — technically weaker than Session 4
+    - entry.py: ENTER/REDUCED — win prob 72.0% vs 33.0% base rate; top drivers: IV_pct (+),
+      price_vs_52w_low (+), Days_to_earnings (-); HV 75.1%, IV rank 0.74, IV pct 89.6%,
+      expansion prob 13.2% (87% contraction); Days to Earnings 84d; Days to Catalyst N/A
+    - backtest: STRONG ENTRY 3.3% best avg return; gap over STAY OUT widened to +0.3pt;
+      AvgLoss improved to -7.5% (was -9.2%) — model avoiding big losers more effectively
+    - Suspicious train/test precision inversion persists (76.5% test vs 54.6% train) —
+      likely favorable test regime, not genuine edge; monitor as more data accumulates
+    - SOFI improving but still thin; direction: correct posture is ENTER/REDUCED not full size
+
+27. Ran pipeline on QQQ (new ticker — broad index ETF):
+    - indicators.py: 6624 rows from 2000-01-03 (longest history of any ticker tested)
+      price $681.61, RSI-14 76.5 overbought, above KC upper band, Stoch 97.6 overbought
+    - entry.py: ENTER/REDUCED — 15d win prob 58.1% vs 45.0% base rate (WIN)
+      63d win prob 45.6% vs 53.4% base rate (NO SIGNAL — base rate exceeds threshold because
+      QQQ drifts up so consistently that >53% of 63-day windows are wins by default)
+      Phase 3: HV 15.5%, IV rank 0.20 (Low IV) — contraction signal
+      Structural note: earnings warnings suppressed (ETF has no earnings); Days_to_earnings 45d default
+    - backtest (51 windows, 2002-2026): correct signal hierarchy confirmed
+      STRONG ENTRY 2.3% best avg return; STAY OUT 0.6% worst
+      SHORT-TERM ONLY 0.7% — near-worst for QQQ (vs best for AMD); QQQ lacks sharp
+      momentum bursts that make SHORT-TERM ONLY profitable for individual stocks
+      Phase 3 test precision 63.2% vs 41.9% base — strongest Phase 3 edge seen across any ticker
+    - Structural quirk: QQQ benchmark is SPX (^GSPC); ~0.95+ correlation means SPX_RS features
+      contribute near-zero signal; model compensates with VIX, HV, RSI, KC band features
+      Swapping to XLK benchmark would be worse (QQQ and XLK even more correlated)
+    - Framework assessment: works well for index ETFs; best statistical validation of any
+      ticker (51 windows); STRONG ENTRY clearly outperforms; weaker individual stock features
+      don't hurt because QQQ doesn't need them
+
+    QQQ Backtest Results (51 windows, 2002-2026):
+      Signal           Count   Avg Ret   Median  Win%   Strong%  AvgWin  AvgLoss
+      STRONG ENTRY       500     2.3%     2.6%   65.6%   55.2%    5.6%   -4.1%  <- best
+      CAUTION           1081     1.2%     1.8%   61.3%   50.2%    4.6%   -4.2%
+      SHORT-TERM ONLY    517     0.7%     1.6%   60.2%   48.0%    4.1%   -4.6%
+      STAY OUT          4007     0.6%     1.2%   61.9%   43.1%    3.3%   -3.7%
+      ALL DAYS          6105     0.9%     1.4%   62.0%   45.8%    3.8%   -3.9%
+
 Next Steps (planned, not yet implemented)
-- Update data/catalysts.csv with real CRSP PDUFA and trial readout dates (replace placeholders)
 - Consider buying straddles/strangles before PDUFA dates for CRSP instead of directional calls
   — Phase 3 IV expansion model is reliable for biotech; direction model is not
+  — Watch for Phase 3 to flip EXPANSION as Days_to_catalyst counts down toward Aug/Sep/Nov 2026
 - Add interest rate features to improve SOFI model (rate features loaded but need more data/
   rate regime variation before they show up as significant contributors):
   Rate features already wired up via MACRO_FEATURES; need time and different rate regimes
@@ -308,10 +437,39 @@ Key Findings
 - Volatility more predictable than direction: Phase 3 ~31pt edge vs Phase 2 ~12pt edge
 - CAUTION avg loss premium (~3-4pt vs STRONG ENTRY) confirmed consistent across AMD, NVDA, SOFI
   — IV contraction risk on losing trades is real and validates REDUCED position sizing
-- Ticker suitability: AMD well-suited; SOFI marginal (short history, missing rate features —
-  inversion fixed by reducing MIN_TRAIN_DAYS to 252 but edge remains thin);
+- Phase 2B (63-day) edge stronger than Phase 2 (15-day) on AMD (+8.5pt vs +6pt over base rate)
+  and CRSP (+22.5pt — longer window filters out binary event noise that contaminates 15-day model)
+- SHORT-TERM ONLY signal behavior is ticker-dependent: best on AMD (12.2% avg — momentum bursts)
+  but worst on QQQ (0.7% — no sharp momentum bursts on an index)
+- Framework works best for: large liquid sector-driven stocks with no near-term binary events
+  (AMD ideal), and broad index ETFs (QQQ — cleanest backtest, 51 windows)
+- Framework degrades for: event-driven biotech (CRSP), rate-sensitive with short history (SOFI),
+  secular trend too strong to discriminate (NVDA post-2023)
+- Ticker suitability: AMD well-suited; QQQ well-suited (index, no binary events, 51 windows);
+  SOFI marginal (short history, missing rate features — edge improving session-over-session);
   NVDA marginal (bull trend too strong, vol regime change hurts Phase 3);
-  CRSP unsuitable for direction (binary FDA/trial events; Phase 3 viable for vol plays)
+  CRSP unsuitable for direction (binary FDA/trial events dominate; Phase 3 viable for vol plays)
+
+Potential Improvements (identified, not yet implemented)
+Priority 1 — highest value for individual stocks:
+  - Earnings estimate revision direction: are analysts raising or cutting EPS over past 30-60 days?
+    Available from finviz or yfinance. Single most powerful missing feature for individual stocks.
+  - Actual IV from Tradier options chain: ATM IV and put/call ratio fed back into signal layer.
+    Tradier already integrated via sizing.py; closing HV-proxy gap (e.g. NVDA HV 35% vs IV 43%)
+Priority 2 — additional individual stock signals:
+  - Short interest ratio (days to cover): high short + positive momentum = squeeze setup.
+    Available monthly from FINRA. Not applicable to ETFs.
+  - Relative valuation: P/S or P/E vs 3-year history. Distinguishes oversold cheap vs oversold
+    expensive. Simple to compute from yfinance .info when available.
+Priority 3 — model quality:
+  - Probability calibration: isotonic regression post-processing so "72% win prob" means 72%.
+    Currently logistic regression outputs are scores not calibrated probabilities.
+    Feasible for AMD (2096 rows); riskier for SOFI (1340 rows).
+Won't fix / structural limits:
+  - Binary event direction: no price/volume feature can predict which way an FDA decision
+    or trial readout will go. Framework correctly identifies event proximity; direction unknowable.
+  - Secular trend regimes: when a stock is in parabolic uptrend (NVDA 2023-2024), "overbought"
+    signals become noise. Would require explicit regime labels to handle.
 
 Important Notes
 - backtest.py is SELF-CONTAINED — does NOT import from direction.py or volatility.py
@@ -321,23 +479,33 @@ Important Notes
 - memory/ subdirectory in project root is Claude's auto-memory system
 - Unicode arrow issue (->): not a problem in VS Code/Windows Terminal; only affects cmd.exe cp1252
 - FORWARD_DAYS = 15 kept intentionally — acts as entry timing signal, not holding period predictor
-  Considered changing to 63 days to match 3-month minimum hold; kept at 15 for now
+  Phase 2B (63-day) added in Session 6 as LEAPS-aligned thesis validation layer
 - data/catalysts.csv must have no commas in description field (use dashes instead)
+- QQQ ETF has no earnings dates — yfinance warns "may be delisted" but this is harmless;
+  Days_to_earnings defaults to 45 (neutral) for ETFs
 
 Tech Stack
 yfinance, pandas, numpy, ta, matplotlib, scikit-learn (LogisticRegression, StandardScaler,
 precision_score), lxml (for earnings dates), requests (for Tradier API in sizing.py)
 
 Model Details
-Both models: Logistic Regression (C=0.1, class_weight="balanced", 80/20 time-based split)
-Direction threshold: P2_THRESHOLD = 0.55 (~50.4% precision vs 37.8% base rate)
-IV expansion threshold: P3_THRESHOLD = 0.60 (~59% precision vs 27.8% base rate)
-Training history: 2018-present (~2,095 rows for AMD)
-Threshold sweep marker: auto-marks optimal threshold using max (precision - base_rate) x log(signals)
-Vol-adjusted thresholds: compute_vol_thresholds() auto-calibrates WIN_THRESHOLD and EXPANSION_THRESHOLD
-  to each ticker's median HV at runtime. P2_VOL_MULTIPLE=0.41, P3_VOL_MULTIPLE=0.20.
+All models: Logistic Regression (C=0.1, class_weight="balanced", 80/20 time-based split)
+Phase 2  (15d direction) threshold: P2_THRESHOLD = 0.55 — entry timing signal
+Phase 2B (63d direction) threshold: P2_THRESHOLD = 0.55 — thesis validation (LEAPS-aligned)
+Phase 3  (IV expansion)  threshold: P3_THRESHOLD = 0.60
+Training history: 2018-present (~2,096 rows for AMD); 2000-present (~6,624 rows for QQQ)
+Threshold sweep marker: auto-marks optimal using max (precision - base_rate) x log(signals)
+Vol-adjusted thresholds: compute_vol_thresholds() auto-calibrates all thresholds at runtime
+  WIN_THRESHOLD    = P2_VOL_MULTIPLE x median_HV x sqrt(15/252)  — 15-day direction bar
+  WIN_THRESHOLD_63 = P2_VOL_MULTIPLE x median_HV x sqrt(63/252)  — 63-day direction bar
+  EXPANSION_THRESHOLD = P3_VOL_MULTIPLE x median_HV
+  P2_VOL_MULTIPLE=0.41 (0.41-sigma bar); P3_VOL_MULTIPLE=0.20 (heuristic)
   P2 tuning range: 0.25=aggressive (~40% base rate), 0.41=default (~34%), 0.75=conservative (~23%)
-  P3 is a heuristic — no clean closed-form derivation; validate via backtest for each new ticker
+Backtest signal labels (updated Session 6):
+  STRONG ENTRY = 15d WIN + 63d WIN + Phase 3 EXPANSION
+  CAUTION      = 15d WIN + 63d WIN + Phase 3 CONTRACTION
+  SHORT-TERM ONLY = 15d WIN + 63d NO SIGNAL (any Phase 3)
+  STAY OUT     = 15d NO SIGNAL
 
 Sizing.py Config Notes
 TRADIER_TOKEN = brokerage token (not sandbox)

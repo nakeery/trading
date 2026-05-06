@@ -315,7 +315,10 @@ def print_signal_summary(df_full, clf, scaler, feature_cols):
     print(f"  IV Percentile:    {iv_pct:.1%}")
     print(f"  Expansion Prob:   {exp_prob:.1%}")
     print(f"  Signal:           {signal}")
+    _dtc = int(latest_row.get("Days_to_catalyst", 90))
+    days_to_cat = "N/A" if _dtc >= 90 else f"{_dtc}d"
     print(f"  Days to Earnings: {int(latest_row['Days_to_earnings'])}d")
+    print(f"  Days to Catalyst: {days_to_cat}")
     print()
     if iv_rank < 0.33 and signal == "EXPANSION":
         print("  → Options cheap and vol likely rising — favorable entry")

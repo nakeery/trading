@@ -37,9 +37,11 @@ DATA_DIR       = "data"
 INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 
 HV_WINDOW      = 20     # Rolling window for realized vol (trading days)
-FORWARD_DAYS   = 15     # Days ahead to evaluate win/loss
-WIN_THRESHOLD   = 0.05  # Default (AMD). Overridden at runtime by compute_vol_thresholds()
-P2_VOL_MULTIPLE = 0.41  # 0.41 sigma bar — practical range: 0.25 (aggressive) to 1.0 (conservative)
+FORWARD_DAYS     = 15    # Days ahead to evaluate win/loss (entry timing)
+FORWARD_DAYS_63  = 63    # Medium-term direction window (~1 quarter)
+WIN_THRESHOLD    = 0.05  # Default (AMD). Overridden at runtime by compute_vol_thresholds()
+WIN_THRESHOLD_63 = 0.10  # Default (AMD). Overridden at runtime by compute_vol_thresholds()
+P2_VOL_MULTIPLE  = 0.41  # 0.41 sigma bar — practical range: 0.25 (aggressive) to 1.0 (conservative)
 TEST_SIZE      = 0.20   # Fraction of data held out as test set (time-based)
 N_ESTIMATORS       = 200    # Random forest trees
 DECISION_THRESHOLD = 0.55   # Probability cutoff for predicting Win (lower = more wins predicted)
@@ -338,7 +340,7 @@ def plot_results(clf, X_test, y_test, y_pred, feature_cols):
 # VOL-ADJUSTED THRESHOLD
 # ─────────────────────────────────────────
 def compute_vol_thresholds(df):
-    global WIN_THRESHOLD
+    global WIN_THRESHOLD, WIN_THRESHOLD_63
     log_ret   = np.log(df["Close"] / df["Close"].shift(1))
     hv_series = log_ret.rolling(HV_WINDOW).std() * np.sqrt(252)
     hv_valid  = hv_series.dropna()
@@ -350,12 +352,15 @@ def compute_vol_thresholds(df):
         print("─" * 42)
         return
 
-    median_hv = hv_valid.median()
-    new_win   = P2_VOL_MULTIPLE * median_hv * np.sqrt(FORWARD_DAYS / 252)
+    median_hv    = hv_valid.median()
+    new_win      = P2_VOL_MULTIPLE * median_hv * np.sqrt(FORWARD_DAYS / 252)
+    new_win_63   = P2_VOL_MULTIPLE * median_hv * np.sqrt(FORWARD_DAYS_63 / 252)
     print(f"  Ticker median HV (20-day, annualized): {median_hv:.1%}")
-    print(f"  WIN_THRESHOLD:  0.05 (AMD default)  ->  {new_win:.1%}  [computed]")
+    print(f"  WIN_THRESHOLD:    0.05 (AMD default)  ->  {new_win:.1%}  [computed]")
+    print(f"  WIN_THRESHOLD_63: 0.10 (AMD default)  ->  {new_win_63:.1%}  [computed]")
     print("─" * 42)
-    WIN_THRESHOLD = new_win
+    WIN_THRESHOLD    = new_win
+    WIN_THRESHOLD_63 = new_win_63
 
 
 # ─────────────────────────────────────────
@@ -391,10 +396,22 @@ if __name__ == "__main__":
     df = add_earnings_proximity(df)
     df = add_catalyst_proximity(df, TICKER, DATA_DIR)
     df = normalize_features(df)
-    df = add_target(df)
 
-    clf, X_test, y_test, y_pred, y_prob, feature_cols = train_model(df)
+    # Phase 2 — 15-day direction model
+    df_15 = add_target(df.copy())
+    clf, X_test, y_test, y_pred, y_prob, feature_cols = train_model(df_15)
     plot_results(clf, X_test, y_test, y_pred, feature_cols)
 
-    df.to_csv(os.path.join(DATA_DIR, f"{TICKER.lower()}_ml_features.csv"))
-    print(f"Enriched feature dataset saved -> {os.path.join(DATA_DIR, f'{TICKER.lower()}_ml_features.csv')}")
+    # Phase 2B — 63-day direction model
+    df_63 = df.copy()
+    future_close_63 = df_63["Close"].shift(-FORWARD_DAYS_63)
+    df_63["target"] = ((future_close_63 / df_63["Close"] - 1) >= WIN_THRESHOLD_63).astype(int)
+    df_63 = df_63.iloc[:-FORWARD_DAYS_63]
+    win_rate_63 = df_63["target"].mean()
+    print(f"\nPhase 2B — 63-day direction model")
+    print(f"  Target: {FORWARD_DAYS_63}d forward ≥ {WIN_THRESHOLD_63*100:.0f}% gain = win")
+    print(f"  → Win rate: {win_rate_63:.1%}  ({df_63['target'].sum()} wins / {len(df_63)} samples)")
+    clf63, X_test63, y_test63, y_pred63, y_prob63, fcols63 = train_model(df_63)
+
+    df_15.to_csv(os.path.join(DATA_DIR, f"{TICKER.lower()}_ml_features.csv"))
+    print(f"\nEnriched feature dataset saved -> {os.path.join(DATA_DIR, f'{TICKER.lower()}_ml_features.csv')}")

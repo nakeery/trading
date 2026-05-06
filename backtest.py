@@ -39,8 +39,10 @@ INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 HV_WINDOW           = 20
 IV_RANK_WINDOW      = 252
 P2_FORWARD_DAYS     = 15
+P2B_FORWARD_DAYS    = 63    # Medium-term direction window (~1 quarter)
 P3_FORWARD_DAYS     = 10
 WIN_THRESHOLD       = 0.05  # Default (AMD). Overridden at runtime by compute_vol_thresholds()
+WIN_THRESHOLD_63    = 0.10  # Default (AMD). Overridden at runtime by compute_vol_thresholds()
 P2_VOL_MULTIPLE     = 0.41  # 0.41 sigma bar — practical range: 0.25 (aggressive) to 1.0 (conservative)
 EXPANSION_THRESHOLD = 0.10  # Default (AMD). Overridden at runtime by compute_vol_thresholds()
 P3_VOL_MULTIPLE     = 0.20  # Sets expansion bar at 20% of median HV — practical range: 0.10 to 0.40
@@ -255,12 +257,19 @@ def run_backtest(df_full):
 
         df_train = df_full.iloc[:train_end].copy()
 
-        # Phase 2 — direction target
+        # Phase 2 — 15-day direction target
         df_p2 = df_train.copy()
         fc2 = df_p2["Close"].shift(-P2_FORWARD_DAYS)
         df_p2["_target"] = ((fc2 / df_p2["Close"] - 1) >= WIN_THRESHOLD).astype(int)
         df_p2 = df_p2.iloc[:-P2_FORWARD_DAYS]
         clf2, scaler2, fcols2 = train_model(df_p2, "_target")
+
+        # Phase 2B — 63-day direction target
+        df_p2b = df_train.copy()
+        fc2b = df_p2b["Close"].shift(-P2B_FORWARD_DAYS)
+        df_p2b["_target"] = ((fc2b / df_p2b["Close"] - 1) >= WIN_THRESHOLD_63).astype(int)
+        df_p2b = df_p2b.iloc[:-P2B_FORWARD_DAYS]
+        clf2b, scaler2b, fcols2b = train_model(df_p2b, "_target")
 
         # Phase 3 — IV expansion target
         df_p3 = df_train.copy()
@@ -269,7 +278,7 @@ def run_backtest(df_full):
         df_p3 = df_p3.iloc[:-P3_FORWARD_DAYS]
         clf3, scaler3, fcols3 = train_model(df_p3, "_target")
 
-        if clf2 is None or clf3 is None:
+        if clf2 is None or clf2b is None or clf3 is None:
             train_end += STEP_DAYS
             continue
 
@@ -277,23 +286,29 @@ def run_backtest(df_full):
         for i in range(test_start, test_end):
             date = df_full.index[i]
 
-            row2 = df_full[fcols2].iloc[i]
-            row3 = df_full[fcols3].iloc[i]
-            if row2.isna().any() or row3.isna().any():
+            row2  = df_full[fcols2].iloc[i]
+            row2b = df_full[fcols2b].iloc[i]
+            row3  = df_full[fcols3].iloc[i]
+            if row2.isna().any() or row2b.isna().any() or row3.isna().any():
                 continue
 
-            X2 = pd.DataFrame([row2], columns=fcols2)
-            X3 = pd.DataFrame([row3], columns=fcols3)
-            dir_prob = clf2.predict_proba(scaler2.transform(X2))[0, 1]
-            exp_prob = clf3.predict_proba(scaler3.transform(X3))[0, 1]
+            X2  = pd.DataFrame([row2],  columns=fcols2)
+            X2b = pd.DataFrame([row2b], columns=fcols2b)
+            X3  = pd.DataFrame([row3],  columns=fcols3)
+            dir_prob    = clf2.predict_proba(scaler2.transform(X2))[0, 1]
+            dir_prob_63 = clf2b.predict_proba(scaler2b.transform(X2b))[0, 1]
+            exp_prob    = clf3.predict_proba(scaler3.transform(X3))[0, 1]
 
-            dir_signal = dir_prob >= P2_THRESHOLD
-            exp_signal = exp_prob >= P3_THRESHOLD
+            dir_signal    = dir_prob    >= P2_THRESHOLD
+            dir_signal_63 = dir_prob_63 >= P2_THRESHOLD
+            exp_signal    = exp_prob    >= P3_THRESHOLD
 
-            if dir_signal and exp_signal:
+            if dir_signal and dir_signal_63 and exp_signal:
                 signal = "STRONG ENTRY"
-            elif dir_signal and not exp_signal:
+            elif dir_signal and dir_signal_63 and not exp_signal:
                 signal = "CAUTION"
+            elif dir_signal and not dir_signal_63:
+                signal = "SHORT-TERM ONLY"
             else:
                 signal = "STAY OUT"
 
@@ -303,6 +318,7 @@ def run_backtest(df_full):
                 "date":       date,
                 "signal":     signal,
                 "dir_prob":   dir_prob,
+                "dir_prob_63": dir_prob_63,
                 "exp_prob":   exp_prob,
                 "fwd_return": fwd_return,
                 "window":     window_num,
@@ -317,9 +333,9 @@ def run_backtest(df_full):
 # 6. SUMMARIZE RESULTS
 # ─────────────────────────────────────────
 def summarize(results):
-    order  = ["STRONG ENTRY", "CAUTION", "STAY OUT", "ALL DAYS"]
+    order  = ["STRONG ENTRY", "CAUTION", "SHORT-TERM ONLY", "STAY OUT", "ALL DAYS"]
     colors = {"STRONG ENTRY": "#3fb950", "CAUTION": "#ffa657",
-              "STAY OUT": "#f85149", "ALL DAYS": "#58a6ff"}
+              "SHORT-TERM ONLY": "#d2a8ff", "STAY OUT": "#f85149", "ALL DAYS": "#58a6ff"}
 
     all_row = results.copy()
     all_row["signal"] = "ALL DAYS"
@@ -418,7 +434,7 @@ def plot_results(df_stats, order, colors, results):
 # VOL-ADJUSTED THRESHOLDS
 # ─────────────────────────────────────────
 def compute_vol_thresholds(df):
-    global WIN_THRESHOLD, EXPANSION_THRESHOLD
+    global WIN_THRESHOLD, WIN_THRESHOLD_63, EXPANSION_THRESHOLD
     log_ret   = np.log(df["Close"] / df["Close"].shift(1))
     hv_series = log_ret.rolling(HV_WINDOW).std() * np.sqrt(252)
     hv_valid  = hv_series.dropna()
@@ -432,12 +448,15 @@ def compute_vol_thresholds(df):
 
     median_hv     = hv_valid.median()
     new_win       = P2_VOL_MULTIPLE * median_hv * np.sqrt(P2_FORWARD_DAYS / 252)
+    new_win_63    = P2_VOL_MULTIPLE * median_hv * np.sqrt(P2B_FORWARD_DAYS / 252)
     new_expansion = P3_VOL_MULTIPLE * median_hv
     print(f"  Ticker median HV (20-day, annualized): {median_hv:.1%}")
     print(f"  WIN_THRESHOLD:       0.05 (AMD default)  ->  {new_win:.1%}  [computed]")
+    print(f"  WIN_THRESHOLD_63:    0.10 (AMD default)  ->  {new_win_63:.1%}  [computed]")
     print(f"  EXPANSION_THRESHOLD: 0.10 (AMD default)  ->  {new_expansion:.1%}  [computed]")
     print("─" * 42)
     WIN_THRESHOLD       = new_win
+    WIN_THRESHOLD_63    = new_win_63
     EXPANSION_THRESHOLD = new_expansion
 
 

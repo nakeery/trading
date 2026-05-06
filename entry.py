@@ -36,8 +36,10 @@ INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 HV_WINDOW           = 20
 IV_RANK_WINDOW      = 252
 P2_FORWARD_DAYS     = 15    # Phase 2: direction window
+P2B_FORWARD_DAYS    = 63    # Phase 2B: medium-term direction window (~1 quarter)
 P3_FORWARD_DAYS     = 10    # Phase 3: IV expansion window
 WIN_THRESHOLD       = 0.05  # Default (AMD). Overridden at runtime by compute_vol_thresholds()
+WIN_THRESHOLD_63    = 0.10  # Default (AMD). Overridden at runtime by compute_vol_thresholds()
 P2_VOL_MULTIPLE     = 0.41  # 0.41 sigma bar — practical range: 0.25 (aggressive) to 1.0 (conservative)
 EXPANSION_THRESHOLD = 0.10  # Default (AMD). Overridden at runtime by compute_vol_thresholds()
 P3_VOL_MULTIPLE     = 0.20  # Sets expansion bar at 20% of median HV — practical range: 0.10 to 0.40
@@ -227,28 +229,39 @@ def get_top_contributors(df_full, clf, scaler, feature_cols, n=3):
 # ─────────────────────────────────────────
 # 4. COMBINED SIGNAL OUTPUT
 # ─────────────────────────────────────────
-def print_combined_signal(df_full, direction_prob, expansion_prob, iv_rank, iv_pct, hv_20,
-                          dir_base_rate, exp_base_rate, dir_contributors, exp_contributors):
+def print_combined_signal(df_full, direction_prob, dir_prob_63, expansion_prob,
+                          iv_rank, iv_pct, hv_20,
+                          dir_base_rate, dir_base_rate_63, exp_base_rate,
+                          dir_contributors, dir_contributors_63, exp_contributors):
     latest_date   = df_full.dropna().index[-1].strftime("%Y-%m-%d")
     days_to_earn  = int(df_full.dropna().iloc[-1].get("Days_to_earnings", 45))
+    _dtc          = int(df_full.dropna().iloc[-1].get("Days_to_catalyst", 90))
+    days_to_cat   = "N/A" if _dtc >= 90 else f"{_dtc}d"
 
-    dir_signal = direction_prob >= P2_THRESHOLD
-    exp_signal = expansion_prob >= P3_THRESHOLD
+    dir_signal    = direction_prob >= P2_THRESHOLD
+    dir_signal_63 = dir_prob_63 >= P2_THRESHOLD
+    exp_signal    = expansion_prob >= P3_THRESHOLD
     contraction_prob = 1 - expansion_prob
 
     iv_regime = "Low IV" if iv_rank < 0.33 else "High IV" if iv_rank > 0.67 else "Mid IV"
 
-    # Entry decision driven by Phase 2 alone
+    # Entry decision driven by Phase 2 (15-day) alone
     entry = "ENTER" if dir_signal else "STAY OUT"
 
-    # Position sizing driven by Phase 3
+    # Sizing: Phase 3 is primary sizing input; Phase 2B adds a REDUCED override
     if dir_signal:
-        if exp_signal:
+        if exp_signal and dir_signal_63:
             sizing      = "FULL"
             sizing_note = f"IV {iv_regime.lower()} and vol likely rising — premium affordable and expanding."
-        else:
+        elif exp_signal and not dir_signal_63:
+            sizing      = "REDUCED"
+            sizing_note = "Vol expanding but medium-term model does not confirm — limit size."
+        elif not exp_signal and dir_signal_63:
             sizing      = "REDUCED"
             sizing_note = f"IV {iv_regime.lower()} with {contraction_prob:.0%} contraction probability — limit exposure to premium decay."
+        else:
+            sizing      = "REDUCED"
+            sizing_note = f"IV {iv_regime.lower()} with {contraction_prob:.0%} contraction probability and medium-term model does not confirm — limit size."
     else:
         sizing      = "N/A"
         sizing_note = "No directional edge — wait for Phase 2 signal before sizing."
@@ -264,12 +277,17 @@ def print_combined_signal(df_full, direction_prob, expansion_prob, iv_rank, iv_p
     print(f"\n{'═'*w}")
     print(f"  COMBINED ENTRY SIGNAL — {TICKER} as of {latest_date}")
     print(f"{'═'*w}")
-    print(f"\n  DIRECTION (Phase 2)  [threshold: {P2_THRESHOLD}]")
+    print(f"\n  DIRECTION — 15d entry timing  [threshold: {P2_THRESHOLD}]")
     print(f"  Win Probability:    {direction_prob:.1%}  (base rate: {dir_base_rate:.1%})")
     print(f"  Signal:             {'WIN ✓' if dir_signal else 'NO SIGNAL ✗'}")
     print(f"  Drivers:            {fmt_contributors(dir_contributors)}")
     print(f"  Days to Earnings:   {days_to_earn}d")
-    print(f"\n  IV TIMING (Phase 3)  [threshold: {P3_THRESHOLD}]")
+    print(f"  Days to Catalyst:   {days_to_cat}")
+    print(f"\n  DIRECTION — 63d thesis        [threshold: {P2_THRESHOLD}]")
+    print(f"  Win Probability:    {dir_prob_63:.1%}  (base rate: {dir_base_rate_63:.1%})")
+    print(f"  Signal:             {'WIN ✓' if dir_signal_63 else 'NO SIGNAL ✗'}")
+    print(f"  Drivers:            {fmt_contributors(dir_contributors_63)}")
+    print(f"\n  IV TIMING (Phase 3)           [threshold: {P3_THRESHOLD}]")
     print(f"  HV (20-day):        {hv_20:.1%}")
     print(f"  IV Rank:            {iv_rank:.2f}  ({iv_regime})")
     print(f"  IV Percentile:      {iv_pct:.1%}")
@@ -287,7 +305,7 @@ def print_combined_signal(df_full, direction_prob, expansion_prob, iv_rank, iv_p
 # VOL-ADJUSTED THRESHOLDS
 # ─────────────────────────────────────────
 def compute_vol_thresholds(df):
-    global WIN_THRESHOLD, EXPANSION_THRESHOLD
+    global WIN_THRESHOLD, WIN_THRESHOLD_63, EXPANSION_THRESHOLD
     log_ret   = np.log(df["Close"] / df["Close"].shift(1))
     hv_series = log_ret.rolling(HV_WINDOW).std() * np.sqrt(252)
     hv_valid  = hv_series.dropna()
@@ -301,12 +319,15 @@ def compute_vol_thresholds(df):
 
     median_hv     = hv_valid.median()
     new_win       = P2_VOL_MULTIPLE * median_hv * np.sqrt(P2_FORWARD_DAYS / 252)
+    new_win_63    = P2_VOL_MULTIPLE * median_hv * np.sqrt(P2B_FORWARD_DAYS / 252)
     new_expansion = P3_VOL_MULTIPLE * median_hv
     print(f"  Ticker median HV (20-day, annualized): {median_hv:.1%}")
     print(f"  WIN_THRESHOLD:       0.05 (AMD default)  ->  {new_win:.1%}  [computed]")
+    print(f"  WIN_THRESHOLD_63:    0.10 (AMD default)  ->  {new_win_63:.1%}  [computed]")
     print(f"  EXPANSION_THRESHOLD: 0.10 (AMD default)  ->  {new_expansion:.1%}  [computed]")
     print("─" * 42)
     WIN_THRESHOLD       = new_win
+    WIN_THRESHOLD_63    = new_win_63
     EXPANSION_THRESHOLD = new_expansion
 
 
@@ -334,13 +355,21 @@ if __name__ == "__main__":
 
     df_full = build_features(df, benchmarks)
 
-    # Phase 2 — direction target
+    # Phase 2 — 15-day direction target
     df_p2 = df_full.copy()
     future_close = df_p2["Close"].shift(-P2_FORWARD_DAYS)
     df_p2["direction_target"] = ((future_close / df_p2["Close"] - 1) >= WIN_THRESHOLD).astype(int)
     df_p2 = df_p2.iloc[:-P2_FORWARD_DAYS]
     clf2, scaler2, fcols2, tr2, te2, base2 = train(df_p2, "direction_target")
-    print(f"Phase 2 (direction)  — train precision: {tr2:.1%}  test precision: {te2:.1%}  base rate: {base2:.1%}")
+    print(f"Phase 2  (15d direction) — train precision: {tr2:.1%}  test precision: {te2:.1%}  base rate: {base2:.1%}")
+
+    # Phase 2B — 63-day direction target
+    df_p2b = df_full.copy()
+    future_close_63 = df_p2b["Close"].shift(-P2B_FORWARD_DAYS)
+    df_p2b["direction_target_63"] = ((future_close_63 / df_p2b["Close"] - 1) >= WIN_THRESHOLD_63).astype(int)
+    df_p2b = df_p2b.iloc[:-P2B_FORWARD_DAYS]
+    clf2b, scaler2b, fcols2b, tr2b, te2b, base2b = train(df_p2b, "direction_target_63")
+    print(f"Phase 2B (63d direction) — train precision: {tr2b:.1%}  test precision: {te2b:.1%}  base rate: {base2b:.1%}")
 
     # Phase 3 — IV expansion target
     df_p3 = df_full.copy()
@@ -348,24 +377,29 @@ if __name__ == "__main__":
     df_p3["iv_target"] = ((future_hv / df_p3["HV_20"] - 1) >= EXPANSION_THRESHOLD).astype(int)
     df_p3 = df_p3.iloc[:-P3_FORWARD_DAYS]
     clf3, scaler3, fcols3, tr3, te3, base3 = train(df_p3, "iv_target")
-    print(f"Phase 3 (IV timing)  — train precision: {tr3:.1%}  test precision: {te3:.1%}  base rate: {base3:.1%}\n")
+    print(f"Phase 3  (IV timing)     — train precision: {tr3:.1%}  test precision: {te3:.1%}  base rate: {base3:.1%}\n")
 
     # Current signals
-    direction_prob = get_current_prob(df_full, clf2, scaler2, fcols2)
-    expansion_prob = get_current_prob(df_full, clf3, scaler3, fcols3)
-    dir_contributors = get_top_contributors(df_full, clf2, scaler2, fcols2)
-    exp_contributors = get_top_contributors(df_full, clf3, scaler3, fcols3)
+    direction_prob    = get_current_prob(df_full, clf2,  scaler2,  fcols2)
+    dir_prob_63       = get_current_prob(df_full, clf2b, scaler2b, fcols2b)
+    expansion_prob    = get_current_prob(df_full, clf3,  scaler3,  fcols3)
+    dir_contributors    = get_top_contributors(df_full, clf2,  scaler2,  fcols2)
+    dir_contributors_63 = get_top_contributors(df_full, clf2b, scaler2b, fcols2b)
+    exp_contributors    = get_top_contributors(df_full, clf3,  scaler3,  fcols3)
 
     latest = df_full[["HV_20", "IV_rank", "IV_pct"]].dropna().iloc[-1]
     print_combined_signal(
         df_full,
         direction_prob,
+        dir_prob_63,
         expansion_prob,
         latest["IV_rank"],
         latest["IV_pct"],
         latest["HV_20"],
         base2,
+        base2b,
         base3,
         dir_contributors,
+        dir_contributors_63,
         exp_contributors,
     )
