@@ -25,7 +25,7 @@ import matplotlib.pyplot as plt
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
-from benchmarks import detect_benchmarks
+from benchmarks import detect_benchmarks, detect_macro_features, add_macro_features, add_catalyst_proximity
 
 # ─────────────────────────────────────────
 # CONFIG
@@ -104,8 +104,9 @@ def add_benchmarks(df, benchmarks):
         df[col] = df[col].ffill()
         for window in [5, 20]:
             df[f"{bench_name}_RS_{window}d"] = df["Close"].pct_change(window) - df[col].pct_change(window)
+        df[f"{bench_name}_vs_ma200"] = df[col] / df[col].rolling(200).mean() - 1
         df.drop(columns=[col], inplace=True)
-        print(f"  ✓ {bench_name}_RS_5d, {bench_name}_RS_20d")
+        print(f"  ✓ {bench_name}_RS_5d, {bench_name}_RS_20d, {bench_name}_vs_ma200")
     return df
 
 
@@ -145,6 +146,11 @@ def add_earnings_proximity(df):
 def normalize_features(df):
     """Replace absolute price-level indicators with scale-invariant ratios."""
     close = df["Close"]
+
+    # Universal momentum / positioning features (generic for any ticker)
+    df["price_vs_52w_high"] = close / close.rolling(252).max() - 1
+    df["price_vs_52w_low"]  = close / close.rolling(252).min() - 1
+    df["vol_ratio"]         = df["Volume"] / df["Volume"].rolling(20).mean()
 
     # MA → keep short (20), medium (50), long (200) — drop 100 (redundant between 50/200)
     for period in [20, 50, 200]:
@@ -378,7 +384,12 @@ if __name__ == "__main__":
     df = add_hv(df)
     df = add_vix(df)
     df = add_benchmarks(df, benchmarks)
+    macro = detect_macro_features(TICKER)
+    if macro:
+        print("  Macro features:")
+        df = add_macro_features(df, macro, START_DATE, END_DATE)
     df = add_earnings_proximity(df)
+    df = add_catalyst_proximity(df, TICKER, DATA_DIR)
     df = normalize_features(df)
     df = add_target(df)
 

@@ -1,5 +1,5 @@
 """
-Benchmark detection — shared module for all ML pipeline scripts.
+Benchmark detection and macro feature engineering — shared module for all ML pipeline scripts.
 Maps ticker sector/industry to the appropriate market benchmark(s).
 
 Lookup order:
@@ -9,9 +9,12 @@ Lookup order:
   4. FALLBACK_BENCHMARK — S&P 500 if everything else fails
 
 To add a ticker: add an entry to TICKER_BENCHMARK.
+To add macro features for a ticker: add an entry to MACRO_FEATURES.
 """
 
+import os
 import yfinance as yf
+import pandas as pd
 
 # Direct per-ticker mapping — checked first, no network call required.
 # Format: "TICKER": [(yf_ticker, display_name), ...]
@@ -62,6 +65,86 @@ SECTOR_BENCHMARK = {
 }
 
 FALLBACK_BENCHMARK = ("^GSPC", "SPX")
+
+# Opt-in macro features for rate/commodity-sensitive tickers.
+# Format: "TICKER": [(yf_symbol, feature_name), ...]
+# Add new tickers as needed; tickers not listed get no macro features.
+MACRO_FEATURES = {
+    "SOFI": [("^TNX", "UST10Y"), ("^IRX", "UST3M")],
+    "JPM":  [("^TNX", "UST10Y"), ("^IRX", "UST3M")],
+    "BAC":  [("^TNX", "UST10Y"), ("^IRX", "UST3M")],
+    "GS":   [("^TNX", "UST10Y"), ("^IRX", "UST3M")],
+    "MS":   [("^TNX", "UST10Y"), ("^IRX", "UST3M")],
+    "WFC":  [("^TNX", "UST10Y"), ("^IRX", "UST3M")],
+    "C":    [("^TNX", "UST10Y"), ("^IRX", "UST3M")],
+}
+
+
+def detect_macro_features(ticker):
+    """Returns list of (yf_symbol, feature_name) pairs for ticker, or [] if none defined."""
+    return MACRO_FEATURES.get(ticker, [])
+
+
+def add_macro_features(df, macro_features, start_date, end_date):
+    """
+    Fetch and join macro features (rate data, etc.) into df.
+    No-op if macro_features is empty — safe to call for any ticker.
+    Derives per-source: raw value, 5d change, vs 20d MA.
+    If both UST10Y and UST3M present, also derives yield_curve and yield_curve_chg_5d.
+    """
+    if not macro_features:
+        return df
+
+    fetched = {}
+    for symbol, name in macro_features:
+        raw = yf.download(symbol, start=start_date, end=end_date, progress=False)
+        raw.columns = raw.columns.get_level_values(0)
+        series = raw[["Close"]].rename(columns={"Close": name})
+        series[f"{name}_chg_5d"]  = series[name].pct_change(5)
+        series[f"{name}_vs_ma20"] = series[name] / series[name].rolling(20).mean() - 1
+        df = df.join(series, how="left")
+        ff_cols = [name, f"{name}_chg_5d", f"{name}_vs_ma20"]
+        df[ff_cols] = df[ff_cols].ffill()
+        fetched[name] = True
+        print(f"  ✓ {name}, {name}_chg_5d, {name}_vs_ma20")
+
+    if "UST10Y" in fetched and "UST3M" in fetched:
+        df["yield_curve"]        = df["UST10Y"] - df["UST3M"]
+        df["yield_curve_chg_5d"] = df["yield_curve"].pct_change(5)
+        print("  ✓ yield_curve, yield_curve_chg_5d")
+
+    return df
+
+
+def add_catalyst_proximity(df, ticker, data_dir="data"):
+    """
+    Joins Days_to_catalyst from data/catalysts.csv — days until the next known binary event
+    (PDUFA date or clinical trial readout) for the given ticker.
+    Silent no-op (fills 90) when file missing or ticker not in file.
+    Populate catalysts.csv manually; columns: ticker, date, type, description.
+    """
+    csv_path = os.path.join(data_dir, "catalysts.csv")
+    if not os.path.exists(csv_path):
+        df["Days_to_catalyst"] = 90
+        return df
+
+    cats = pd.read_csv(csv_path)
+    cats["date"] = pd.to_datetime(cats["date"])
+    cats = cats[cats["ticker"].str.upper() == ticker.upper()]
+
+    if cats.empty:
+        df["Days_to_catalyst"] = 90
+        return df
+
+    dates = sorted(cats["date"].dt.normalize().unique())
+
+    def _days_to_next(date):
+        future = [d for d in dates if d >= date]
+        return int((future[0] - date).days) if future else 90
+
+    df["Days_to_catalyst"] = [_days_to_next(d) for d in df.index]
+    print(f"  ✓ Days_to_catalyst ({len(dates)} event(s) for {ticker})")
+    return df
 
 
 def detect_benchmarks(ticker):

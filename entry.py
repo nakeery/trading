@@ -22,7 +22,7 @@ import yfinance as yf
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import precision_score
 from sklearn.preprocessing import StandardScaler
-from benchmarks import detect_benchmarks
+from benchmarks import detect_benchmarks, detect_macro_features, add_macro_features, add_catalyst_proximity
 
 # ─────────────────────────────────────────
 # CONFIG
@@ -105,7 +105,7 @@ def build_features(df, benchmarks):
     df = df.join(vix, how="left")
     df[["VIX", "VIX_chg_5d", "VIX_vs_ma20"]] = df[["VIX", "VIX_chg_5d", "VIX_vs_ma20"]].ffill()
 
-    # Sector/industry benchmark relative strength
+    # Sector/industry benchmark relative strength + sector trend
     for bench_ticker, bench_name in benchmarks:
         raw = yf.download(bench_ticker, start=START_DATE, end=END_DATE, progress=False)
         raw.columns = raw.columns.get_level_values(0)
@@ -115,7 +115,12 @@ def build_features(df, benchmarks):
         df[col] = df[col].ffill()
         for window in [5, 20]:
             df[f"{bench_name}_RS_{window}d"] = close.pct_change(window) - df[col].pct_change(window)
+        df[f"{bench_name}_vs_ma200"] = df[col] / df[col].rolling(200).mean() - 1
         df.drop(columns=[col], inplace=True)
+
+    # Macro features (rate-sensitive tickers, etc.)
+    macro = detect_macro_features(TICKER)
+    df = add_macro_features(df, macro, START_DATE, END_DATE)
 
     # Earnings proximity
     ticker = yf.Ticker(TICKER)
@@ -136,6 +141,8 @@ def build_features(df, benchmarks):
         df["Days_to_earnings"] = [_days_to_next(d) for d in df.index]
     else:
         df["Days_to_earnings"] = 45
+
+    df = add_catalyst_proximity(df, TICKER, DATA_DIR)
 
     # Normalize price-level features
     for period in [20, 50, 200]:
@@ -163,6 +170,11 @@ def build_features(df, benchmarks):
     if "OBV" in df.columns:
         df["OBV_chg_5d"] = df["OBV"].pct_change(5)
         df.drop(columns=["OBV"], inplace=True)
+
+    # Universal momentum / positioning features (generic for any ticker)
+    df["price_vs_52w_high"] = close / close.rolling(252).max() - 1
+    df["price_vs_52w_low"]  = close / close.rolling(252).min() - 1
+    df["vol_ratio"]         = df["Volume"] / df["Volume"].rolling(20).mean()
 
     print("Features built.\n")
     return df

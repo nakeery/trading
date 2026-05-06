@@ -25,6 +25,7 @@ import matplotlib.pyplot as plt
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report
+from benchmarks import detect_macro_features, add_macro_features, add_catalyst_proximity
 
 # ─────────────────────────────────────────
 # CONFIG
@@ -147,6 +148,11 @@ def add_earnings_proximity(df):
 # ─────────────────────────────────────────
 def normalize_features(df):
     close = df["Close"]
+
+    # Universal momentum / positioning features (generic for any ticker)
+    df["price_vs_52w_high"] = close / close.rolling(252).max() - 1
+    df["price_vs_52w_low"]  = close / close.rolling(252).min() - 1
+    df["vol_ratio"]         = df["Volume"] / df["Volume"].rolling(20).mean()
 
     for period in [20, 50, 200]:
         col = f"MA_{period}"
@@ -415,7 +421,12 @@ if __name__ == "__main__":
     print("Building features...")
     df = add_iv_features(df)
     df = add_vix(df)
+    macro = detect_macro_features(TICKER)
+    if macro:
+        print("  Macro features:")
+        df = add_macro_features(df, macro, START_DATE, END_DATE)
     df = add_earnings_proximity(df)
+    df = add_catalyst_proximity(df, TICKER, DATA_DIR)
     df = normalize_features(df)
 
     # Save full df before target truncation for signal summary and HV plot

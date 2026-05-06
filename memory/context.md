@@ -13,7 +13,7 @@ volatility.py   IV expansion ML model (HV >=10% higher in 10d?)    data/{ticker}
 entry.py        Combines both models -> single recommendation        Console output only
 backtest.py     Walk-forward backtest of combined signal             data/{ticker}_backtest.png, data/{ticker}_backtest_results.csv
 sizing.py       Live options chain sizing via Tradier API            Console output only
-benchmarks.py   Shared module — benchmark detection (no output)     Imported by direction.py, entry.py, backtest.py
+benchmarks.py   Shared module — benchmark detection, macro features, catalyst proximity (no output)
 
 Primary daily-use script: entry.py
 Run after ENTER signal: sizing.py
@@ -167,6 +167,8 @@ Troubleshooting History
 - SOFI direction filter inverted in backtest: insufficient training history (2021 onward, 7 windows);
   fixed by reducing MIN_TRAIN_DAYS to 252 (9 windows); edge still thin — fintech needs
   rate/credit/regulatory features to fully discriminate
+- catalysts.csv commas in description field: caused pandas to read CSV with ragged columns,
+  promoting ticker column to row index; fixed by replacing commas with dashes in descriptions
 
 Backtest Results (AMD, Session 3 — 2095 rows, 13 windows, 2020-2026)
   Signal          Count   Avg Ret   Median  Win%    Strong%  AvgWin   AvgLoss
@@ -223,13 +225,78 @@ Work Done — Session 4 (This Device)
     - Gap is thin — model still lacks key fintech macro drivers
     - AMD also improved: STRONG ENTRY now clearly best (4.3%, 57.7% win rate, 15 windows)
 
+Work Done — Session 5 (This Device)
+18. Generalized feature set for any US equity ticker — added to all 4 ML scripts:
+    Universal features (all tickers, no external fetch):
+    - price_vs_52w_high = Close / Close.rolling(252).max() - 1 (distance from 52-week peak)
+    - price_vs_52w_low  = Close / Close.rolling(252).min() - 1 (distance from 52-week trough)
+    - vol_ratio         = Volume / Volume.rolling(20).mean()   (relative volume spike detection)
+    Benchmark sector trend feature (added in add_benchmarks / benchmark loop):
+    - {bench_name}_vs_ma200 = bench_close / bench_close.rolling(200).mean() - 1
+      (is the sector ETF itself in an uptrend?)
+    These are added in normalize_features() for direction.py/volatility.py and inline in
+    build_features() for entry.py/backtest.py.
+
+19. Added modular macro feature layer (rate-sensitive tickers) — benchmarks.py:
+    - MACRO_FEATURES dict: SOFI + major financials (JPM, BAC, GS, MS, WFC, C) -> ^TNX + ^IRX
+    - detect_macro_features(ticker) -> list or []
+    - add_macro_features(df, macro_features, start_date, end_date):
+      Derives: {name}, {name}_chg_5d, {name}_vs_ma20 per rate source
+      If both UST10Y and UST3M present: derives yield_curve and yield_curve_chg_5d
+    - All 4 ML scripts import and call add_macro_features(); no-op for AMD/CRSP
+    - SOFI: UST10Y, UST3M, yield_curve fetched and joined at runtime
+
+20. Ran pipeline on SOFI with new features:
+    - Rate features (UST10Y, UST3M, yield_curve) loaded correctly
+    - Rate features NOT in top drivers — limited data (1340 rows) insufficient to learn
+      rate sensitivity across different rate regimes; expected to improve over time
+    - New universal feature price_vs_52w_low (+) appeared as direction driver immediately
+    - ENTER/REDUCED signal — same as prior session; model stable
+    - Concern: train/test precision inversion (54.6% train vs 76.5% test) — suspicious,
+      test period likely favorable regime not genuine 39pt edge
+    - IV at 89.6th pct with strong contraction signal remains primary concern for call buying
+
+21. Ran pipeline on CRSP (new ticker, biotech):
+    - indicators.py: 2398 rows from 2016-10-01, price $52.38, all RSIs ~50, inside KC bands
+    - CRSP ATH: $210.04 on 2021-01-14; current -75.1% from ATH
+    - entry.py: ENTER/REDUCED — but direction model has near-zero edge (35.3% test precision
+      vs 34.0% base rate); Phase 3 stronger (60.4% vs 31.8% base rate — biotech vol is
+      predictable from HV momentum)
+    - backtest (17 windows, 2018-2026): STAY OUT outperforms STRONG ENTRY (1.3% vs 0.9%)
+      CAUTION avg loss -10.0% comparable to STAY OUT -10.1% (pattern breaks vs AMD/NVDA/SOFI)
+      STRONG ENTRY avg loss -13.8% — binary event risk materializes in loss magnitude
+    - Verdict: CRSP direction model inverted, unsuitable for directional calls
+      FDA/trial binary events drive price, not technical indicators
+    - WIN threshold for CRSP: 5.9% in 15 days (vol-adjusted, same sigma difficulty as AMD)
+
+22. Added Days_to_catalyst feature via data/catalysts.csv:
+    - Manual CSV: ticker, date, type (trial_readout/pdufa), description
+    - add_catalyst_proximity(df, ticker, data_dir) in benchmarks.py:
+      Reads catalysts.csv, filters by ticker, computes days to next future event
+      Defaults to 90 silently if file missing or ticker not listed (AMD, SOFI unaffected)
+      Prints "✓ Days_to_catalyst (N event(s) for TICKER)" when events found
+    - All 4 ML scripts import and call add_catalyst_proximity() after earnings proximity
+    - CRSP: Days_to_catalyst immediately appeared as top direction driver (-)
+      — far from catalyst is bearish for CRSP direction (big moves happen ON catalyst days)
+    - data/catalysts.csv seeded with 2 placeholder CRSP rows; user should update with real dates
+    - Troubleshooting: commas in description field caused ragged CSV parse error;
+      fixed by replacing commas with dashes in description values
+
+Backtest Results (CRSP, Session 5 — 2398 rows, 17 windows, 2018-2026) [INVERTED — unsuitable]
+  Signal          Count   Avg Ret   Median  Win%    Strong%  AvgWin   AvgLoss
+  STRONG ENTRY      122     0.9%    -0.1%   49.2%    35.2%   16.1%   -13.8%
+  CAUTION           381     0.7%    -1.0%   46.2%    31.0%   13.2%   -10.0%
+  STAY OUT         1502     1.3%    -0.7%   47.9%    32.2%   13.8%   -10.1%  <- best avg return
+  ALL DAYS         2005     1.2%    -0.8%   47.7%    32.1%   13.8%   -10.3%
+
 Next Steps (planned, not yet implemented)
-- Add interest rate features to improve SOFI model (and other rate-sensitive tickers):
-  10Y treasury yield, Fed funds rate, yield curve slope (10Y-2Y spread)
-  These are the primary macro drivers for fintech banks that current feature set misses
-- Expand to support different markets / asset classes beyond US equities
-  Design consideration: macro features should be modular/optional so they don't break
-  non-rate-sensitive tickers (semiconductors, etc.)
+- Update data/catalysts.csv with real CRSP PDUFA and trial readout dates (replace placeholders)
+- Consider buying straddles/strangles before PDUFA dates for CRSP instead of directional calls
+  — Phase 3 IV expansion model is reliable for biotech; direction model is not
+- Add interest rate features to improve SOFI model (rate features loaded but need more data/
+  rate regime variation before they show up as significant contributors):
+  Rate features already wired up via MACRO_FEATURES; need time and different rate regimes
+- Expand MACRO_FEATURES to other rate-sensitive tickers as they're added to watchlist
 - Potential benchmark improvements for SOFI: replace/augment KBE+XLF with fintech peers
   (ARKF, UPST) — SOFI trades more like growth/fintech than traditional banking
 
@@ -243,7 +310,8 @@ Key Findings
   — IV contraction risk on losing trades is real and validates REDUCED position sizing
 - Ticker suitability: AMD well-suited; SOFI marginal (short history, missing rate features —
   inversion fixed by reducing MIN_TRAIN_DAYS to 252 but edge remains thin);
-  NVDA marginal (bull trend too strong, vol regime change hurts Phase 3)
+  NVDA marginal (bull trend too strong, vol regime change hurts Phase 3);
+  CRSP unsuitable for direction (binary FDA/trial events; Phase 3 viable for vol plays)
 
 Important Notes
 - backtest.py is SELF-CONTAINED — does NOT import from direction.py or volatility.py
@@ -254,6 +322,7 @@ Important Notes
 - Unicode arrow issue (->): not a problem in VS Code/Windows Terminal; only affects cmd.exe cp1252
 - FORWARD_DAYS = 15 kept intentionally — acts as entry timing signal, not holding period predictor
   Considered changing to 63 days to match 3-month minimum hold; kept at 15 for now
+- data/catalysts.csv must have no commas in description field (use dashes instead)
 
 Tech Stack
 yfinance, pandas, numpy, ta, matplotlib, scikit-learn (LogisticRegression, StandardScaler,
