@@ -66,6 +66,11 @@ SECTOR_BENCHMARK = {
 
 FALLBACK_BENCHMARK = ("^GSPC", "SPX")
 
+# Tickers where catalyst proximity is noise in direction models (binary events dominate).
+# Days_to_catalyst is neutralized (set to 90 sentinel) when for_direction=True.
+# Phase 3 / volatility models are unaffected — IV expansion near events is real signal.
+EVENT_DRIVEN_TICKERS = {"CRSP"}
+
 # Opt-in macro features for rate/commodity-sensitive tickers.
 # Format: "TICKER": [(yf_symbol, feature_name), ...]
 # Add new tickers as needed; tickers not listed get no macro features.
@@ -116,14 +121,19 @@ def add_macro_features(df, macro_features, start_date, end_date):
     return df
 
 
-def add_catalyst_proximity(df, ticker, data_dir="modules"):
+def add_catalyst_proximity(df, ticker, data_dir="modules", for_direction=False):
     """
     Joins Days_to_catalyst from data/catalysts.csv — days until the next known binary event
     (PDUFA date or clinical trial readout) for the given ticker.
     Silent no-op (fills 90) when file missing or ticker not in file.
     Populate catalysts.csv manually; columns: ticker, date, type, description.
+    for_direction=True neutralizes event-driven tickers (EVENT_DRIVEN_TICKERS) by filling 90 —
+    catalyst proximity is noise for direction models when events are binary and unpredictable.
     """
-    csv_path ="catalysts.csv"
+    if for_direction and ticker.upper() in EVENT_DRIVEN_TICKERS:
+        df["Days_to_catalyst"] = 90
+        return df
+    csv_path = os.path.join(data_dir, "catalysts.csv")
     if not os.path.exists(csv_path):
         df["Days_to_catalyst"] = 90
         return df

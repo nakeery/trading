@@ -30,12 +30,12 @@ from modules.benchmarks import detect_macro_features, add_macro_features, add_ca
 # ─────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────
-TICKER         = "AMD"
-START_DATE     = "2018-01-01"
+# TICKER         = "AMD"
+START_DATE     = "1792-05-17"
 END_DATE       = ""  # set automatically from CSV
 DATA_DIR       = "data"
 MODULE_DIR     = "modules"
-INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
+# INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 
 HV_WINDOW           = 20    # Days for realized vol calculation
 IV_RANK_WINDOW      = 252   # 1 trading year lookback for IV rank/percentile
@@ -414,10 +414,16 @@ def compute_vol_thresholds(df):
 # MAIN
 # ─────────────────────────────────────────
 if __name__ == "__main__":
-    ticker_in = input(f"  Ticker [{TICKER}]: ").strip().upper()
-    if ticker_in:
-        TICKER         = ticker_in
-        INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
+    while True:
+        try:
+            ticker_in = input("  Ticker [XYZ]: ").strip().upper()
+            if ticker_in:
+                TICKER         = ticker_in
+                INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
+                break
+        except (KeyboardInterrupt):
+            print()
+            sys.exit(0)
 
     df = load_indicators(INDICATORS_CSV)
     compute_vol_thresholds(df)

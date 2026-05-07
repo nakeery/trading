@@ -30,12 +30,12 @@ from modules.benchmarks import detect_benchmarks, detect_macro_features, add_mac
 # ─────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────
-TICKER         = "AMD"
-START_DATE     = "2018-01-01"
+# TICKER         = "AMD"
+START_DATE     = "1792-05-17"
 END_DATE       = ""  # set automatically from CSV
 DATA_DIR       = "data"
 MODULE_DIR     = "modules"
-INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
+# INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 
 HV_WINDOW      = 20     # Rolling window for realized vol (trading days)
 FORWARD_DAYS     = 15    # Days ahead to evaluate win/loss (entry timing)
@@ -368,10 +368,16 @@ def compute_vol_thresholds(df):
 # MAIN
 # ─────────────────────────────────────────
 if __name__ == "__main__":
-    ticker_in = input(f"  Ticker [{TICKER}]: ").strip().upper()
-    if ticker_in:
-        TICKER         = ticker_in
-        INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
+    while True:
+        try:
+            ticker_in = input("  Ticker [XYZ]: ").strip().upper()
+            if ticker_in:
+                TICKER         = ticker_in
+                INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
+                break
+        except (KeyboardInterrupt):
+            print()
+            sys.exit(0)
 
     df = load_indicators(INDICATORS_CSV)
     compute_vol_thresholds(df)
@@ -395,7 +401,7 @@ if __name__ == "__main__":
         print("  Macro features:")
         df = add_macro_features(df, macro, START_DATE, END_DATE)
     df = add_earnings_proximity(df)
-    df = add_catalyst_proximity(df, TICKER, MODULE_DIR)
+    df = add_catalyst_proximity(df, TICKER, MODULE_DIR, for_direction=True)
     df = normalize_features(df)
 
     # Phase 2 — 15-day direction model

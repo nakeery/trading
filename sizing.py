@@ -28,9 +28,9 @@ import datetime
 # ─────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────
-TICKER               = "AMD"
+# TICKER               = "AMD"
 DATA_DIR             = "data"
-INDICATORS_CSV       = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
+# INDICATORS_CSV       = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 TRADIER_TOKEN        = "Bu4Zf6XIUJT7fC08NxopO5JDdh6I"  # replace with your brokerage token
 TRADIER_URL          = "https://api.tradier.com/v1"
 MIN_DTE              = 180   # ~6 months
@@ -244,10 +244,16 @@ if __name__ == "__main__":
         print("  Set TRADIER_TOKEN in sizing.py before running.")
         exit(1)
 
-    ticker_in = input(f"  Ticker [{TICKER}]: ").strip().upper()
-    if ticker_in:
-        TICKER         = ticker_in
-        INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
+    while True:
+        try:
+            ticker_in = input("  Ticker [XYZ]: ").strip().upper()
+            if ticker_in:
+                TICKER         = ticker_in
+                INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
+            break
+        except (KeyboardInterrupt):
+            print()
+            sys.exit(0)
 
     budget_in = input(f"  Budget ($): ").strip()
     try:

@@ -29,8 +29,8 @@ from matplotlib.gridspec import GridSpec
 # ─────────────────────────────────────────
 # CONFIG — adjust these to your preference
 # ─────────────────────────────────────────
-TICKER       = "AMD"
-START_DATE   = "2018-01-01"
+# TICKER       = "AMD"
+START_DATE   = "1792-05-17"
 END_DATE     = datetime.date.today().strftime("%Y-%m-%d")
 DATA_DIR     = "data"
 
@@ -284,14 +284,22 @@ def plot_dashboard(df):
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     print("─" * 40)
-    ticker_in = input(f"  Ticker       [{TICKER}]: ").strip().upper()
+    while True:
+        try:
+            ticker_in = input("  Ticker        [XYZ]: ").strip().upper()
+            if ticker_in:
+                break
+            print("  Ticker cannot be empty.")
+        except KeyboardInterrupt:
+            print()
+            sys.exit(0)
     start_in  = input(f"  Start date   [{START_DATE}]: ").strip()
     end_in    = input(f"  End date     [{END_DATE}]: ").strip()
     print("─" * 40)
 
-    TICKER     = ticker_in     or TICKER
-    START_DATE = start_in      or START_DATE
-    END_DATE   = end_in        or END_DATE
+    TICKER     = ticker_in
+    START_DATE = start_in or START_DATE
+    END_DATE   = end_in   or END_DATE
 
     try:
         df = fetch_data(TICKER, START_DATE, END_DATE)
