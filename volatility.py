@@ -108,7 +108,17 @@ def add_vix(df):
     vix["VIX_vs_ma20"] = vix["VIX"] / vix["VIX"].rolling(20).mean() - 1
     df = df.join(vix, how="left")
     df[["VIX", "VIX_chg_5d", "VIX_vs_ma20"]] = df[["VIX", "VIX_chg_5d", "VIX_vs_ma20"]].ffill()
-    print("  ✓ VIX, VIX_chg_5d, VIX_vs_ma20")
+
+    for sym, col in [("^VIX9D", "VIX9D"), ("^VIX3M", "VIX3M")]:
+        r = yf.download(sym, start=START_DATE, end=END_DATE, progress=False)
+        r.columns = r.columns.get_level_values(0)
+        df = df.join(r[["Close"]].rename(columns={"Close": col}), how="left")
+        df[col] = df[col].ffill()
+    df["VIX9D_VIX_ratio"] = (df["VIX9D"] / df["VIX"]).fillna(1.0)
+    df["VIX_VIX3M_ratio"] = (df["VIX"] / df["VIX3M"]).fillna(1.0)
+    df.drop(columns=["VIX9D", "VIX3M"], inplace=True)
+
+    print("  ✓ VIX, VIX_chg_5d, VIX_vs_ma20, VIX9D_VIX_ratio, VIX_VIX3M_ratio")
     return df
 
 

@@ -13,10 +13,12 @@ Script          Purpose                                              Output
 indicators.py   Fetch OHLCV, compute 30+ indicators                 data/{ticker}_indicators.csv, data/{ticker}_dashboard.png
 direction.py    Direction ML model (Phase 2 + 2B)                   data/{ticker}_ml_features.csv, data/{ticker}_ml_results.png
 volatility.py   IV expansion ML model (Phase 3)                    data/{ticker}_phase3_features.csv, data/{ticker}_phase3_results.png
-entry.py        Combines models -> single SIGNAL recommendation      Console output only
+entry.py        Combines models -> SIGNAL + IV/HV gate              Console + data/iv_log.csv (append-only)
 backtest.py     Walk-forward backtest of combined signal             data/{ticker}_backtest.png, data/{ticker}_backtest_results.csv
 sizing.py       Live options chain sizing via Tradier API            Console output only
-modules/benchmarks.py  Shared module — benchmarks, macro features, catalyst proximity (no output)
+modules/benchmarks.py  Shared module — benchmarks, macro features, catalyst proximity
+modules/tradier.py     Shared Tradier API client + get_atm_iv()    (no output; imported by sizing/entry)
+calibrate_multipliers.py  One-off P2/P3 multiplier sweep tool       data/{ticker}_multiplier_sweep.csv, data/multiplier_calibration.png
 
 Primary daily-use script: entry.py
 Run after entry signal is actionable: sizing.py
@@ -33,6 +35,8 @@ Decision Framework
 - Phase 2 (15d direction) fires = entry timing signal
 - Phase 2B (63d direction) confirms or rejects medium-term thesis
 - Phase 3 (IV expansion) = position SIZING input, not go/no-go gate
+- [S8] IV/HV gate (entry.py): live ATM IV from Tradier, downgrades STRONG ENTRY -> CAUTION
+  if IV/HV >= 1.40. Surfaces options-market info the HV-only model can't see.
 
 Backtest Signal Labels (used in both entry.py and backtest.py)
   STRONG ENTRY    = 15d WIN + 63d WIN + Phase 3 EXPANSION
@@ -153,15 +157,104 @@ Session 7 — Catalyst Fix + Output Polish + Geopolitical Awareness (current dev
    - sizing.py at $5K budget: only deep OTM (715-745) fits at 1 contract per expiry;
      IV/HV ratio 1.6-1.8x (every row marked ^ = IV expensive vs HV)
 
+Session 8 — Multiplier Validation, New Features, Tradier IV Gate (2026-05-07, same day as S7)
+
+1. Multiplier sweep tooling
+   - calibrate_multipliers.py: classification-edge sweep over P2_VOL_MULTIPLE (0.20-1.80) and
+     P3_VOL_MULTIPLE (0.10-0.40); outputs CSV per ticker + combined PNG
+   - backtest.py MULTIPLIER_SWEEP config (list of (p2,p3) tuples; empty=default behavior):
+     iterates over combinations, prints comparison table sorted by STRONG ENTRY avg return,
+     flags hierarchy-monotonic combos
+   - Both tools self-contained; production multipliers untouched unless deliberately changed
+
+2. Multiplier validation: 0.41 / 0.20 are correct
+   - Classification sweep on QQQ suggested P2 optimum at 0.90 (edge 11.6pp vs 6.6pp at 0.41)
+     and SPY at 1.50 (edge 16.6pp vs 10.6pp at 0.41) — looked like big improvement
+   - But the trading-metric backtest sweep (QQQ, P2 in {0.25, 0.41, 0.90} × P3=0.20):
+     STRONG ENTRY avg ~2.3-2.5% across all three values (statistically identical),
+     0.90 BROKE the signal hierarchy (SHORT-TERM ONLY 1.6% > CAUTION 1.4%)
+   - Lesson: classification edge ≠ trading P&L. Strict labels lower base rates,
+     inflating "edge" in the score formula without improving real returns.
+   - 0.41 / 0.20 stay as production constants. Multiplier sweep tool is for future
+     ticker-specific calibration if needed.
+
+3. Two new feature additions to the model
+   - Gap features in indicators.py:
+       gap_pct    = (Open - prev_Close) / prev_Close
+       gap_ma_5d  = 5-day rolling mean of gap_pct (directional drift from overnight news)
+       gap_vol_5d = 5-day rolling mean of |gap_pct| (recent gap activity / news velocity)
+     Computed once in indicators.py; flows into all downstream CSVs automatically.
+     backtest.py computes them inline as fallback if CSV is stale (self-containment preserved).
+   - VIX term structure in direction.py / volatility.py / entry.py / backtest.py:
+       VIX9D_VIX_ratio = ^VIX9D / ^VIX  (>1 = near-term fear elevated)
+       VIX_VIX3M_ratio = ^VIX / ^VIX3M  (<1 = backwardation = stress regime)
+     Neutral fill (1.0) for dates before VIX9D/VIX3M history starts (~2011-2013).
+     This addresses the "VIX term structure feature" mitigation listed in S7.
+
+4. Pipeline run on QQQ / SPY / NVDA (May 6 close) — current state assessment
+   - All three: STAY OUT (Phase 2 below 55% threshold; markets extended at RSI 60-80, above KC)
+   - Backtests with new features (no regression vs S6 baseline):
+     QQQ  (2001-2026, 53 windows): STRONG ENTRY 2.0% / 65% win  (was 2.3% S6; -0.3pp explained
+            by 2 extra 2026 windows including geopolitical-stress period)
+     SPY  (1995-2026, 31y): STRONG ENTRY 0.8% / 64% — barely above ALL DAYS 0.7%; CAUTION
+            (0.9%) actually beats STRONG. Hierarchy broken. Framework finds no edge on SPY.
+     NVDA (2001-2026, 25y): STRONG ENTRY 4.4% / 65% win — BEST result in project. Decisively
+            beats AMD (2.6%) and QQQ (2.0%). Reclassify NVDA from "marginal" to "well-suited".
+   - Cross-ticker pattern: STRONG ENTRY win rate ≈ 65% across all three. That's a
+     reproducible framework property (tunable target for new tickers — if backtest <60%,
+     ticker is probably unsuitable).
+   - SPY finding is structural: broad-market efficiency dampens signal below noise threshold.
+     Framework's lens (price-action, momentum, sector RS) is wrong for macro-driven SPY.
+     Not a tuning problem.
+
+5. Tradier IV gate in entry.py — Priority 1 step shipped
+   - New module: modules/tradier.py — extracted shared API client (was in sizing.py).
+     Includes get_atm_iv(ticker, target_dte=30) → {price, iv, expiry, dte, atm_strike}.
+     TRADIER_TOKEN reads $env:TRADIER_TOKEN if set, else hardcoded fallback (security improvement).
+   - sizing.py refactored to import from modules/tradier — behavior unchanged.
+   - entry.py:
+       After signal computation, fetches ATM call IV at ~30 DTE (apples-to-apples with HV-20).
+       Computes IV/HV ratio with labels: cheap (<0.85) / fair / rich (>=1.20) / very rich (>=1.40).
+       Gate: if signal == STRONG ENTRY AND IV/HV >= IV_HV_GATE_RICH (1.40), downgrade to
+              CAUTION + REDUCED with explanatory note.
+       Displays the IV section regardless of signal — informative on STAY OUT too.
+       Graceful fallback: any Tradier error prints "IV check unavailable: ..." and continues.
+   - Forward-accumulating dataset: data/iv_log.csv appends one row per entry.py run with
+     date, ticker, price, atm_iv, expiry, dte, hv_20, iv_hv_ratio, label, signal_pre, signal_post.
+     After ~3-6 months: enough history to feature-engineer real IV into Phase 3 retraining.
+   - First QQQ snapshot (2026-05-06): ATM IV 20.6% / HV 14.2% / ratio 1.46 = "very rich".
+     Signal was STAY OUT so gate didn't fire, but the snapshot validates the documented
+     "options market sees what HV-based Phase 3 cannot" gap from S7.
+
 Backtest Results (Most Recent / Representative)
 
-QQQ (51 windows, 2002-2026) — best statistical validation in project
+QQQ (53 windows, 2001-2026, post-S8 features) — framework reference baseline
   Signal           Count   Avg Ret   Median  Win%   Strong%  AvgWin  AvgLoss
-  STRONG ENTRY       501     2.3%     2.5%   65.5%   55.1%    5.6%   -4.1%   <- best
-  CAUTION           1082     1.2%     1.8%   61.4%   50.3%    4.6%   -4.2%
-  SHORT-TERM ONLY    518     0.7%     1.6%   60.2%   48.1%    4.1%   -4.6%
-  STAY OUT          4005     0.6%     1.2%   61.9%   43.1%    3.3%   -3.7%
-  ALL DAYS          6106     0.9%     1.4%   62.0%   45.8%    3.8%   -3.9%
+  STRONG ENTRY       619     2.0%     2.4%   64.9%   53.3%    5.4%   -4.1%   <- best
+  CAUTION           1364     1.1%     1.8%   62.1%   50.1%    4.4%   -4.3%
+  SHORT-TERM ONLY    558     0.3%     0.8%   56.5%   43.4%    4.1%   -4.6%
+  STAY OUT          3772     0.6%     1.2%   61.5%   42.6%    3.5%   -3.9%
+  Note: -0.3pp vs S6 baseline (was 2.3%) explained by 2 extra 2026 windows in stress period
+
+NVDA (25 windows, 2001-2026, post-S8 features) — RECLASSIFIED well-suited (was marginal)
+  Signal           Count   Avg Ret   Median  Win%   Strong%  AvgWin  AvgLoss
+  STRONG ENTRY       392     4.4%     4.9%   65.3%   52.8%   14.4%  -14.5%   <- BEST in project
+  CAUTION           1269     1.7%     2.4%   56.4%   45.0%   11.2%  -10.8%
+  SHORT-TERM ONLY    323     4.1%     3.0%   60.7%   44.6%   12.7%   -9.3%
+  STAY OUT          4361     2.5%     2.0%   58.5%   40.6%   10.0%   -8.0%
+  S7 said "marginal — bull trend too strong"; data contradicts that. STRONG ENTRY 4.4% beats AMD.
+  Long history dilutes the recent-regime objection; new gap+VIX9D features may also help.
+
+SPY (31 years, 1995-2026, post-S8 features) — UNSUITABLE for this framework
+  Signal           Count   Avg Ret   Median  Win%   Strong%  AvgWin  AvgLoss
+  STRONG ENTRY       898     0.8%     1.1%   63.6%   47.1%    3.6%   -4.1%
+  CAUTION           1189     0.9%     1.2%   61.9%   48.6%    3.4%   -3.1%   <- inverted!
+  SHORT-TERM ONLY    724     0.2%     0.8%   58.7%   43.6%    3.1%   -3.8%
+  STAY OUT          5044     0.7%     1.2%   65.6%   47.3%    2.6%   -3.0%
+  ALL DAYS          7855     0.7%     1.1%   64.2%   47.2%    2.9%   -3.2%
+  STRONG ENTRY beats ALL DAYS by 0.1pp = noise. Hierarchy broken (CAUTION>STRONG).
+  Structural: SPY moves are macro-driven (Fed, GDP, geopolitics); framework's price-action
+  + momentum + sector-RS lens is the wrong tool. Don't use as primary ticker.
 
 AMD (15 windows, 2019-2026) — well-suited; baseline ticker
   Signal           Count   Avg Ret   Median  Win%   Strong%  AvgLoss
@@ -202,31 +295,40 @@ geopolitical crises:
   - Don't size like the SHORT-TERM ONLY backtest avg return (0.7%) — those windows
     don't include "Iran-war-2026" type events
 
-Potential Mitigations (not yet implemented)
-- VIX term structure feature: VIX9D/VIX or VIX/VIX3M ratio — captures dealer hedging
-  and near-term shock pricing in a way HV-derived features cannot
-- Put/call ratio or skew metric from Tradier — direct options-market positioning signal
-- News/sentiment feature scoped to conflict-related keywords (e.g. NewsAPI integration)
-- Manual "elevated tail risk" override flag in entry.py — switch to conservative
-  thresholds when user knows a binary catalyst (Fed week, war escalation) is pending
-- Replace HV proxy with actual ATM IV from Tradier in Phase 3 — already integrated
-  via sizing.py; closing the HV-proxy gap is Priority 1
+Potential Mitigations
+- [DONE S8] VIX term structure features (VIX9D_VIX_ratio, VIX_VIX3M_ratio) added to all
+  ML scripts — captures dealer hedging and near-term shock pricing
+- [DONE S8] Live ATM IV gate at entry time — IV/HV ratio computed; STRONG ENTRY -> CAUTION
+  if ratio >= 1.40 (very rich). Forward-accumulating data/iv_log.csv builds historical
+  IV dataset for eventual Phase 3 retraining (~3-6 months out)
+- [TODO] Put/call ratio or skew metric from Tradier — direct options-market positioning signal
+- [TODO] News/sentiment feature scoped to conflict-related keywords (NewsAPI integration)
+- [TODO] Manual "elevated tail risk" override flag in entry.py — conservative thresholds
+  when user knows a binary catalyst (Fed week, war escalation) is pending
+- [TODO/Phase 2] Once iv_log.csv has 3-6 months of history, retrain Phase 3 with real IV
+  features instead of HV proxy. Considering paid options history (ORATS/CBOE) to backfill
+  if real-IV results justify the cost.
 
 Known Issues (not yet fixed)
 - indicators.py: unused `import mdates`
 - direction.py: dead `N_ESTIMATORS = 200` constant (Random Forest leftover)
-- sizing.py: TRADIER_TOKEN hardcoded in source (security risk — should be env var)
+- modules/tradier.py: TRADIER_TOKEN now reads $env:TRADIER_TOKEN if set; hardcoded
+  fallback still in source. Set the env var to keep token out of git.
 
 Improvements (Identified, Not Yet Implemented)
 
 Priority 1 — close the HV/IV proxy gap and add macro tail risk visibility
-  - Actual IV from Tradier options chain fed back into Phase 3 (closes HV-proxy gap)
-  - VIX term structure + put/call ratio for dealer hedging visibility
-  - Earnings estimate revision direction (finviz/yfinance) for individual stocks
+  - [DONE S8] VIX term structure features (VIX9D_VIX_ratio, VIX_VIX3M_ratio)
+  - [DONE S8] Live ATM IV gate at entry time + forward IV history accumulation
+  - [TODO] Put/call ratio or skew metric from Tradier
+  - [TODO/Phase 2] Phase 3 retraining on real IV history (after iv_log.csv accumulates ~3-6mo)
+  - [TODO] Earnings estimate revision direction (finviz/yfinance) for individual stocks
 Priority 2 — additional individual stock signals
   - Short interest ratio (FINRA monthly): high short + positive momentum = squeeze setup
   - Relative valuation (P/S, P/E vs 3-year history) — distinguishes oversold cheap vs
     oversold expensive
+  - Macro feature layer for indexes (yield curve, credit spread, DXY) — only worth it
+    if SPY tuning is wanted; current verdict says SPY is structurally unsuitable
 Priority 3 — model quality
   - Probability calibration (isotonic regression) so "72% win prob" actually means 72%
   - Currently logistic regression outputs are scores not calibrated probabilities
@@ -234,7 +336,8 @@ Won't fix / structural
   - Binary event direction (FDA decisions, trial readouts) — direction unknowable from
     price/volume features
   - Geopolitical shocks — see Geopolitical Risk Limitation above
-  - Secular trend regimes (NVDA 2023-2024 parabolic) — would require explicit regime labels
+  - SPY edge — broad-market efficiency dampens framework lens below noise threshold
+    (verified S8: 0.1pp edge over base, broken hierarchy across 31 years)
 
 Important Notes
 - Use the PowerShell tool (NOT Bash) for piped script execution on Windows.
@@ -243,7 +346,10 @@ Important Notes
 - backtest.py is SELF-CONTAINED — does NOT import from direction.py or volatility.py.
   If feature engineering changes there, backtest.py must be manually updated.
 - data/ directory must exist before running any script (user created manually)
-- modules/ contains benchmarks.py and catalysts.csv (the catalyst event ledger)
+- modules/ contains benchmarks.py (sector + macro + catalysts), tradier.py (S8 — shared
+  Tradier API client used by sizing.py and entry.py), and catalysts.csv (catalyst event ledger)
+- data/iv_log.csv (S8) is append-only — every entry.py run adds one row. Used to build
+  forward-looking IV history for eventual Phase 3 retraining on real IV (not HV proxy)
 - trade/ subdirectory is the Python virtual environment — do not delete
 - memory/ subdirectory in project root is Claude's auto-memory system
 - FORWARD_DAYS = 15 kept intentionally — entry timing signal, not holding period predictor
@@ -254,7 +360,7 @@ Important Notes
 
 Tech Stack
 yfinance, pandas, numpy, ta, matplotlib, scikit-learn (LogisticRegression, StandardScaler,
-precision_score), lxml (earnings dates), requests (Tradier API in sizing.py)
+precision_score), lxml (earnings dates), requests (Tradier API via modules/tradier.py)
 
 Model Details
 All models: Logistic Regression (C=0.1, class_weight="balanced", 80/20 time-based split)
@@ -268,19 +374,33 @@ Vol-adjusted thresholds: compute_vol_thresholds() auto-calibrates at runtime
   EXPANSION_THRESHOLD = P3_VOL_MULTIPLE × median_HV
   P2_VOL_MULTIPLE=0.41; P3_VOL_MULTIPLE=0.20
 
-Sizing.py Config
-TRADIER_TOKEN = brokerage token (not sandbox)
-MIN_DTE = 180, MAX_DTE = 365 (6-12 month expiries)
+Tradier Config (modules/tradier.py + sizing.py)
+TRADIER_TOKEN = $env:TRADIER_TOKEN if set, else hardcoded fallback (S8 refactor)
+MIN_DTE = 180, MAX_DTE = 365 (6-12 month expiries) — sizing.py default
 DEFAULT_STRIKE_RANGE = 10 strikes above/below ATM
-IV source: smv_vol (smoothed model vol, matches Tradier app display)
+IV source: smv_vol (smoothed model vol, matches Tradier app display) — fallback: mid_iv
+get_atm_iv(ticker, target_dte=30) — picks closest-to-30-DTE expiry, returns ATM call IV
 
-Ticker Suitability (current understanding)
+Entry.py IV/HV Gate (S8)
+IV_HV_FAIR_LOW = 0.85   — below: premium cheap vs realized (favorable for buyers)
+IV_HV_FAIR_HIGH = 1.20  — above: premium rich
+IV_HV_GATE_RICH = 1.40  — above: STRONG ENTRY downgrades to CAUTION (REDUCED sizing)
+IV_TARGET_DTE = 30      — ATM IV expiry tenor (matches HV-20 timeframe)
+data/iv_log.csv columns: log_time, signal_date, ticker, price, atm_iv, iv_expiry,
+                         iv_dte, hv_20, iv_hv_ratio, iv_hv_label, signal_pre_gate, signal_post_gate
+
+Ticker Suitability (post-S8)
+- QQQ:  best statistical case; 53 windows; clean hierarchy; framework reference baseline
+        STRONG ENTRY 2.0% / 65% win
+- NVDA: WELL-SUITED (was "marginal" in S7) — STRONG ENTRY 4.4% / 65% win, BEST in project.
+        Long history dilutes the post-2023 regime-change concern.
 - AMD:  well-suited; 15 walk-forward windows; STRONG ENTRY 2.6%/59.7% win rate
-- QQQ:  best statistical case; 51 windows; clean signal hierarchy; framework reference
 - SOFI: marginal — short history (2021 IPO); rate features need more rate-regime variation
-- NVDA: marginal — bull trend too strong post-2023 AI pivot; vol regime change hurts Phase 3
 - CRSP: unsuitable for direction (binary FDA/trial events); Phase 3 viable for vol plays
         (consider straddle/strangle around PDUFA dates rather than directional calls)
+- SPY:  UNSUITABLE — 0.1pp edge over base rate, hierarchy broken (S8 finding).
+        Structural mismatch: framework is price-action/momentum, SPY is macro-driven.
+        Don't use as primary ticker.
 
 Cross-Ticker Findings
 - Direction filter (Phase 2) works: STAY OUT consistently underperforms benchmark
@@ -293,3 +413,13 @@ Cross-Ticker Findings
   — longer horizon filters out binary event noise)
 - SHORT-TERM ONLY ticker-dependent: best on AMD (12.2% — momentum bursts) but worst on
   QQQ (0.7% — no sharp momentum bursts on an index)
+- [S8] STRONG ENTRY win rate ≈ 65% across QQQ/NVDA/SPY — reproducible framework property.
+  Use as suitability test: if a new ticker can't hit ~60%+ STRONG win rate, probably unsuitable.
+- [S8] Framework's edge concentrates where micro-inefficiencies exist:
+  individual stocks (NVDA 4.4%, AMD 2.6%) > tech-heavy index (QQQ 2.0%) > broad index (SPY 0.8%).
+  Lens is wrong for macro-driven tickers; correct for momentum/growth-driven tickers.
+- [S8] Classification edge ≠ trading P&L. Multiplier sweep on classification metric suggested
+  P2_VOL_MULTIPLE=0.90 was 4× better than 0.41; trading-metric backtest sweep showed
+  identical STRONG ENTRY returns (~2.4% across 0.25/0.41/0.90) and 0.90 broke hierarchy.
+  Always validate threshold-tuning ideas via backtest STRONG ENTRY avg return, not via
+  precision-edge metrics.

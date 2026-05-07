@@ -72,6 +72,7 @@ Seven scripts. `indicators.py` must run first — all downstream scripts depend 
 | `backtest.py` | Walk-forward backtest (51 windows for QQQ; 15 for AMD; 17 for CRSP) | `data/{ticker}_backtest.png`, `data/{ticker}_backtest_results.csv` |
 | `sizing.py` | Live options chain sizing via Tradier API | Console only |
 | `modules/benchmarks.py` | Shared sector benchmarks, macro features, catalyst proximity | Imported by direction/entry/backtest/volatility |
+| `modules/tradier.py` | Shared Tradier API client + `get_atm_iv()` | Imported by sizing/entry |
 
 All CSVs and PNGs are written to the `data/` subdirectory (must exist — create manually if missing).
 
@@ -89,6 +90,10 @@ All CSVs and PNGs are written to the `data/` subdirectory (must exist — create
 - Phase 2 (15d) drives ENTER vs STAY OUT
 - Phase 2B (63d) confirms or rejects medium-term thesis
 - Phase 3 (IV expansion) modulates sizing — not a go/no-go gate
+- **IV/HV gate (`entry.py` only)**: live ATM IV (~30 DTE) is fetched from Tradier and compared to HV-20.
+  If `signal == STRONG ENTRY` and `IV/HV >= 1.40`, downgrade to `CAUTION` (premium too rich for the
+  vol-expansion thesis). The ratio + label (cheap/fair/rich/very rich) prints regardless of signal.
+  Each run appends a row to `data/iv_log.csv` for forward-accumulating IV history.
 
 ## Key Design Decisions
 
@@ -159,7 +164,7 @@ See `memory/context.md` "Geopolitical Risk Limitation" for proposed mitigations 
 
 - `indicators.py`: unused `import mdates`
 - `direction.py`: dead `N_ESTIMATORS = 200` constant (Random Forest leftover)
-- `sizing.py`: `TRADIER_TOKEN` hardcoded in source (security risk — should be env var)
+- `modules/tradier.py`: `TRADIER_TOKEN` reads `$env:TRADIER_TOKEN` if set, else falls back to hardcoded constant (security improvement — set the env var to keep token out of git)
 
 ## Important Warnings
 

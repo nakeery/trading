@@ -107,6 +107,11 @@ def add_indicators(df):
     df["Stoch_K"] = stoch.stoch()
     df["Stoch_D"] = stoch.stoch_signal()
 
+    # --- Overnight Gap ---
+    df["gap_pct"]    = (df["Open"] - df["Close"].shift(1)) / df["Close"].shift(1)
+    df["gap_ma_5d"]  = df["gap_pct"].rolling(5).mean()
+    df["gap_vol_5d"] = df["gap_pct"].abs().rolling(5).mean()
+
     print("Indicators calculated:")
     indicator_cols = [c for c in df.columns if c not in ["Open","High","Low","Close","Adj Close","Volume"]]
     for col in indicator_cols:

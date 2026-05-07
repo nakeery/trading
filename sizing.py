@@ -13,17 +13,24 @@ Run after signal.py fires an ENTER signal to determine:
 Setup:
   1. Open a free Tradier brokerage account at tradier.com
   2. Get your API token from Account > API Access (use brokerage token, not sandbox)
-  3. Paste it into TRADIER_TOKEN below
+  3. Set $env:TRADIER_TOKEN = "..." or edit modules/tradier.py
 
 Requirements:
     pip install pandas numpy requests
 """
 
 import os
+import sys
 import numpy as np
 import pandas as pd
-import requests
 import datetime
+
+from modules.tradier import (
+    TRADIER_TOKEN,
+    get_current_price,
+    get_expirations,
+    get_chain,
+)
 
 # ─────────────────────────────────────────
 # CONFIG
@@ -31,47 +38,10 @@ import datetime
 # TICKER               = "AMD"
 DATA_DIR             = "data"
 # INDICATORS_CSV       = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
-TRADIER_TOKEN        = "Bu4Zf6XIUJT7fC08NxopO5JDdh6I"  # replace with your brokerage token
-TRADIER_URL          = "https://api.tradier.com/v1"
 MIN_DTE              = 180   # ~6 months
 MAX_DTE              = 365   # ~12 months
 DEFAULT_STRIKE_RANGE = 10    # strikes above and below ATM
 HV_WINDOW            = 20
-
-
-# ─────────────────────────────────────────
-# 1. TRADIER API
-# ─────────────────────────────────────────
-def _get(endpoint, params=None):
-    headers = {
-        "Authorization": f"Bearer {TRADIER_TOKEN}",
-        "Accept":        "application/json",
-    }
-    resp = requests.get(f"{TRADIER_URL}{endpoint}", headers=headers, params=params)
-    resp.raise_for_status()
-    return resp.json()
-
-
-def get_current_price(ticker):
-    data = _get("/markets/quotes", {"symbols": ticker})
-    return float(data["quotes"]["quote"]["last"])
-
-
-def get_expirations(ticker):
-    data = _get("/markets/options/expirations", {"symbol": ticker})
-    return data["expirations"]["date"]
-
-
-def get_chain(ticker, expiration):
-    data = _get("/markets/options/chains", {
-        "symbol":     ticker,
-        "expiration": expiration,
-        "greeks":     "true",
-    })
-    options = data.get("options") or {}
-    if not options.get("option"):
-        return pd.DataFrame()
-    return pd.DataFrame(options["option"])
 
 
 # ─────────────────────────────────────────

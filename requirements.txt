@@ -4,3 +4,4 @@ ta
 matplotlib
 scikit-learn
 lxml
+numpy

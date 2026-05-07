@@ -56,6 +56,13 @@ RANDOM_STATE        = 42
 MIN_TRAIN_DAYS = 252   # ~1 year minimum training window
 STEP_DAYS      = 126   # ~6 months between retrains
 
+# Multiplier sweep — list of (P2_VOL_MULTIPLE, P3_VOL_MULTIPLE) tuples.
+# Empty list = single run with the production constants above (default behavior).
+# When non-empty, runs the full walk-forward backtest for each combination,
+# then prints a comparison table identifying the best by STRONG ENTRY avg return.
+# Features are built once and reused; only target labels and model fits vary per run.
+MULTIPLIER_SWEEP = []
+
 
 # ─────────────────────────────────────────
 # 1. LOAD BASE INDICATORS
@@ -125,6 +132,16 @@ def build_features(df, benchmarks):
     vix["VIX_vs_ma20"] = vix["VIX"] / vix["VIX"].rolling(20).mean() - 1
     df = df.join(vix, how="left")
     df[["VIX", "VIX_chg_5d", "VIX_vs_ma20"]] = df[["VIX", "VIX_chg_5d", "VIX_vs_ma20"]].ffill()
+
+    # VIX term structure: near-term vs spot vs 3-month
+    for sym, cache, col in [("^VIX9D", "vix9d_cache.csv", "VIX9D"),
+                             ("^VIX3M", "vix3m_cache.csv", "VIX3M")]:
+        r = _fetch_cached(sym, cache)
+        df = df.join(r[["Close"]].rename(columns={"Close": col}), how="left")
+        df[col] = df[col].ffill()
+    df["VIX9D_VIX_ratio"] = (df["VIX9D"] / df["VIX"]).fillna(1.0)
+    df["VIX_VIX3M_ratio"] = (df["VIX"] / df["VIX3M"]).fillna(1.0)
+    df.drop(columns=["VIX9D", "VIX3M"], inplace=True)
 
     # Sector/industry benchmark relative strength + sector trend
     for bench_ticker, bench_name in benchmarks:
@@ -208,6 +225,12 @@ def build_features(df, benchmarks):
     df["price_vs_52w_high"] = close / close.rolling(252).max() - 1
     df["price_vs_52w_low"]  = close / close.rolling(252).min() - 1
     df["vol_ratio"]         = df["Volume"] / df["Volume"].rolling(20).mean()
+
+    # Overnight gap features — computed fresh (not read from CSV) for self-containment
+    if "gap_pct" not in df.columns:
+        df["gap_pct"]    = (df["Open"] - close.shift(1)) / close.shift(1)
+        df["gap_ma_5d"]  = df["gap_pct"].rolling(5).mean()
+        df["gap_vol_5d"] = df["gap_pct"].abs().rolling(5).mean()
 
     print("Features built.\n")
     return df
@@ -434,31 +457,105 @@ def plot_results(df_stats, order, colors, results):
 # ─────────────────────────────────────────
 # VOL-ADJUSTED THRESHOLDS
 # ─────────────────────────────────────────
-def compute_vol_thresholds(df):
+def compute_vol_thresholds(df, verbose=True):
     global WIN_THRESHOLD, WIN_THRESHOLD_63, EXPANSION_THRESHOLD
     log_ret   = np.log(df["Close"] / df["Close"].shift(1))
     hv_series = log_ret.rolling(HV_WINDOW).std() * np.sqrt(252)
     hv_valid  = hv_series.dropna()
 
-    print("\nVol-Adjusted Threshold Calibration")
-    print("─" * 42)
-    if len(hv_valid) < 20 or hv_valid.median() < 0.05:
-        print("  WARNING: Insufficient/invalid HV data — using AMD defaults.")
+    if verbose:
+        print("\nVol-Adjusted Threshold Calibration")
         print("─" * 42)
+    if len(hv_valid) < 20 or hv_valid.median() < 0.05:
+        if verbose:
+            print("  WARNING: Insufficient/invalid HV data — using AMD defaults.")
+            print("─" * 42)
         return
 
     median_hv     = hv_valid.median()
     new_win       = P2_VOL_MULTIPLE * median_hv * np.sqrt(P2_FORWARD_DAYS / 252)
     new_win_63    = P2_VOL_MULTIPLE * median_hv * np.sqrt(P2B_FORWARD_DAYS / 252)
     new_expansion = P3_VOL_MULTIPLE * median_hv
-    print(f"  Ticker median HV (20-day, annualized): {median_hv:.1%}")
-    print(f"  WIN_THRESHOLD:       0.05 (AMD default)  ->  {new_win:.1%}  [computed]")
-    print(f"  WIN_THRESHOLD_63:    0.10 (AMD default)  ->  {new_win_63:.1%}  [computed]")
-    print(f"  EXPANSION_THRESHOLD: 0.10 (AMD default)  ->  {new_expansion:.1%}  [computed]")
-    print("─" * 42)
+    if verbose:
+        print(f"  Ticker median HV (20-day, annualized): {median_hv:.1%}")
+        print(f"  P2_VOL_MULTIPLE = {P2_VOL_MULTIPLE}  |  P3_VOL_MULTIPLE = {P3_VOL_MULTIPLE}")
+        print(f"  WIN_THRESHOLD:       {new_win:.2%}")
+        print(f"  WIN_THRESHOLD_63:    {new_win_63:.2%}")
+        print(f"  EXPANSION_THRESHOLD: {new_expansion:.2%}")
+        print("─" * 42)
     WIN_THRESHOLD       = new_win
     WIN_THRESHOLD_63    = new_win_63
     EXPANSION_THRESHOLD = new_expansion
+
+
+def collect_signal_stats(results):
+    """Returns a dict of per-signal stats for sweep comparison."""
+    stats = {}
+    for sig in ["STRONG ENTRY", "CAUTION", "SHORT-TERM ONLY", "STAY OUT"]:
+        subset = results[results["signal"] == sig]["fwd_return"].dropna()
+        stats[sig] = {
+            "count":      len(subset),
+            "avg_return": subset.mean() if len(subset) > 0 else float("nan"),
+            "win_rate":   (subset > 0).mean() if len(subset) > 0 else float("nan"),
+        }
+    return stats
+
+
+def print_sweep_summary(sweep_results, ticker):
+    """Compare multiplier combinations side-by-side; flag the best by STRONG ENTRY avg return."""
+    print()
+    print("=" * 92)
+    print(f"  MULTIPLIER SWEEP SUMMARY — {ticker}  ({len(sweep_results)} combinations)")
+    print("=" * 92)
+    print(f"  {'P2':>5} {'P3':>5}  {'STRONG':<22}  {'CAUTION':<19}  "
+          f"{'SHORT':<19}  {'STAY':<13}  {'Hierarchy':>10}")
+    print(f"  {'mult':>5} {'mult':>5}  {'cnt   avg     win%':<22}  "
+          f"{'cnt   avg':<19}  {'cnt   avg':<19}  {'cnt   avg':<13}  {'monotonic?':>10}")
+    print("-" * 92)
+
+    rows = []
+    for r in sweep_results:
+        s = r["stats"]
+        strong, caution, short, stay = (
+            s["STRONG ENTRY"], s["CAUTION"], s["SHORT-TERM ONLY"], s["STAY OUT"]
+        )
+        # Clean hierarchy: STRONG > CAUTION > SHORT-TERM > STAY OUT (by avg return)
+        avgs = [strong["avg_return"], caution["avg_return"],
+                short["avg_return"], stay["avg_return"]]
+        valid = [a for a in avgs if not np.isnan(a)]
+        hierarchy_clean = (len(valid) == 4 and
+                           avgs[0] > avgs[1] and avgs[1] > avgs[2] and avgs[2] > avgs[3])
+        rows.append({
+            "p2": r["p2"], "p3": r["p3"],
+            "strong_avg":  strong["avg_return"],
+            "strong_cnt":  strong["count"],
+            "hierarchy":   hierarchy_clean,
+            "stats":       s,
+        })
+
+    # Sort by STRONG ENTRY avg return descending
+    rows.sort(key=lambda x: x["strong_avg"] if not np.isnan(x["strong_avg"]) else -1,
+              reverse=True)
+    best_p2_p3 = (rows[0]["p2"], rows[0]["p3"])
+
+    for r in rows:
+        s = r["stats"]
+        marker = "  <-- best" if (r["p2"], r["p3"]) == best_p2_p3 else ""
+        hier   = "Y" if r["hierarchy"] else "N"
+        line = (
+            f"  {r['p2']:>5.2f} {r['p3']:>5.2f}  "
+            f"{s['STRONG ENTRY']['count']:>4} {s['STRONG ENTRY']['avg_return']:>+6.1%} "
+            f"{s['STRONG ENTRY']['win_rate']:>6.0%}  "
+            f"{s['CAUTION']['count']:>4} {s['CAUTION']['avg_return']:>+6.1%}      "
+            f"{s['SHORT-TERM ONLY']['count']:>4} {s['SHORT-TERM ONLY']['avg_return']:>+6.1%}      "
+            f"{s['STAY OUT']['count']:>4} {s['STAY OUT']['avg_return']:>+6.1%}   "
+            f"{hier:>10}{marker}"
+        )
+        print(line)
+    print("=" * 92)
+    print(f"\n  Best by STRONG ENTRY avg return: P2={best_p2_p3[0]}, P3={best_p2_p3[1]}")
+    print(f"  Hierarchy column flags whether STRONG > CAUTION > SHORT-TERM > STAY OUT (Y/N).")
+    print(f"  Production values: P2=0.41, P3=0.20.")
 
 
 # ─────────────────────────────────────────
@@ -496,11 +593,47 @@ if __name__ == "__main__":
     print(f"  Step / test window:  {STEP_DAYS} days (~6 months)")
     print()
 
-    results = run_backtest(df_full)
+    if MULTIPLIER_SWEEP:
+        # Sweep mode: rerun walk-forward for each (p2, p3) combo, compare summaries.
+        print(f"\n*** MULTIPLIER SWEEP MODE — {len(MULTIPLIER_SWEEP)} combinations ***\n")
+        sweep_results = []
+        for i, (p2_mult, p3_mult) in enumerate(MULTIPLIER_SWEEP, 1):
+            print(f"\n[{i}/{len(MULTIPLIER_SWEEP)}] P2_VOL_MULTIPLE={p2_mult}, "
+                  f"P3_VOL_MULTIPLE={p3_mult}")
+            print("─" * 60)
+            P2_VOL_MULTIPLE = p2_mult
+            P3_VOL_MULTIPLE = p3_mult
+            compute_vol_thresholds(df, verbose=True)
+            results = run_backtest(df_full)
+            stats   = collect_signal_stats(results)
+            sweep_results.append({"p2": p2_mult, "p3": p3_mult,
+                                  "stats": stats, "results": results})
+            print(f"  STRONG ENTRY: {stats['STRONG ENTRY']['count']} signals, "
+                  f"avg {stats['STRONG ENTRY']['avg_return']:+.1%}, "
+                  f"win% {stats['STRONG ENTRY']['win_rate']:.0%}")
 
-    df_stats, order, colors = summarize(results)
-    plot_results(df_stats, order, colors, results)
+        print_sweep_summary(sweep_results, TICKER)
 
-    out = os.path.join(DATA_DIR, f"{TICKER.lower()}_backtest_results.csv")
-    results.to_csv(out)
-    print(f"Full results saved -> {out}")
+        # Persist the sweep summary as CSV for later inspection.
+        sweep_rows = []
+        for r in sweep_results:
+            for sig, s in r["stats"].items():
+                sweep_rows.append({
+                    "p2_mult":    r["p2"],
+                    "p3_mult":    r["p3"],
+                    "signal":     sig,
+                    "count":      s["count"],
+                    "avg_return": s["avg_return"],
+                    "win_rate":   s["win_rate"],
+                })
+        out = os.path.join(DATA_DIR, f"{TICKER.lower()}_multiplier_backtest_sweep.csv")
+        pd.DataFrame(sweep_rows).to_csv(out, index=False)
+        print(f"\nSweep summary saved -> {out}")
+    else:
+        results = run_backtest(df_full)
+        df_stats, order, colors = summarize(results)
+        plot_results(df_stats, order, colors, results)
+
+        out = os.path.join(DATA_DIR, f"{TICKER.lower()}_backtest_results.csv")
+        results.to_csv(out)
+        print(f"Full results saved -> {out}")

@@ -23,6 +23,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import precision_score
 from sklearn.preprocessing import StandardScaler
 from modules.benchmarks import detect_benchmarks, detect_macro_features, add_macro_features, add_catalyst_proximity
+from modules.tradier import get_atm_iv
 
 # ─────────────────────────────────────────
 # CONFIG
@@ -48,6 +49,14 @@ TEST_SIZE           = 0.20
 P2_THRESHOLD        = 0.55  # Direction signal cutoff (best precision from Phase 2)
 P3_THRESHOLD        = 0.60  # IV expansion cutoff (best precision from Phase 3)
 RANDOM_STATE        = 42
+
+# IV/HV gate thresholds — ATM IV (30 DTE) divided by realized HV-20.
+# IV_HV_GATE_RICH triggers a STRONG ENTRY -> CAUTION downgrade when premium is
+# rich enough that the vol-expansion thesis is already priced in.
+IV_HV_FAIR_LOW   = 0.85  # below this: premium is cheap vs realized — favorable for buyers
+IV_HV_FAIR_HIGH  = 1.20  # above this: premium is rich
+IV_HV_GATE_RICH  = 1.40  # above this: STRONG ENTRY downgrades to CAUTION
+IV_TARGET_DTE    = 30    # ATM IV expiry tenor — 30d aligns with HV-20 timeframe
 
 
 # ─────────────────────────────────────────
@@ -107,6 +116,16 @@ def build_features(df, benchmarks):
     vix["VIX_vs_ma20"] = vix["VIX"] / vix["VIX"].rolling(20).mean() - 1
     df = df.join(vix, how="left")
     df[["VIX", "VIX_chg_5d", "VIX_vs_ma20"]] = df[["VIX", "VIX_chg_5d", "VIX_vs_ma20"]].ffill()
+
+    # VIX term structure: near-term vs spot vs 3-month
+    for sym, col in [("^VIX9D", "VIX9D"), ("^VIX3M", "VIX3M")]:
+        r = yf.download(sym, start=START_DATE, end=END_DATE, progress=False)
+        r.columns = r.columns.get_level_values(0)
+        df = df.join(r[["Close"]].rename(columns={"Close": col}), how="left")
+        df[col] = df[col].ffill()
+    df["VIX9D_VIX_ratio"] = (df["VIX9D"] / df["VIX"]).fillna(1.0)
+    df["VIX_VIX3M_ratio"] = (df["VIX"] / df["VIX3M"]).fillna(1.0)
+    df.drop(columns=["VIX9D", "VIX3M"], inplace=True)
 
     # Sector/industry benchmark relative strength + sector trend
     for bench_ticker, bench_name in benchmarks:
@@ -229,10 +248,62 @@ def get_top_contributors(df_full, clf, scaler, feature_cols, n=3):
 # ─────────────────────────────────────────
 # 4. COMBINED SIGNAL OUTPUT
 # ─────────────────────────────────────────
+def check_atm_iv(ticker, hv_20):
+    """
+    Pull ATM call IV from Tradier (~IV_TARGET_DTE days out) and compare to HV-20.
+    Returns dict {price, iv, expiry, dte, atm_strike, hv_20, ratio, label} or None on failure.
+    Graceful: any error (no internet, bad token, no chain) returns None and prints a one-line note.
+    """
+    try:
+        iv_data = get_atm_iv(ticker, target_dte=IV_TARGET_DTE)
+    except Exception as e:
+        print(f"  IV check unavailable: {e}")
+        return None
+    if iv_data is None or hv_20 is None or hv_20 <= 0:
+        return None
+    ratio = iv_data["iv"] / hv_20
+    if ratio < IV_HV_FAIR_LOW:
+        label = "cheap"
+    elif ratio < IV_HV_FAIR_HIGH:
+        label = "fair"
+    elif ratio < IV_HV_GATE_RICH:
+        label = "rich"
+    else:
+        label = "very rich"
+    return {**iv_data, "hv_20": hv_20, "ratio": ratio, "label": label}
+
+
+def log_iv_observation(ticker, signal_date, iv_info, signal_pre, signal_post):
+    """Append one row per run to data/iv_log.csv. Builds historical IV dataset for future training."""
+    if iv_info is None:
+        return
+    log_path = os.path.join(DATA_DIR, "iv_log.csv")
+    row = {
+        "log_time":         pd.Timestamp.now().isoformat(timespec="seconds"),
+        "signal_date":      signal_date,
+        "ticker":           ticker,
+        "price":            iv_info["price"],
+        "atm_iv":           iv_info["iv"],
+        "iv_expiry":        iv_info["expiry"],
+        "iv_dte":           iv_info["dte"],
+        "hv_20":            iv_info["hv_20"],
+        "iv_hv_ratio":      iv_info["ratio"],
+        "iv_hv_label":      iv_info["label"],
+        "signal_pre_gate":  signal_pre,
+        "signal_post_gate": signal_post,
+    }
+    df_row = pd.DataFrame([row])
+    if os.path.exists(log_path):
+        df_row.to_csv(log_path, mode="a", header=False, index=False)
+    else:
+        df_row.to_csv(log_path, mode="w", header=True, index=False)
+
+
 def print_combined_signal(df_full, direction_prob, dir_prob_63, expansion_prob,
                           iv_rank, iv_pct, hv_20,
                           dir_base_rate, dir_base_rate_63, exp_base_rate,
-                          dir_contributors, dir_contributors_63, exp_contributors):
+                          dir_contributors, dir_contributors_63, exp_contributors,
+                          iv_info=None):
     latest_date   = df_full.dropna().index[-1].strftime("%Y-%m-%d")
     days_to_earn  = int(df_full.dropna().iloc[-1].get("Days_to_earnings", 45))
     _dtc          = int(df_full.dropna().iloc[-1].get("Days_to_catalyst", 90))
@@ -274,6 +345,16 @@ def print_combined_signal(df_full, direction_prob, dir_prob_63, expansion_prob,
         sizing      = "N/A"
         sizing_note = "No directional edge — wait for Phase 2 signal before sizing."
 
+    # ── IV/HV gate: downgrade STRONG ENTRY if options-market premium is too rich ──
+    signal_pre_gate = signal
+    gate_msg = None
+    if iv_info is not None and signal == "STRONG ENTRY" and iv_info["ratio"] >= IV_HV_GATE_RICH:
+        signal      = "CAUTION"
+        sizing      = "REDUCED"
+        sizing_note = (f"IV/HV ratio {iv_info['ratio']:.2f} ({iv_info['label']}) — "
+                       f"premium pricing the vol-expansion thesis already; downgraded from STRONG ENTRY.")
+        gate_msg    = f"IV/HV gate triggered: ratio {iv_info['ratio']:.2f} >= {IV_HV_GATE_RICH}"
+
     def fmt_contributors(contributors):
         parts = []
         for name, val in contributors:
@@ -302,11 +383,27 @@ def print_combined_signal(df_full, direction_prob, dir_prob_63, expansion_prob,
     print(f"  Expansion Prob:     {expansion_prob:.1%}  (base rate: {exp_base_rate:.1%})")
     print(f"  Signal:             {'EXPANSION ✓' if exp_signal else 'CONTRACTION ✗'}")
     print(f"  Drivers:            {fmt_contributors(exp_contributors)}")
+
+    if iv_info is not None:
+        print(f"\n  OPTIONS-MARKET CHECK (Tradier ATM IV)")
+        print(f"  ATM IV ({iv_info['dte']}d):        {iv_info['iv']:.1%}   "
+              f"(expiry: {iv_info['expiry']}, strike: ${iv_info['atm_strike']:.2f})")
+        print(f"  HV-20:              {iv_info['hv_20']:.1%}")
+        print(f"  IV/HV ratio:        {iv_info['ratio']:.2f}    "
+              f"({iv_info['label']})")
+    else:
+        print(f"\n  OPTIONS-MARKET CHECK: skipped (Tradier IV unavailable)")
+
     print(f"\n  {'─'*w}")
-    print(f"  SIGNAL:             {signal}")
+    if gate_msg:
+        print(f"  SIGNAL:             {signal_pre_gate} -> {signal}  ({gate_msg})")
+    else:
+        print(f"  SIGNAL:             {signal}")
     print(f"  POSITION SIZING:    {sizing}")
     print(f"  {sizing_note}")
     print(f"{'═'*w}\n")
+
+    return signal_pre_gate, signal
 
 
 # ─────────────────────────────────────────
@@ -402,7 +499,11 @@ if __name__ == "__main__":
     exp_contributors    = get_top_contributors(df_full, clf3,  scaler3,  fcols3)
 
     latest = df_full[["HV_20", "IV_rank", "IV_pct"]].dropna().iloc[-1]
-    print_combined_signal(
+
+    # Pull live ATM IV from Tradier and compute IV/HV ratio
+    iv_info = check_atm_iv(TICKER, float(latest["HV_20"]))
+
+    signal_pre, signal_post = print_combined_signal(
         df_full,
         direction_prob,
         dir_prob_63,
@@ -416,4 +517,9 @@ if __name__ == "__main__":
         dir_contributors,
         dir_contributors_63,
         exp_contributors,
+        iv_info=iv_info,
     )
+
+    # Log the observation for future historical IV training data
+    latest_date = df_full.dropna().index[-1].strftime("%Y-%m-%d")
+    log_iv_observation(TICKER, latest_date, iv_info, signal_pre, signal_post)
