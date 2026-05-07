@@ -24,7 +24,8 @@ import yfinance as yf
 import matplotlib.pyplot as plt
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
+from sklearn.calibration import CalibratedClassifierCV
+from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay, brier_score_loss
 from modules.benchmarks import detect_benchmarks, detect_macro_features, add_macro_features, add_catalyst_proximity
 
 # ─────────────────────────────────────────
@@ -221,6 +222,37 @@ def add_target(df):
 # ─────────────────────────────────────────
 # 5. TRAIN / EVALUATE
 # ─────────────────────────────────────────
+def print_calibration_diagnostic(y_true, y_prob, label):
+    """Print Brier score, ECE, and reliability bins for predicted probabilities."""
+    y_true = np.asarray(y_true)
+    y_prob = np.asarray(y_prob)
+    brier = brier_score_loss(y_true, y_prob)
+
+    n_bins = 10
+    edges = np.linspace(0, 1, n_bins + 1)
+    bin_idx = np.clip(np.digitize(y_prob, edges) - 1, 0, n_bins - 1)
+
+    ece = 0.0
+    rows = []
+    for i in range(n_bins):
+        mask = bin_idx == i
+        n = int(mask.sum())
+        if n == 0:
+            continue
+        pred = y_prob[mask].mean()
+        actual = y_true[mask].mean()
+        gap = pred - actual
+        ece += abs(gap) * n / len(y_prob)
+        rows.append((edges[i], edges[i+1], n, pred, actual, gap))
+
+    print(f"\n[{label}]")
+    print(f"  Brier: {brier:.4f}  ECE: {ece:.4f}  (lower=better; 0=perfect)")
+    print(f"  {'Bin':<11}  {'N':>5}  {'Pred':>7}  {'Actual':>7}  {'Gap':>8}")
+    for lo, hi, n, pred, actual, gap in rows:
+        marker = " over" if gap > 0.05 else " under" if gap < -0.05 else ""
+        print(f"  {lo:.1f}-{hi:.1f}      {n:>5}  {pred:>7.1%}  {actual:>7.1%}  {gap:>+8.1%}{marker}")
+
+
 def train_model(df):
     exclude = {"Open", "High", "Low", "Close", "Volume", "target"}
     feature_cols = [c for c in df.columns if c not in exclude]
@@ -302,6 +334,23 @@ def train_model(df):
     for feat, val in coefs.head(10).items():
         direction = "bullish ↑" if val > 0 else "bearish ↓"
         print(f"{feat:<25}  {val:>12.4f}  {direction}")
+    print()
+
+    # Calibration diagnostic — compare raw LR vs isotonic-calibrated wrapper.
+    # Diagnostic only; does not affect the production model returned below.
+    print("─" * 60)
+    print("CALIBRATION DIAGNOSTIC (test set)")
+    print("─" * 60)
+    print_calibration_diagnostic(y_test, y_prob, "Raw Logistic Regression")
+    calibrated = CalibratedClassifierCV(
+        LogisticRegression(C=0.1, class_weight="balanced", max_iter=1000, random_state=RANDOM_STATE),
+        method="isotonic",
+        cv=5,
+    )
+    calibrated.fit(X_train_s, y_train)
+    y_prob_cal = calibrated.predict_proba(X_test_s)[:, 1]
+    print_calibration_diagnostic(y_test, y_prob_cal, "Calibrated (Isotonic, 5-fold CV)")
+    print("─" * 60)
     print()
 
     return clf, X_test, y_test, y_pred, y_prob, feature_cols

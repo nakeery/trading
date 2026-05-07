@@ -226,6 +226,66 @@ Session 8 — Multiplier Validation, New Features, Tradier IV Gate (2026-05-07, 
      Signal was STAY OUT so gate didn't fire, but the snapshot validates the documented
      "options market sees what HV-based Phase 3 cannot" gap from S7.
 
+Session 9 — Probability Calibration Diagnostic (2026-05-07, same day as S7+S8)
+
+Context: discussion explored two next-step options — put/call ratio + skew (extends S8
+IV/HV gate) vs probability calibration (model-quality polish). Chose calibration as the
+lowest-risk path: existing models are untouched, only diagnostic output added. Decision
+on whether to switch the production model deferred until after seeing the diagnostic data.
+
+1. Diagnostic-only addition (no production changes)
+   - Added print_calibration_diagnostic() helper to direction.py and volatility.py
+   - Added calibration block at end of train_model() in both files
+   - Compares raw LR vs CalibratedClassifierCV (isotonic, 5-fold CV) on the test set
+   - Outputs per model: Brier score, ECE, 10-bin reliability table (N / Pred / Actual / Gap)
+   - Production model RETURNED is still the raw LR — diagnostic does not flip any switch
+   - New imports: sklearn.calibration.CalibratedClassifierCV, sklearn.metrics.brier_score_loss
+
+2. QQQ findings — direction models are miscalibrated, Phase 3 already OK
+   Phase 2  (15d direction):  Raw ECE 6.99% -> Calibrated 1.56%   (4.5x improvement)
+                              Raw Brier 0.2547 -> 0.2491
+                              Pattern: overconfident at 0.5-0.7 bins
+                              (raw 55% predicted = 47% actual; raw 64% = 51% actual)
+                              Range compression after calibration: minimal — still 0.4-0.6 spread
+
+   Phase 2B (63d direction):  Raw ECE 9.75% -> Calibrated 6.40%   (1.5x improvement)
+                              Raw Brier 0.2600 -> 0.2500
+                              Pattern: severely overconfident at high end
+                              (raw 74% predicted = 41% actual — 33pp gap)
+                              Also underconfident at low end (raw 46% = 61% actual)
+                              Range compression: SIGNIFICANT — 1002/1304 test samples
+                              concentrated in 0.6-0.7 bin after isotonic calibration
+                              (loss of discriminative power partially offsets calibration gain)
+
+   Phase 3  (IV expansion):   Raw ECE 4.95% -> Calibrated 3.35%   (1.5x, low base)
+                              Raw Brier 0.1789 -> 0.1759
+                              Pattern: already well-calibrated; one bad bin at 0.4-0.5
+                              (raw 45% predicted = 24% actual)
+                              Calibration provides modest improvement only
+
+3. Root cause: class_weight="balanced" inflates confidence
+   - LR is trained on artificially balanced classes (each contributes equal loss weight)
+   - Scores reflect odds vs a 50/50 base rate, not the true ~45% WIN base rate
+   - Raw scores are ranking scores not calibrated probabilities — "57.2% win prob"
+     in entry.py output corresponds to ~48% actual win frequency on Phase 2
+   - Phase 3 has less miscalibration because its base rate (~42%) is closer to balanced
+
+4. Backtest baseline confirmed unchanged after S9 changes
+   - Ran backtest.py on QQQ post-edit (53 windows, 2001-2026)
+   - Numbers match S8 baseline exactly: STRONG ENTRY 2.0% / 64.9% win, hierarchy intact
+   - Confirms diagnostic-only addition didn't accidentally alter production behavior
+
+5. Pending decision: whether/how to switch production model
+   Direction 1 (recommended): Switch Phase 2 ONLY to calibrated
+     - Cleanest case (4.5x ECE drop, minimal compression)
+     - Phase 2 is the gateway gate (ENTER vs STAY OUT) — best leverage point
+     - Single-model change is isolatable for regression diagnosis
+     - Downstream task: re-tune P2_THRESHOLD on calibrated scale, re-run backtest, confirm hierarchy
+   Direction 2: Try Platt scaling on Phase 2B
+     - Phase 2B has worst miscalibration but isotonic compressed too aggressively
+     - Platt (sigmoid fit) compresses less; better fit for sigmoid-shaped miscalibration
+     - Best as follow-up after Direction 1 validates that calibration helps in this framework
+
 Backtest Results (Most Recent / Representative)
 
 QQQ (53 windows, 2001-2026, post-S8 features) — framework reference baseline
@@ -330,8 +390,20 @@ Priority 2 — additional individual stock signals
   - Macro feature layer for indexes (yield curve, credit spread, DXY) — only worth it
     if SPY tuning is wanted; current verdict says SPY is structurally unsuitable
 Priority 3 — model quality
-  - Probability calibration (isotonic regression) so "72% win prob" actually means 72%
-  - Currently logistic regression outputs are scores not calibrated probabilities
+  - [DIAGNOSTIC DONE S9] Probability calibration via isotonic regression
+    - Diagnostic added to direction.py + volatility.py train_model() — compares raw LR
+      vs CalibratedClassifierCV side-by-side via Brier/ECE/reliability bins
+    - QQQ results: Phase 2 ECE 6.99% -> 1.56% (4.5x); Phase 2B 9.75% -> 6.40% (1.5x);
+      Phase 3 4.95% -> 3.35% (already low base)
+    - Raw scores systematically overconfident — root cause is class_weight="balanced"
+    - Production model unchanged; diagnostic only at this stage
+  - [PENDING DECISION S9] Switch Phase 2 to calibrated production model (Direction 1)
+    - Cleanest improvement; Phase 2 is the gateway gate so leverage is highest
+    - Phase 2B isotonic compresses 1002/1304 samples into one bin — defer until Platt tested
+    - Phase 3 already well-calibrated; not essential to switch
+  - [TODO follow-up] Try Platt scaling on Phase 2B (Direction 2)
+    - Sigmoid-fit alternative; less compression than isotonic, may fit
+      sigmoid-shaped miscalibration well
 Won't fix / structural
   - Binary event direction (FDA decisions, trial readouts) — direction unknowable from
     price/volume features
