@@ -22,7 +22,7 @@ import yfinance as yf
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import precision_score
 from sklearn.preprocessing import StandardScaler
-from benchmarks import detect_benchmarks, detect_macro_features, add_macro_features, add_catalyst_proximity
+from modules.benchmarks import detect_benchmarks, detect_macro_features, add_macro_features, add_catalyst_proximity
 
 # ─────────────────────────────────────────
 # CONFIG
@@ -31,6 +31,7 @@ TICKER         = "AMD"
 START_DATE     = "2018-01-01"
 END_DATE       = ""  # set automatically from CSV
 DATA_DIR       = "data"
+MODULE_DIR     = "modules"
 INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 
 HV_WINDOW           = 20
@@ -144,8 +145,7 @@ def build_features(df, benchmarks):
     else:
         df["Days_to_earnings"] = 45
 
-    df = add_catalyst_proximity(df, TICKER, DATA_DIR)
-
+    df = add_catalyst_proximity(df, TICKER, MODULE_DIR)
     # Normalize price-level features
     for period in [20, 50, 200]:
         col = f"MA_{period}"

@@ -116,14 +116,14 @@ def add_macro_features(df, macro_features, start_date, end_date):
     return df
 
 
-def add_catalyst_proximity(df, ticker, data_dir="data"):
+def add_catalyst_proximity(df, ticker, data_dir="modules"):
     """
     Joins Days_to_catalyst from data/catalysts.csv — days until the next known binary event
     (PDUFA date or clinical trial readout) for the given ticker.
     Silent no-op (fills 90) when file missing or ticker not in file.
     Populate catalysts.csv manually; columns: ticker, date, type, description.
     """
-    csv_path = os.path.join(data_dir, "catalysts.csv")
+    csv_path ="catalysts.csv"
     if not os.path.exists(csv_path):
         df["Days_to_catalyst"] = 90
         return df

@@ -1,0 +1,19 @@
+ticker,date,type,description
+CRSP,2019-11-19,trial_readout,CTX001 first two patients - positive SCD and TDT safety/efficacy data
+CRSP,2020-06-12,trial_readout,CTX001 EHA 2020 - new clinical data CLIMB-111 and CLIMB-121 trials
+CRSP,2020-10-21,trial_readout,CTX110 CARBON Phase 1 positive top-line results - B-cell malignancies
+CRSP,2020-12-05,trial_readout,CTX001 ASH 2020 data and NEJM publication - exa-cel hemoglobinopathies
+CRSP,2021-06-11,trial_readout,CTX001 EHA 2021 - 22 patients with 3+ month follow-up SCD and TDT (approximate)
+CRSP,2021-10-12,trial_readout,CTX110 CARBON Phase 1 positive results update - CD19+ B-cell malignancies
+CRSP,2022-06-11,trial_readout,Exa-cel EHA 2022 - extended follow-up data SCD and TDT
+CRSP,2022-12-10,trial_readout,Exa-cel ASH 2022 data readout - SCD and TDT
+CRSP,2022-12-12,trial_readout,CTX110 CARBON Phase 1 ASH 2022 update - B-cell malignancies
+CRSP,2023-06-09,trial_readout,Exa-cel EHA 2023 - pivotal trial results SCD and TDT
+CRSP,2023-10-31,pdufa,FDA advisory committee meeting - exa-cel SCD - trading halted - adcom voted in favor
+CRSP,2023-11-16,pdufa,UK MHRA authorization - Casgevy SCD and TDT
+CRSP,2023-12-08,pdufa,Casgevy FDA approval - SCD (ages 12+)
+CRSP,2024-01-16,pdufa,Casgevy FDA approval - TDT (ages 12+) - approved ahead of March 2024 PDUFA
+CRSP,2024-02-13,pdufa,Casgevy European Commission approval - SCD and TDT
+CRSP,2026-08-01,pdufa,Casgevy pediatric label expansion (ages 5-11) - Priority Review Voucher - approximate Q3 2026
+CRSP,2026-09-30,trial_readout,Zugo-cel (CTX112) autoimmune/oncology data update - H2 2026 approximate
+CRSP,2026-11-30,trial_readout,CTX611 Phase 2 topline data - anticoagulant (AF/VTE/stroke) - H2 2026 approximate

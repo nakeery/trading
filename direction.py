@@ -25,7 +25,7 @@ import matplotlib.pyplot as plt
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay
-from benchmarks import detect_benchmarks, detect_macro_features, add_macro_features, add_catalyst_proximity
+from modules.benchmarks import detect_benchmarks, detect_macro_features, add_macro_features, add_catalyst_proximity
 
 # ─────────────────────────────────────────
 # CONFIG
@@ -34,6 +34,7 @@ TICKER         = "AMD"
 START_DATE     = "2018-01-01"
 END_DATE       = ""  # set automatically from CSV
 DATA_DIR       = "data"
+MODULE_DIR     = "modules"
 INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 
 HV_WINDOW      = 20     # Rolling window for realized vol (trading days)
@@ -394,7 +395,7 @@ if __name__ == "__main__":
         print("  Macro features:")
         df = add_macro_features(df, macro, START_DATE, END_DATE)
     df = add_earnings_proximity(df)
-    df = add_catalyst_proximity(df, TICKER, DATA_DIR)
+    df = add_catalyst_proximity(df, TICKER, MODULE_DIR)
     df = normalize_features(df)
 
     # Phase 2 — 15-day direction model
