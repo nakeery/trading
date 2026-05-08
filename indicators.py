@@ -26,6 +26,8 @@ import matplotlib.pyplot as plt
 import matplotlib.dates as mdates
 from matplotlib.gridspec import GridSpec
 
+from modules.massive import IV_COLS, get_chain_summary
+
 # ─────────────────────────────────────────
 # CONFIG — adjust these to your preference
 # ─────────────────────────────────────────
@@ -285,6 +287,51 @@ def plot_dashboard(df):
 
 
 # ─────────────────────────────────────────
+# 5. OPTIONS CHAIN HARVEST (Massive)
+# ─────────────────────────────────────────
+def harvest_iv_snapshot(df, ticker, csv_path):
+    """Append today's chain snapshot summary (atm_iv, skew, term, p/c OI) to today's
+    row. Past rows stay NaN until the BS-inversion backfill (S11) populates them.
+
+    Prior IV harvested on previous runs is preserved by merging from the existing
+    CSV before writing — without this, every indicators.py re-run would overwrite
+    accumulated forward IV history with NaN.
+
+    Graceful: any failure leaves the affected columns NaN and prints a warning."""
+    for col in IV_COLS:
+        if col not in df.columns:
+            df[col] = pd.NA
+
+    # Merge prior IV from the existing CSV (preserve forward-accumulated history).
+    if os.path.exists(csv_path):
+        try:
+            prior = pd.read_csv(csv_path, index_col=0, parse_dates=True)
+            common = df.index.intersection(prior.index)
+            for col in IV_COLS:
+                if col in prior.columns:
+                    df.loc[common, col] = df.loc[common, col].combine_first(prior.loc[common, col])
+        except Exception as e:
+            print(f"  Could not merge prior IV from {csv_path}: {e}")
+
+    spot = float(df["Close"].iloc[-1])
+    summary = get_chain_summary(ticker, spot)
+    last_idx = df.index[-1]
+    if summary is None:
+        print(f"  WARNING: Massive chain unavailable — IV columns left NaN for {last_idx.date()}")
+        return df
+
+    for k in IV_COLS:
+        df.loc[last_idx, k] = summary.get(k)
+
+    skew_s = f"{summary['iv_skew_25d']:+.3f}" if summary["iv_skew_25d"] is not None else "n/a"
+    term_s = f"{summary['term_structure']:.2f}" if summary["term_structure"] is not None else "n/a"
+    pc_s   = f"{summary['put_call_oi_ratio']:.2f}" if summary["put_call_oi_ratio"] is not None else "n/a"
+    print(f"  ATM IV (~{summary['atm_dte']}d): {summary['atm_iv_30d']:.1%} | "
+          f"25Δ skew: {skew_s} | term: {term_s} | P/C OI: {pc_s}")
+    return df
+
+
+# ─────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────
 if __name__ == "__main__":
@@ -316,7 +363,10 @@ if __name__ == "__main__":
     print_signal_summary(df)
     plot_dashboard(df)
 
+    csv_path = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
+    df = harvest_iv_snapshot(df, TICKER, csv_path)
+
     # Save full indicator table to CSV for Phase 2
     df["Ticker"] = TICKER
-    df.to_csv(os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv"))
-    print(f"Full indicator data saved -> {os.path.join(DATA_DIR, f'{TICKER.lower()}_indicators.csv')}")
+    df.to_csv(csv_path)
+    print(f"Full indicator data saved -> {csv_path}")

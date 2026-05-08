@@ -7,15 +7,19 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 Daily workflow:
 
 ```bash
-# 1. Refresh data + indicators (run daily)
+# 1. Refresh data + indicators + harvest today's options chain snapshot from Massive
 python indicators.py
 
-# 2. Get entry decision — SIGNAL + POSITION SIZING
+# 2. Get entry decision — SIGNAL + POSITION SIZING (reads IV from indicators CSV)
 python entry.py
 
 # 3. If signal is actionable: get live options chain sizing via Tradier
 python sizing.py
 ```
+
+`indicators.py` requires `$env:MASSIVE_API_KEY` to be set for the chain harvest. Without it,
+the IV columns are written as NaN and `entry.py` warns to re-run. Add the key to `$PROFILE`
+to persist it across PowerShell sessions.
 
 As-needed analysis:
 
@@ -65,14 +69,15 @@ Seven scripts. `indicators.py` must run first — all downstream scripts depend 
 
 | Script | Purpose | Output |
 |---|---|---|
-| `indicators.py` | Fetch OHLCV, compute 30+ indicators | `data/{ticker}_indicators.csv`, `data/{ticker}_dashboard.png` |
+| `indicators.py` | Fetch OHLCV, compute 30+ indicators, harvest today's chain summary from Massive | `data/{ticker}_indicators.csv` (with IV cols), `data/{ticker}_dashboard.png` |
 | `direction.py` | Direction ML models (Phase 2 + 2B) | `data/{ticker}_ml_features.csv`, `data/{ticker}_ml_results.png` |
 | `volatility.py` | IV expansion ML model (Phase 3) | `data/{ticker}_phase3_features.csv`, `data/{ticker}_phase3_results.png` |
-| `entry.py` | Combines all models → SIGNAL + POSITION SIZING | Console only |
-| `backtest.py` | Walk-forward backtest (51 windows for QQQ; 15 for AMD; 17 for CRSP) | `data/{ticker}_backtest.png`, `data/{ticker}_backtest_results.csv` |
+| `entry.py` | Combines all models → SIGNAL + POSITION SIZING (reads IV from CSV — no live API) | Console only |
+| `backtest.py` | Walk-forward backtest (53 windows QQQ; 25 NVDA; 31y SPY; 15 AMD; 17 CRSP) | `data/{ticker}_backtest.png`, `data/{ticker}_backtest_results.csv` |
 | `sizing.py` | Live options chain sizing via Tradier API | Console only |
-| `modules/benchmarks.py` | Shared sector benchmarks, macro features, catalyst proximity | Imported by direction/entry/backtest/volatility |
-| `modules/tradier.py` | Shared Tradier API client + `get_atm_iv()` | Imported by sizing/entry |
+| `modules/benchmarks.py` | Sector benchmarks, macro features, catalyst proximity | Imported by direction/entry/backtest/volatility |
+| `modules/tradier.py` | Tradier API client + `get_atm_iv()` | Imported by `sizing.py` only |
+| `modules/massive.py` | Massive.com API client + `get_chain_summary()`; exports `IV_COLS` | Imported by `indicators.py` (harvest) and 5 ML scripts (exclude from features) |
 
 All CSVs and PNGs are written to the `data/` subdirectory (must exist — create manually if missing).
 
@@ -90,10 +95,15 @@ All CSVs and PNGs are written to the `data/` subdirectory (must exist — create
 - Phase 2 (15d) drives ENTER vs STAY OUT
 - Phase 2B (63d) confirms or rejects medium-term thesis
 - Phase 3 (IV expansion) modulates sizing — not a go/no-go gate
-- **IV/HV gate (`entry.py` only)**: live ATM IV (~30 DTE) is fetched from Tradier and compared to HV-20.
-  If `signal == STRONG ENTRY` and `IV/HV >= 1.40`, downgrade to `CAUTION` (premium too rich for the
-  vol-expansion thesis). The ratio + label (cheap/fair/rich/very rich) prints regardless of signal.
-  Each run appends a row to `data/iv_log.csv` for forward-accumulating IV history.
+- **IV/HV gate (`entry.py` only)**: ATM IV (~30 DTE) read from `atm_iv_30d` column in indicators
+  CSV (harvested by `indicators.py` from Massive) and compared to HV-20. If `signal == STRONG ENTRY`
+  and `IV/HV >= 1.40`, downgrade to `CAUTION`. The ratio + label (cheap/fair/rich/very rich) prints
+  regardless of signal. If `atm_iv_30d` is NaN (Massive harvest failed or never ran), prints a
+  warning to re-run `indicators.py` and skips the gate.
+- **Term structure** (`entry.py` display only — not yet a feature): printed with 5-band label.
+  `< 0.95` contango → `0.95–0.98` slight contango → `0.98–1.02` noise → `1.02–1.05` slight
+  backwardation → `> 1.05` backwardation. Treat `> 1.05` as a stress signal (trust contraction
+  signals less; weight options-market-implied tail risk higher).
 
 ## Key Design Decisions
 
@@ -120,6 +130,17 @@ All CSVs and PNGs are written to the `data/` subdirectory (must exist — create
   - Phase 3 (`volatility.py`) uses default `for_direction=False` — IV expansion near events is real signal
 - **`FORWARD_DAYS = 15`** kept intentionally — entry timing signal, not holding period predictor
   - Phase 2B (63-day) added as LEAPS-aligned thesis validation layer
+- **IV harvest in `indicators.py`** (S10) — daily chain summary written to today's row of
+  indicators CSV. Two-call pattern in `modules/massive.py`: front tenor (target_dte ± 7d, wide
+  strikes) for ATM IV + 25Δ skew + P/C OI; back tenor (55–90 DTE, narrow ATM strikes) for term
+  structure. Avoids hitting the 1250-contract pagination cap.
+- **CSV merge preserves IV history** — `harvest_iv_snapshot()` reads existing CSV and merges
+  prior IV via `combine_first` before writing today's. Without this, every `indicators.py` re-run
+  would wipe accumulated IV data because the CSV is regenerated from scratch.
+- **`IV_COLS` exclusion required in all ML scripts** — the 7 IV columns are NaN for all pre-today
+  rows until S11 backfill. Every `train()` / `train_model()` must include `*IV_COLS` in its
+  exclude set, or `dropna()` removes the entire training set. Already applied to entry/direction/
+  volatility/backtest/calibrate_multipliers.
 
 ## Model Details
 
@@ -145,6 +166,21 @@ Threshold sweep auto-marks optimal using `max(precision - base_rate) × log(sign
 - All strikes shown including "over budget" ones (not silently filtered)
 - IV/HV ratio shown via `^` (>120%, expensive) and `v` (<80%, cheap) markers — useful for assessing whether option premium is rich relative to realized vol
 
+## Massive Config (`modules/massive.py`)
+
+- `MASSIVE_API_KEY` env var required — no hardcoded fallback. Calls fail with clear error if unset.
+- Plan tier: Options Starter (15-min delayed snapshots, 2yr historical, unlimited rate limit)
+- `MASSIVE_URL = https://api.massive.com` — surface is functionally identical to Polygon.io
+- `get_chain_summary(ticker, underlying_price, target_dte=30)` returns:
+  `atm_iv_30d`, `atm_strike`, `atm_expiry`, `atm_dte`, `iv_skew_25d`, `term_structure`, `put_call_oi_ratio`
+- Two-call harvest (avoids pagination cap):
+  - Front: `dte=target±7`, strikes `spot×0.85` to `×1.15` → ATM IV + 25Δ skew + P/C OI
+  - Back: `dte=55-90`, strikes `spot×0.97` to `×1.03` → back-month ATM for term structure
+- Filters out `iv=20` placeholder (Massive returns this for deep ITM/OTM with empty greeks)
+- Snapshot endpoint is current-only — `expired=true` is ignored on `/v3/snapshot/options/`
+  (only honored on `/v3/reference/options/contracts`). Historical IV requires the BS-inversion
+  pipeline planned for S11 (use contracts reference + aggregates + Black-Scholes invert).
+
 ## Geopolitical / Exogenous Shock Limitation
 
 The framework is **reactive, not predictive** of shocks. All inputs are derived from price/volume/HV history; the model cannot detect war escalations, central bank surprises, or other exogenous events before they affect prices.
@@ -165,13 +201,15 @@ See `memory/context.md` "Geopolitical Risk Limitation" for proposed mitigations 
 - `indicators.py`: unused `import mdates`
 - `direction.py`: dead `N_ESTIMATORS = 200` constant (Random Forest leftover)
 - `modules/tradier.py`: `TRADIER_TOKEN` reads `$env:TRADIER_TOKEN` if set, else falls back to hardcoded constant (security improvement — set the env var to keep token out of git)
+- `modules/massive.py`: `MASSIVE_API_KEY` has no hardcoded fallback by design. If the env var isn't set in the current PowerShell session, harvest fails silently and writes NaN. Add to `$PROFILE` for permanence.
+- `data/iv_log.csv` (deprecated as of S10): file preserved on disk as historical record but no new rows are written. IV history now lives in `data/{ticker}_indicators.csv`.
 
 ## Important Warnings
 
 - **NEVER name a script `signal.py`** — it shadows Python's built-in `signal` module and causes `AttributeError: partially initialized module 'subprocess'`. The original `entry_signal.py` was renamed to `entry.py` to resolve this.
 - **`backtest.py` is self-contained** — does NOT import from `direction.py` or `volatility.py`. If feature engineering changes in those scripts, `backtest.py` must be manually updated to match.
 - **`data/` directory must exist** before running any script — create it manually if missing.
-- **`modules/` directory** holds `benchmarks.py` and `catalysts.csv`. Catalyst CSV path is `data_dir`-relative; the `csv_path = os.path.join(data_dir, "catalysts.csv")` fix in Session 7 is required for catalyst loading to work.
+- **`modules/` directory** holds `benchmarks.py`, `tradier.py`, `massive.py`, and `catalysts.csv`. Catalyst CSV path is `data_dir`-relative; the `csv_path = os.path.join(data_dir, "catalysts.csv")` fix in Session 7 is required for catalyst loading to work.
 - **`trade/` subdirectory** is the Python virtual environment — do not delete.
 - **`memory/` subdirectory** is Claude's auto-memory system.
 - **yfinance `.info` returns 401 errors** — `TICKER_BENCHMARK` dict in `benchmarks.py` bypasses this entirely for known tickers.
@@ -181,7 +219,7 @@ See `memory/context.md` "Geopolitical Risk Limitation" for proposed mitigations 
 
 ## Tech Stack
 
-`yfinance`, `pandas`, `numpy`, `ta`, `matplotlib`, `scikit-learn` (LogisticRegression, StandardScaler, precision_score), `lxml` (earnings dates), `requests` (Tradier API in sizing.py)
+`yfinance`, `pandas`, `numpy`, `ta`, `matplotlib`, `scikit-learn` (LogisticRegression, StandardScaler, precision_score, CalibratedClassifierCV, brier_score_loss), `lxml` (earnings dates), `requests` (Tradier API via `modules/tradier.py` + Massive API via `modules/massive.py`)
 
 ## Ticker Suitability Notes
 

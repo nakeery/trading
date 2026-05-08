@@ -23,7 +23,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import precision_score
 from sklearn.preprocessing import StandardScaler
 from modules.benchmarks import detect_benchmarks, detect_macro_features, add_macro_features, add_catalyst_proximity
-from modules.tradier import get_atm_iv
+from modules.massive import IV_COLS
 
 # ─────────────────────────────────────────
 # CONFIG
@@ -205,7 +205,7 @@ def build_features(df, benchmarks):
 # 3. TRAIN MODELS
 # ─────────────────────────────────────────
 def train(df, target_col):
-    exclude = {"Open", "High", "Low", "Close", "Volume", target_col}
+    exclude = {"Open", "High", "Low", "Close", "Volume", target_col, *IV_COLS}
     feature_cols = [c for c in df.columns if c not in exclude]
 
     df_model = df[feature_cols + [target_col]].dropna()
@@ -248,20 +248,23 @@ def get_top_contributors(df_full, clf, scaler, feature_cols, n=3):
 # ─────────────────────────────────────────
 # 4. COMBINED SIGNAL OUTPUT
 # ─────────────────────────────────────────
-def check_atm_iv(ticker, hv_20):
+def read_iv_from_csv(df, hv_20):
     """
-    Pull ATM call IV from Tradier (~IV_TARGET_DTE days out) and compare to HV-20.
-    Returns dict {price, iv, expiry, dte, atm_strike, hv_20, ratio, label} or None on failure.
-    Graceful: any error (no internet, bad token, no chain) returns None and prints a one-line note.
+    Read today's IV snapshot from the indicators CSV (harvested by indicators.py).
+    Returns dict {iv, atm_strike, expiry, dte, hv_20, ratio, label, skew_25d, term, pc_oi}
+    or None if atm_iv_30d is NaN — in which case prints a warning to re-run indicators.py.
     """
-    try:
-        iv_data = get_atm_iv(ticker, target_dte=IV_TARGET_DTE)
-    except Exception as e:
-        print(f"  IV check unavailable: {e}")
+    latest = df.iloc[-1]
+    atm_iv = latest.get("atm_iv_30d")
+    if atm_iv is None or pd.isna(atm_iv):
+        print(f"  WARNING: atm_iv_30d is NaN for {df.index[-1].date()} — "
+              f"re-run indicators.py to refresh the IV snapshot.")
         return None
-    if iv_data is None or hv_20 is None or hv_20 <= 0:
+    if hv_20 is None or hv_20 <= 0:
         return None
-    ratio = iv_data["iv"] / hv_20
+
+    atm_iv = float(atm_iv)
+    ratio  = atm_iv / hv_20
     if ratio < IV_HV_FAIR_LOW:
         label = "cheap"
     elif ratio < IV_HV_FAIR_HIGH:
@@ -270,33 +273,23 @@ def check_atm_iv(ticker, hv_20):
         label = "rich"
     else:
         label = "very rich"
-    return {**iv_data, "hv_20": hv_20, "ratio": ratio, "label": label}
 
+    def _opt(col):
+        v = latest.get(col)
+        return None if v is None or pd.isna(v) else v
 
-def log_iv_observation(ticker, signal_date, iv_info, signal_pre, signal_post):
-    """Append one row per run to data/iv_log.csv. Builds historical IV dataset for future training."""
-    if iv_info is None:
-        return
-    log_path = os.path.join(DATA_DIR, "iv_log.csv")
-    row = {
-        "log_time":         pd.Timestamp.now().isoformat(timespec="seconds"),
-        "signal_date":      signal_date,
-        "ticker":           ticker,
-        "price":            iv_info["price"],
-        "atm_iv":           iv_info["iv"],
-        "iv_expiry":        iv_info["expiry"],
-        "iv_dte":           iv_info["dte"],
-        "hv_20":            iv_info["hv_20"],
-        "iv_hv_ratio":      iv_info["ratio"],
-        "iv_hv_label":      iv_info["label"],
-        "signal_pre_gate":  signal_pre,
-        "signal_post_gate": signal_post,
+    return {
+        "iv":         atm_iv,
+        "atm_strike": float(_opt("atm_strike")) if _opt("atm_strike") is not None else None,
+        "expiry":     str(_opt("atm_expiry")) if _opt("atm_expiry") is not None else None,
+        "dte":        int(_opt("atm_dte")) if _opt("atm_dte") is not None else None,
+        "hv_20":      hv_20,
+        "ratio":      ratio,
+        "label":      label,
+        "skew_25d":   _opt("iv_skew_25d"),
+        "term":       _opt("term_structure"),
+        "pc_oi":      _opt("put_call_oi_ratio"),
     }
-    df_row = pd.DataFrame([row])
-    if os.path.exists(log_path):
-        df_row.to_csv(log_path, mode="a", header=False, index=False)
-    else:
-        df_row.to_csv(log_path, mode="w", header=True, index=False)
 
 
 def print_combined_signal(df_full, direction_prob, dir_prob_63, expansion_prob,
@@ -304,9 +297,10 @@ def print_combined_signal(df_full, direction_prob, dir_prob_63, expansion_prob,
                           dir_base_rate, dir_base_rate_63, exp_base_rate,
                           dir_contributors, dir_contributors_63, exp_contributors,
                           iv_info=None):
-    latest_date   = df_full.dropna().index[-1].strftime("%Y-%m-%d")
-    days_to_earn  = int(df_full.dropna().iloc[-1].get("Days_to_earnings", 45))
-    _dtc          = int(df_full.dropna().iloc[-1].get("Days_to_catalyst", 90))
+    df_clean      = df_full.drop(columns=IV_COLS, errors="ignore").dropna()
+    latest_date   = df_clean.index[-1].strftime("%Y-%m-%d")
+    days_to_earn  = int(df_clean.iloc[-1].get("Days_to_earnings", 45))
+    _dtc          = int(df_clean.iloc[-1].get("Days_to_catalyst", 90))
     days_to_cat   = "N/A" if _dtc >= 90 else f"{_dtc}d"
 
     dir_signal    = direction_prob >= P2_THRESHOLD
@@ -385,14 +379,21 @@ def print_combined_signal(df_full, direction_prob, dir_prob_63, expansion_prob,
     print(f"  Drivers:            {fmt_contributors(exp_contributors)}")
 
     if iv_info is not None:
-        print(f"\n  OPTIONS-MARKET CHECK (Tradier ATM IV)")
+        print(f"\n  OPTIONS-MARKET CHECK (Massive snapshot)")
         print(f"  ATM IV ({iv_info['dte']}d):        {iv_info['iv']:.1%}   "
               f"(expiry: {iv_info['expiry']}, strike: ${iv_info['atm_strike']:.2f})")
         print(f"  HV-20:              {iv_info['hv_20']:.1%}")
         print(f"  IV/HV ratio:        {iv_info['ratio']:.2f}    "
               f"({iv_info['label']})")
+        if iv_info.get("skew_25d") is not None:
+            print(f"  25Δ skew (P-C):     {iv_info['skew_25d']:+.3f}")
+        if iv_info.get("term") is not None:
+            term_label = "noise" if iv_info["term"] > 0.98 and iv_info["term"] < 1.02 else "slight backwardation" if iv_info["term"] >= 1.02 and iv_info["term"] < 1.05 else "backwardation" if iv_info["term"] >= 1.05 else "slight contango" if iv_info["term"] <= 0.98 and iv_info["term"] >= 0.95 else "contango"
+            print(f"  Term structure:     {iv_info['term']:.2f}  ({term_label})")
+        if iv_info.get("pc_oi") is not None:
+            print(f"  Put/Call OI:        {iv_info['pc_oi']:.2f}")
     else:
-        print(f"\n  OPTIONS-MARKET CHECK: skipped (Tradier IV unavailable)")
+        print(f"\n  OPTIONS-MARKET CHECK: skipped (IV not in indicators CSV)")
 
     print(f"\n  {'─'*w}")
     if gate_msg:
@@ -500,10 +501,10 @@ if __name__ == "__main__":
 
     latest = df_full[["HV_20", "IV_rank", "IV_pct"]].dropna().iloc[-1]
 
-    # Pull live ATM IV from Tradier and compute IV/HV ratio
-    iv_info = check_atm_iv(TICKER, float(latest["HV_20"]))
+    # Read today's IV snapshot harvested by indicators.py and compute IV/HV ratio
+    iv_info = read_iv_from_csv(df_full, float(latest["HV_20"]))
 
-    signal_pre, signal_post = print_combined_signal(
+    print_combined_signal(
         df_full,
         direction_prob,
         dir_prob_63,
@@ -519,7 +520,3 @@ if __name__ == "__main__":
         exp_contributors,
         iv_info=iv_info,
     )
-
-    # Log the observation for future historical IV training data
-    latest_date = df_full.dropna().index[-1].strftime("%Y-%m-%d")
-    log_iv_observation(TICKER, latest_date, iv_info, signal_pre, signal_post)

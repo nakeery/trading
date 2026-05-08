@@ -33,6 +33,7 @@ from modules.benchmarks import (
     detect_benchmarks, detect_macro_features, add_macro_features,
     add_catalyst_proximity,
 )
+from modules.massive import IV_COLS
 
 # ─────────────────────────────────────────
 # CONFIG
@@ -258,7 +259,7 @@ def fit_and_score(X, y, decision_threshold):
 def sweep_p2(df, median_hv):
     """Phase 2 (15-day direction) sweep across P2_VOL_MULTIPLE."""
     rows = []
-    exclude = {"Open", "High", "Low", "Close", "Volume", "target"}
+    exclude = {"Open", "High", "Low", "Close", "Volume", "target", *IV_COLS}
     feature_cols_base = [c for c in df.columns if c not in exclude]
 
     future_close = df["Close"].shift(-P2_FORWARD_DAYS)
@@ -299,7 +300,7 @@ def sweep_p2(df, median_hv):
 def sweep_p3(df, median_hv):
     """Phase 3 (IV expansion) sweep across P3_VOL_MULTIPLE."""
     rows = []
-    exclude = {"Open", "High", "Low", "Close", "Volume", "target"}
+    exclude = {"Open", "High", "Low", "Close", "Volume", "target", *IV_COLS}
     feature_cols_base = [c for c in df.columns if c not in exclude]
 
     future_hv = df["HV_20"].shift(-P3_FORWARD_DAYS)

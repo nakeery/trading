@@ -26,6 +26,7 @@ import matplotlib.pyplot as plt
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from modules.benchmarks import detect_benchmarks, detect_macro_features, add_catalyst_proximity
+from modules.massive import IV_COLS
 
 # ─────────────────────────────────────────
 # CONFIG
@@ -240,7 +241,7 @@ def build_features(df, benchmarks):
 # 4. TRAIN A SINGLE MODEL
 # ─────────────────────────────────────────
 def train_model(df_train, target_col):
-    exclude = {"Open", "High", "Low", "Close", "Volume", target_col}
+    exclude = {"Open", "High", "Low", "Close", "Volume", target_col, *IV_COLS}
     feature_cols = [c for c in df_train.columns if c not in exclude]
 
     df_model = df_train[feature_cols + [target_col]].dropna()

@@ -27,6 +27,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay, brier_score_loss
 from modules.benchmarks import detect_benchmarks, detect_macro_features, add_macro_features, add_catalyst_proximity
+from modules.massive import IV_COLS
 
 # ─────────────────────────────────────────
 # CONFIG
@@ -254,7 +255,7 @@ def print_calibration_diagnostic(y_true, y_prob, label):
 
 
 def train_model(df):
-    exclude = {"Open", "High", "Low", "Close", "Volume", "target"}
+    exclude = {"Open", "High", "Low", "Close", "Volume", "target", *IV_COLS}
     feature_cols = [c for c in df.columns if c not in exclude]
 
     df_model = df[feature_cols + ["target"]].dropna()
