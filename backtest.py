@@ -17,12 +17,14 @@ Requirements:
     pip install yfinance pandas scikit-learn matplotlib
 """
 
+import argparse
 import os
 import sys
 import numpy as np
 import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from modules.benchmarks import detect_benchmarks, detect_macro_features, add_catalyst_proximity
@@ -48,7 +50,9 @@ WIN_THRESHOLD_63    = 0.10  # Default (AMD). Overridden at runtime by compute_vo
 P2_VOL_MULTIPLE     = 0.41  # 0.41 sigma bar — practical range: 0.25 (aggressive) to 1.0 (conservative)
 EXPANSION_THRESHOLD = 0.10  # Default (AMD). Overridden at runtime by compute_vol_thresholds()
 P3_VOL_MULTIPLE     = 0.20  # Sets expansion bar at 20% of median HV — practical range: 0.10 to 0.40
-P2_THRESHOLD        = 0.55
+P2_CALIBRATE        = False  # Decision 1 (S11) reverted as default after NVDA regression (STRONG ENTRY 4.4% → -0.4%). Pass --calibrate to enable.
+P2_THRESHOLD        = 0.55   # Phase 2 (15d) cutoff. Set from P2_CALIBRATE in __main__: 0.50 calibrated / 0.55 raw.
+P2B_THRESHOLD       = 0.55  # Phase 2B (63d) raw cutoff — calibration deferred to Decision 2
 P3_THRESHOLD        = 0.60
 RANDOM_STATE        = 42
 
@@ -240,7 +244,7 @@ def build_features(df, benchmarks):
 # ─────────────────────────────────────────
 # 4. TRAIN A SINGLE MODEL
 # ─────────────────────────────────────────
-def train_model(df_train, target_col):
+def train_model(df_train, target_col, calibrate=False):
     exclude = {"Open", "High", "Low", "Close", "Volume", target_col, *IV_COLS}
     feature_cols = [c for c in df_train.columns if c not in exclude]
 
@@ -254,9 +258,18 @@ def train_model(df_train, target_col):
     scaler = StandardScaler()
     X_s = scaler.fit_transform(X)
 
-    clf = LogisticRegression(C=0.1, class_weight="balanced",
-                             max_iter=1000, random_state=RANDOM_STATE)
-    clf.fit(X_s, y)
+    if calibrate:
+        clf = CalibratedClassifierCV(
+            LogisticRegression(C=0.1, class_weight="balanced",
+                               max_iter=1000, random_state=RANDOM_STATE),
+            method="isotonic",
+            cv=5,
+        )
+        clf.fit(X_s, y)
+    else:
+        clf = LogisticRegression(C=0.1, class_weight="balanced",
+                                 max_iter=1000, random_state=RANDOM_STATE)
+        clf.fit(X_s, y)
     return clf, scaler, feature_cols
 
 
@@ -282,12 +295,12 @@ def run_backtest(df_full):
 
         df_train = df_full.iloc[:train_end].copy()
 
-        # Phase 2 — 15-day direction target
+        # Phase 2 — 15-day direction target (mode set via CLI flag — see banner)
         df_p2 = df_train.copy()
         fc2 = df_p2["Close"].shift(-P2_FORWARD_DAYS)
         df_p2["_target"] = ((fc2 / df_p2["Close"] - 1) >= WIN_THRESHOLD).astype(int)
         df_p2 = df_p2.iloc[:-P2_FORWARD_DAYS]
-        clf2, scaler2, fcols2 = train_model(df_p2, "_target")
+        clf2, scaler2, fcols2 = train_model(df_p2, "_target", calibrate=P2_CALIBRATE)
 
         # Phase 2B — 63-day direction target
         df_p2b = df_train.copy()
@@ -325,7 +338,7 @@ def run_backtest(df_full):
             exp_prob    = clf3.predict_proba(scaler3.transform(X3))[0, 1]
 
             dir_signal    = dir_prob    >= P2_THRESHOLD
-            dir_signal_63 = dir_prob_63 >= P2_THRESHOLD
+            dir_signal_63 = dir_prob_63 >= P2B_THRESHOLD
             exp_signal    = exp_prob    >= P3_THRESHOLD
 
             if dir_signal and dir_signal_63 and exp_signal:
@@ -563,6 +576,22 @@ def print_sweep_summary(sweep_results, ticker):
 # MAIN
 # ─────────────────────────────────────────
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Walk-forward backtest of combined Phase 2/2B/3 signal.")
+    parser.add_argument(
+        "--calibrate", action=argparse.BooleanOptionalAction, default=False,
+        help="Use isotonic-calibrated Phase 2 (Decision 1, S11). Default OFF (NVDA regression: STRONG ENTRY 4.4% → -0.4%). Pass --calibrate to enable.",
+    )
+    args = parser.parse_args()
+    P2_CALIBRATE = args.calibrate
+    P2_THRESHOLD = 0.50 if P2_CALIBRATE else 0.55
+
+    mode_label = "CALIBRATED  (Decision 1 — isotonic, 5-fold CV)" if P2_CALIBRATE else "RAW  (Decision 1 disabled — class_weight=balanced)"
+    print("═" * 64)
+    print(f"  Phase 2 mode: {mode_label}")
+    print(f"  P2_THRESHOLD = {P2_THRESHOLD}  |  P2B_THRESHOLD = {P2B_THRESHOLD}  |  P3_THRESHOLD = {P3_THRESHOLD}")
+    print("═" * 64)
+    print()
+
     while True:
         try:
             ticker_in = input("  Ticker [XYZ]: ").strip().upper()
@@ -638,3 +667,5 @@ if __name__ == "__main__":
         out = os.path.join(DATA_DIR, f"{TICKER.lower()}_backtest_results.csv")
         results.to_csv(out)
         print(f"Full results saved -> {out}")
+
+    print(f"\n[Phase 2: {'CALIBRATED' if P2_CALIBRATE else 'RAW'} — P2_THRESHOLD={P2_THRESHOLD}]")

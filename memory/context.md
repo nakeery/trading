@@ -229,21 +229,140 @@ and S12 (Phase 3 retraining on real IV).
 
 ────────────────────────────────────────────────────────────────────────
 
+Session 11 — Decision 1 Implementation + NVDA Regression (2026-05-08/09)
+
+Implemented S9-carryover Decision 1 (isotonic-calibrated Phase 2 production model).
+QQQ validation showed marginal pass (-0.3pt STRONG ENTRY); NVDA validation showed
+catastrophic fail (-4.8pt STRONG ENTRY, full hierarchy inversion). Default reverted
+to raw; calibrated retained as a CLI research toggle.
+
+1. Calibrated Phase 2 production path (direction/entry/backtest)
+   - train_model / train accept calibrate=False param; when True fits
+     CalibratedClassifierCV(method="isotonic", cv=5) and SYNTHESIZES .coef_ on the
+     wrapper as the average of base-estimator coefs so downstream code (top-coefficients
+     print, get_top_contributors) keeps working without changes.
+   - direction.py train_model also accepts decision_threshold param so Phase 2 (e.g. 0.50
+     calibrated) and Phase 2B (0.55 raw) classification reports use their own thresholds
+     instead of a single shared DECISION_THRESHOLD constant.
+
+2. P2_THRESHOLD / P2B_THRESHOLD split into separate constants
+   - Previously one value (0.55) was used for both phases. entry.py and backtest.py now
+     have P2B_THRESHOLD = 0.55 separate from P2_THRESHOLD (0.55 raw / 0.50 calibrated).
+   - dir_signal_63 = dir_prob_63 >= P2B_THRESHOLD (was P2_THRESHOLD).
+
+3. CLI flag --calibrate / --no-calibrate (argparse BooleanOptionalAction)
+   - Added to direction.py / entry.py / backtest.py.
+   - Banner at start of every run prints active mode + thresholds; footer at end.
+   - Display label in entry.py "[threshold: X — calibrated/raw]" reflects active mode.
+   - DEFAULT: --no-calibrate (raw production), reverted after NVDA fail. Calibrated path
+     remains accessible via --calibrate.
+
+4. Calibrated Phase 2 threshold sweep (QQQ test, 1314 rows)
+   - Calibrated probs heavily compress: 66% of test in bin 0.4-0.5, 34% in 0.5-0.6,
+     0% above 0.6. Calibration is correctly pulling overconfident raw probs toward
+     true rates — but at the cost of distributional spread.
+   - Threshold sweep optimum 0.50 (446 signals, 48.9% precision, +2.1pt over 46.8% base)
+   - At raw-equivalent threshold 0.55 calibrated only fires 58 times (no usable edge) —
+     the threshold MUST be re-tuned on the calibrated scale, can't reuse the raw cut.
+   - ECE on Phase 2 (QQQ): raw 7.01% → calibrated 1.14% (~6x academic improvement).
+
+5. QQQ walk-forward result (53 windows) — "marginal pass"
+   - STRONG ENTRY: raw 619/2.0%/64.9% → calibrated 434/1.7%/61.5%
+   - Drop within 0.5pt verdict-gate tolerance; STRONG > others preserved (CAUTION ties
+     SHORT-TERM ONLY at 0.8%).
+   - 65% reproducibility property weakened (-3.4pt to 61.5%).
+   - SIDE EFFECT: SHORT-TERM ONLY IMPROVED 0.3% → 0.8% (+0.5pt). The "Phase 2 fires but
+     Phase 2B doesn't" subset gets a quality bump because tighter Phase 2 admits
+     different/better days.
+
+6. NVDA walk-forward result (53 windows) — catastrophic fail
+   - STRONG ENTRY: raw 391/4.4%/65.5% → calibrated 187/-0.4%/52.4%
+   - 4.8pt avg-return drop = 16x my verdict gate. STRONG ENTRY now UNDERPERFORMS
+     ALL DAYS (2.5%) by 2.9pt — the model's strongest signal becomes worse than random.
+   - Hierarchy FULLY inverted: SHORT (3.4%) > STAY OUT (2.9%) > CAUTION (0.6%) >
+     STRONG ENTRY (-0.4%).
+   - Win rate collapses 65.5% → 52.4% (essentially coin-flipping).
+   - AvgLoss worsens -14.5% → -19.6% (surviving calibrated trades are a worse-distributed
+     subset, not a cleaner one).
+
+7. Why NVDA broke where QQQ didn't (postmortem)
+   - QQQ: 25y of relatively stationary index behavior. Per-window calibrators fit on
+     older windows still generalize to newer ones.
+   - NVDA: post-2023 AI-pivot regime change. Vol distributions shift across windows.
+     Per-window isotonic (cv=5 with ~50-400 samples per fold) cannot track regime
+     transitions reliably — calibrator fit on regime A applied to regime B is wrong.
+   - NVDA's STRONG ENTRY edge specifically lived in the HIGH-CONFIDENCE RAW PROBABILITY
+     TAIL. Isotonic regularization-toward-mean compresses those extremes — destroying
+     exactly the signal that drives the edge.
+   - GENERALIZABLE LESSON: framework edge concentrates in the high-confidence tail for
+     individual stocks (vs index ETFs where edge is more uniformly distributed).
+     Calibration's mean-regression IS HARMFUL where the tail IS the signal.
+
+8. Decision: revert default to --no-calibrate
+   - Module-level P2_CALIBRATE = False, P2_THRESHOLD = 0.55 in entry.py and backtest.py.
+   - argparse default=False in all 3 scripts.
+   - help text now flags the NVDA regression: "Default OFF (NVDA regression: STRONG
+     ENTRY 4.4% → -0.4%). Pass --calibrate to enable."
+   - Calibrated mode retained as research/diagnostic toggle (probability honesty for
+     output readability, ECE diagnostics, future probability-based sizing experiments).
+
+9. Implications for Decision 2 (Platt scaling on Phase 2B)
+   - Originally deferred until D1 validates calibration helps in this framework.
+   - D1 actively HURTS on individual stocks. Phase 2B's signal lives in a similar high-
+     confidence tail. Platt is less aggressive than isotonic (sigmoid fit, can't compress
+     to plateau) but still pulls toward mean.
+   - STATUS: DEPRIORITIZED. Investigate only if a Phase 2B-specific use case emerges
+     where probability-value honesty matters more than tail preservation.
+
+10. Cross-ticker validation lesson (process improvement)
+    - QQQ alone is NOT sufficient validation for any framework change. Index ETF edge
+      profile differs structurally from individual-stock edge profile.
+    - Going forward: any model change requires validation on QQQ + NVDA + AMD minimum
+      before adopting as production default.
+
+11. Pipeline run verification (today, 2026-05-09):
+    - QQQ entry.py (raw default): STAY OUT — Phase 2 raw 54.1%, calibrated 45.8%; both
+      below their thresholds. IV/HV 1.63 (very rich), term 1.09 (backwardation).
+    - NVDA entry.py (raw default): STAY OUT — Phase 2 raw 37.7% (NO SIGNAL — below
+      base rate), Phase 2B 57.7% (WIN ✓), Phase 3 12.9% (CONTRACTION — 12d to earnings,
+      vol crush expected). IV/HV 1.18 (fair), term 1.08, P/C OI 0.26 (call-skewed).
+
+────────────────────────────────────────────────────────────────────────
+
 Backtest Results (Most Recent / Representative)
 
 QQQ (53 windows, 2001-2026, post-S8 features) — framework reference baseline
+  Mode: RAW (production default as of S11)
   Signal           Count   Avg Ret   Median  Win%   Strong%  AvgWin  AvgLoss
   STRONG ENTRY       619     2.0%     2.4%   64.9%   53.3%    5.4%   -4.1%   <- best
   CAUTION           1364     1.1%     1.8%   62.1%   50.1%    4.4%   -4.3%
   SHORT-TERM ONLY    558     0.3%     0.8%   56.5%   43.4%    4.1%   -4.6%
   STAY OUT          3772     0.6%     1.2%   61.5%   42.6%    3.5%   -3.9%
 
-NVDA (25 windows, 2001-2026, post-S8 features) — RECLASSIFIED well-suited (was marginal)
+  Mode: CALIBRATED (--calibrate, S11 research toggle)
+  STRONG ENTRY       434     1.7%     1.4%   61.5%   48.6%    5.5%   -4.5%
+  CAUTION            922     0.8%     1.6%   60.6%   47.0%    4.1%   -4.2%
+  SHORT-TERM ONLY    699     0.8%     1.3%   63.8%   42.8%    3.2%   -3.3%   (improved)
+  STAY OUT          4259     0.7%     1.3%   61.4%   45.0%    3.8%   -4.2%
+  Verdict: marginal pass. STRONG ENTRY -0.3pt (within tolerance), hierarchy preserved
+  but tightened, 65% win-rate property weakened to 61.5%. ECE 7.01% → 1.14%.
+
+NVDA (53 windows, 2001-2026, post-S8 features)
+  Mode: RAW (production default as of S11)
   Signal           Count   Avg Ret   Median  Win%   Strong%  AvgWin  AvgLoss
-  STRONG ENTRY       392     4.4%     4.9%   65.3%   52.8%   14.4%  -14.5%   <- BEST in project
-  CAUTION           1269     1.7%     2.4%   56.4%   45.0%   11.2%  -10.8%
-  SHORT-TERM ONLY    323     4.1%     3.0%   60.7%   44.6%   12.7%   -9.3%
-  STAY OUT          4361     2.5%     2.0%   58.5%   40.6%   10.0%   -8.0%
+  STRONG ENTRY       391     4.4%     4.9%   65.5%   52.9%   14.4%  -14.5%   <- BEST in project
+  CAUTION           1270     1.6%     2.4%   56.4%   44.9%   11.2%  -10.8%
+  SHORT-TERM ONLY    322     4.0%     2.7%   60.2%   44.4%   12.8%   -9.3%
+  STAY OUT          4364     2.5%     2.0%   58.6%   40.7%   10.0%   -8.0%
+
+  Mode: CALIBRATED (--calibrate) — REGRESSION
+  STRONG ENTRY       187    -0.4%     3.0%   52.4%   49.7%   17.0%  -19.6%   <- BROKEN
+  CAUTION            666     0.6%     2.9%   57.1%   47.1%   11.7%  -14.1%
+  SHORT-TERM ONLY    187     3.4%     3.4%   62.0%   46.0%   12.7%  -11.7%   <- best
+  STAY OUT          5307     2.9%     2.1%   58.9%   41.5%   10.3%   -7.8%
+  Verdict: catastrophic fail. STRONG ENTRY -4.8pt (16x verdict gate), hierarchy fully
+  inverted (SHORT > STAY OUT > CAUTION > STRONG), STRONG ENTRY underperforms ALL DAYS
+  by 2.9pt. Drove the S11 default-revert decision.
 
 SPY (31 years, 1995-2026, post-S8 features) — UNSUITABLE for this framework
   Signal           Count   Avg Ret   Median  Win%   Strong%  AvgWin  AvgLoss
@@ -293,7 +412,7 @@ During known geopolitical crises:
 
 ────────────────────────────────────────────────────────────────────────
 
-Improvements (status as of S10)
+Improvements (status as of S11)
 
 DONE
 - [S8] VIX term structure (VIX9D_VIX_ratio, VIX_VIX3M_ratio) in all ML scripts
@@ -304,23 +423,35 @@ DONE
     - entry.py reads IV from CSV (no live Tradier call); same gate logic
     - 25Δ skew, term structure, put/call OI ratio captured per ticker per day
     - 5-band term structure labels in entry.py output
+- [S11] Decision 1 (calibrated Phase 2) implemented but NOT adopted as default:
+    - CalibratedClassifierCV(isotonic, cv=5) plumbed through train/train_model
+    - .coef_ synthesized on wrapper as avg of base estimators (downstream code unchanged)
+    - direction.py train_model accepts decision_threshold param for honest per-phase
+      classification reports
+    - P2_THRESHOLD / P2B_THRESHOLD constants split (previously shared)
+    - --calibrate / --no-calibrate CLI flag added to direction/entry/backtest with
+      banner+footer indicating mode
+    - REVERTED TO RAW AS DEFAULT after NVDA regression (-4.8pt STRONG ENTRY, hierarchy
+      inversion). Calibrated mode retained as research toggle.
 
 PENDING DECISIONS
-- [S9 carryover] Switch Phase 2 to calibrated production model (Direction 1)
-    Cleanest improvement; Phase 2 is the gateway gate so leverage is highest
-    Required: re-tune P2_THRESHOLD on calibrated scale + backtest regression check
-- [S9 carryover] Try Platt scaling on Phase 2B (Direction 2)
-    Sigmoid-fit alternative; less compression than isotonic
-    Defer until Direction 1 validates that calibration helps in this framework
+- [S9 carryover, S11 verdict] Decision 2 (Platt scaling on Phase 2B) — DEPRIORITIZED
+    Originally deferred pending D1 validation. D1 fails on individual stocks (NVDA);
+    Phase 2B's signal lives in a similar high-confidence tail that Platt would still
+    regularize toward the mean (less aggressively than isotonic, but same direction).
+    Investigate only if Phase 2B-specific probability-value use case emerges.
 
 NEXT MAJOR WORK
-- [S11/TODO] Black-Scholes inversion pipeline for historical IV backfill
+- [S12/TODO] Black-Scholes inversion pipeline for historical IV backfill (was S11/TODO,
+  bumped to S12 because S11 was consumed by Decision 1)
     Use /v3/reference/options/contracts (as_of) + /v2/aggs/... to get historical option
     OHLC, then BS-invert with risk-free rate + dividends to recover ATM IV per ticker
     per day. Output: 2 years of historical IV in indicators CSV (per ticker).
     Dependencies: scipy.optimize (brentq), FRED ^IRX for risk-free rate, yfinance
     dividend yield.
-- [S12/TODO] Phase 3 retraining on real IV (depends on S11)
+    Now the highest-leverage outstanding item (Phase 3 has 22pt edge on HV-derived IV;
+    real ATM IV history could push it higher).
+- [S13/TODO] Phase 3 retraining on real IV (depends on S12)
     Replace HV-derived target with actual ATM IV expansion in next 10 days; use real
     IV rank/percentile as features. Should sharpen Phase 3 expansion precision (0.64).
 
@@ -350,6 +481,11 @@ Known Issues (not yet fixed)
 Important Notes
 - Use the PowerShell tool (NOT Bash) for piped script execution on Windows.
   Pattern: cmd /c "(echo TICKER && echo.) | python -X utf8 script.py" 2>&1
+- [S11] CLI flag for Phase 2 mode: --calibrate / --no-calibrate available on
+  direction.py / entry.py / backtest.py. Default is RAW (--no-calibrate after the NVDA
+  regression). Add --calibrate to any of those commands to use the isotonic-calibrated
+  Phase 2 model with P2_THRESHOLD=0.50; default raw uses P2_THRESHOLD=0.55.
+  Banner at start and footer at end of each run prints the active mode.
 - backtest.py is SELF-CONTAINED — does NOT import from direction.py or volatility.py.
   If feature engineering changes there, backtest.py must be manually updated.
 - IV_COLS exclusion pattern: any new ML script reading the indicators CSV must add
@@ -426,12 +562,17 @@ Term Structure 5-Band Label (entry.py output)
 
 ────────────────────────────────────────────────────────────────────────
 
-Ticker Suitability (post-S8)
-- QQQ:  best statistical case; 53 windows; clean hierarchy; framework reference baseline
-        STRONG ENTRY 2.0% / 65% win
-- NVDA: WELL-SUITED (was "marginal" in S7) — STRONG ENTRY 4.4% / 65% win, BEST in project.
-        Long history dilutes the post-2023 regime-change concern.
-- AMD:  well-suited; 15 walk-forward windows; STRONG ENTRY 2.6% / 59.7% win
+Ticker Suitability (post-S11)
+- QQQ:  best statistical case; 53 windows; clean hierarchy; framework reference baseline.
+        STRONG ENTRY 2.0% / 65% win (raw); 1.7% / 61.5% (calibrated, marginal pass).
+- NVDA: WELL-SUITED IN RAW MODE ONLY (S8 reclass + S11 caveat) — STRONG ENTRY 4.4% / 65%
+        win raw, BEST in project. CALIBRATED mode COLLAPSES this to -0.4% / 52% (S11
+        regression). Edge lives in the high-confidence probability tail; calibration
+        compresses it. Long history dilutes the post-2023 regime-change concern for raw
+        but exposes calibrators to within-window non-stationarity.
+- AMD:  well-suited; 15 walk-forward windows; STRONG ENTRY 2.6% / 59.7% win (raw).
+        Calibrated mode untested on AMD as of S11 — likely similar pattern to NVDA
+        given individual-stock high-confidence-tail edge profile.
 - SOFI: marginal — short history (2021 IPO); rate features need more rate-regime variation
 - CRSP: unsuitable for direction (binary FDA/trial events); Phase 3 viable for vol plays
         (consider straddle/strangle around PDUFA dates rather than directional calls)
@@ -455,3 +596,11 @@ Cross-Ticker Findings
   individual stocks (NVDA 4.4%, AMD 2.6%) > tech-heavy index (QQQ 2.0%) > broad index (SPY 0.8%)
 - [S8] Classification edge ≠ trading P&L. Validate threshold-tuning ideas via backtest
   STRONG ENTRY avg return, not via precision-edge metrics.
+- [S11] Edge for individual stocks lives in the HIGH-CONFIDENCE PROBABILITY TAIL.
+  Calibration's regularization-toward-mean compresses extremes, destroying exactly the
+  signal that drives STRONG ENTRY for stocks like NVDA. Index ETFs are less affected
+  (edge is more uniformly distributed). Implication: any model regularization that
+  dampens high-confidence outliers risks the same NVDA-style failure.
+- [S11] QQQ-only validation is INSUFFICIENT for framework changes. Always co-validate
+  on at least one individual stock (NVDA recommended as best-in-project baseline)
+  before adopting any model change as the production default.

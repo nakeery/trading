@@ -16,6 +16,7 @@ Requirements:
     pip install yfinance pandas scikit-learn matplotlib
 """
 
+import argparse
 import os
 import sys
 import numpy as np
@@ -254,7 +255,7 @@ def print_calibration_diagnostic(y_true, y_prob, label):
         print(f"  {lo:.1f}-{hi:.1f}      {n:>5}  {pred:>7.1%}  {actual:>7.1%}  {gap:>+8.1%}{marker}")
 
 
-def train_model(df):
+def train_model(df, calibrate=False, decision_threshold=DECISION_THRESHOLD):
     exclude = {"Open", "High", "Low", "Close", "Volume", "target", *IV_COLS}
     feature_cols = [c for c in df.columns if c not in exclude]
 
@@ -273,18 +274,34 @@ def train_model(df):
     X_train_s = scaler.fit_transform(X_train)
     X_test_s  = scaler.transform(X_test)
 
-    clf = LogisticRegression(
+    raw_clf = LogisticRegression(
         C=0.1,                  # regularization strength (lower = more regularized)
         class_weight="balanced",
         max_iter=1000,
         random_state=RANDOM_STATE,
     )
-    clf.fit(X_train_s, y_train)
+    raw_clf.fit(X_train_s, y_train)
+
+    if calibrate:
+        clf = CalibratedClassifierCV(
+            LogisticRegression(C=0.1, class_weight="balanced",
+                               max_iter=1000, random_state=RANDOM_STATE),
+            method="isotonic",
+            cv=5,
+        )
+        clf.fit(X_train_s, y_train)
+        # Average base-estimator coefs onto the wrapper so downstream code that
+        # reads clf.coef_ (top-coefficients print, entry.py contributors) works unchanged.
+        clf.coef_ = np.mean(
+            [cc.estimator.coef_ for cc in clf.calibrated_classifiers_], axis=0
+        )
+    else:
+        clf = raw_clf
 
     y_prob_train = clf.predict_proba(X_train_s)[:, 1]
-    y_pred_train = (y_prob_train >= DECISION_THRESHOLD).astype(int)
+    y_pred_train = (y_prob_train >= decision_threshold).astype(int)
     y_prob = clf.predict_proba(X_test_s)[:, 1]
-    y_pred = (y_prob >= DECISION_THRESHOLD).astype(int)
+    y_pred = (y_prob >= decision_threshold).astype(int)
 
     train_base = y_train.mean()
     test_base  = y_test.mean()
@@ -296,7 +313,7 @@ def train_model(df):
           f"Precision  — train: {train_prec:.1%}  |  test: {test_prec:.1%}  (when model says WIN, how often correct) ***\n")
 
     print("─" * 50)
-    print(f"CLASSIFICATION REPORT (test set, threshold={DECISION_THRESHOLD})")
+    print(f"CLASSIFICATION REPORT (test set, threshold={decision_threshold})")
     print("─" * 50)
     print(classification_report(y_test, y_pred, target_names=["Loss", "Win"], zero_division=0))
 
@@ -338,17 +355,22 @@ def train_model(df):
     print()
 
     # Calibration diagnostic — compare raw LR vs isotonic-calibrated wrapper.
-    # Diagnostic only; does not affect the production model returned below.
+    # When calibrate=True the calibrated path is the production model; the
+    # diagnostic still prints both for ECE drift monitoring.
     print("─" * 60)
     print("CALIBRATION DIAGNOSTIC (test set)")
     print("─" * 60)
-    print_calibration_diagnostic(y_test, y_prob, "Raw Logistic Regression")
-    calibrated = CalibratedClassifierCV(
-        LogisticRegression(C=0.1, class_weight="balanced", max_iter=1000, random_state=RANDOM_STATE),
-        method="isotonic",
-        cv=5,
-    )
-    calibrated.fit(X_train_s, y_train)
+    raw_y_prob = raw_clf.predict_proba(X_test_s)[:, 1]
+    print_calibration_diagnostic(y_test, raw_y_prob, "Raw Logistic Regression")
+    if calibrate:
+        calibrated = clf  # reuse the production calibrated model
+    else:
+        calibrated = CalibratedClassifierCV(
+            LogisticRegression(C=0.1, class_weight="balanced", max_iter=1000, random_state=RANDOM_STATE),
+            method="isotonic",
+            cv=5,
+        )
+        calibrated.fit(X_train_s, y_train)
     y_prob_cal = calibrated.predict_proba(X_test_s)[:, 1]
     print_calibration_diagnostic(y_test, y_prob_cal, "Calibrated (Isotonic, 5-fold CV)")
     print("─" * 60)
@@ -430,6 +452,22 @@ def compute_vol_thresholds(df):
 # MAIN
 # ─────────────────────────────────────────
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Phase 2 direction model — train + diagnose.")
+    parser.add_argument(
+        "--calibrate", action=argparse.BooleanOptionalAction, default=False,
+        help="Use isotonic-calibrated Phase 2 (Decision 1, S11). Default OFF (NVDA regression: STRONG ENTRY 4.4% → -0.4%). Pass --calibrate to enable.",
+    )
+    args = parser.parse_args()
+    P2_CALIBRATE = args.calibrate
+    P2_THRESHOLD = 0.50 if P2_CALIBRATE else 0.55
+
+    mode_label = "CALIBRATED  (Decision 1 — isotonic, 5-fold CV)" if P2_CALIBRATE else "RAW  (Decision 1 disabled — class_weight=balanced)"
+    print("═" * 64)
+    print(f"  Phase 2 mode: {mode_label}")
+    print(f"  P2_THRESHOLD = {P2_THRESHOLD}")
+    print("═" * 64)
+    print()
+
     while True:
         try:
             ticker_in = input("  Ticker [XYZ]: ").strip().upper()
@@ -466,9 +504,11 @@ if __name__ == "__main__":
     df = add_catalyst_proximity(df, TICKER, MODULE_DIR, for_direction=True)
     df = normalize_features(df)
 
-    # Phase 2 — 15-day direction model
+    # Phase 2 — 15-day direction model (mode set via CLI flag — see banner)
     df_15 = add_target(df.copy())
-    clf, X_test, y_test, y_pred, y_prob, feature_cols = train_model(df_15)
+    clf, X_test, y_test, y_pred, y_prob, feature_cols = train_model(
+        df_15, calibrate=P2_CALIBRATE, decision_threshold=P2_THRESHOLD,
+    )
     plot_results(clf, X_test, y_test, y_pred, feature_cols)
 
     # Phase 2B — 63-day direction model
@@ -484,3 +524,5 @@ if __name__ == "__main__":
 
     df_15.to_csv(os.path.join(DATA_DIR, f"{TICKER.lower()}_ml_features.csv"))
     print(f"\nEnriched feature dataset saved -> {os.path.join(DATA_DIR, f'{TICKER.lower()}_ml_features.csv')}")
+
+    print(f"\n[Phase 2: {'CALIBRATED' if P2_CALIBRATE else 'RAW'} — P2_THRESHOLD={P2_THRESHOLD}]")

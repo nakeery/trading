@@ -14,11 +14,13 @@ Requirements:
     pip install yfinance pandas scikit-learn
 """
 
+import argparse
 import sys
 import os
 import numpy as np
 import pandas as pd
 import yfinance as yf
+from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import precision_score
 from sklearn.preprocessing import StandardScaler
@@ -46,7 +48,9 @@ P2_VOL_MULTIPLE     = 0.41  # 0.41 sigma bar — practical range: 0.25 (aggressi
 EXPANSION_THRESHOLD = 0.10  # Default (AMD). Overridden at runtime by compute_vol_thresholds()
 P3_VOL_MULTIPLE     = 0.20  # Sets expansion bar at 20% of median HV — practical range: 0.10 to 0.40
 TEST_SIZE           = 0.20
-P2_THRESHOLD        = 0.55  # Direction signal cutoff (best precision from Phase 2)
+P2_CALIBRATE        = False  # Decision 1 (S11) reverted as default after NVDA regression (STRONG ENTRY 4.4% → -0.4%). Pass --calibrate to enable.
+P2_THRESHOLD        = 0.55   # Phase 2 (15d) cutoff. Set from P2_CALIBRATE in __main__: 0.50 calibrated / 0.55 raw.
+P2B_THRESHOLD       = 0.55  # Phase 2B (63d) raw cutoff — calibration deferred to Decision 2
 P3_THRESHOLD        = 0.60  # IV expansion cutoff (best precision from Phase 3)
 RANDOM_STATE        = 42
 
@@ -204,7 +208,7 @@ def build_features(df, benchmarks):
 # ─────────────────────────────────────────
 # 3. TRAIN MODELS
 # ─────────────────────────────────────────
-def train(df, target_col):
+def train(df, target_col, calibrate=False):
     exclude = {"Open", "High", "Low", "Close", "Volume", target_col, *IV_COLS}
     feature_cols = [c for c in df.columns if c not in exclude]
 
@@ -220,9 +224,23 @@ def train(df, target_col):
     X_train_s = scaler.fit_transform(X_train)
     X_test_s  = scaler.transform(X_test)
 
-    clf = LogisticRegression(C=0.1, class_weight="balanced",
-                             max_iter=1000, random_state=RANDOM_STATE)
-    clf.fit(X_train_s, y_train)
+    if calibrate:
+        clf = CalibratedClassifierCV(
+            LogisticRegression(C=0.1, class_weight="balanced",
+                               max_iter=1000, random_state=RANDOM_STATE),
+            method="isotonic",
+            cv=5,
+        )
+        clf.fit(X_train_s, y_train)
+        # Synthesize .coef_ as average of base-estimator coefs so get_top_contributors
+        # (which reads clf.coef_[0]) keeps working unchanged.
+        clf.coef_ = np.mean(
+            [cc.estimator.coef_ for cc in clf.calibrated_classifiers_], axis=0
+        )
+    else:
+        clf = LogisticRegression(C=0.1, class_weight="balanced",
+                                 max_iter=1000, random_state=RANDOM_STATE)
+        clf.fit(X_train_s, y_train)
 
     train_prec = precision_score(y_train, clf.predict(X_train_s), zero_division=0)
     test_prec  = precision_score(y_test,  clf.predict(X_test_s),  zero_division=0)
@@ -304,7 +322,7 @@ def print_combined_signal(df_full, direction_prob, dir_prob_63, expansion_prob,
     days_to_cat   = "N/A" if _dtc >= 90 else f"{_dtc}d"
 
     dir_signal    = direction_prob >= P2_THRESHOLD
-    dir_signal_63 = dir_prob_63 >= P2_THRESHOLD
+    dir_signal_63 = dir_prob_63 >= P2B_THRESHOLD
     exp_signal    = expansion_prob >= P3_THRESHOLD
     contraction_prob = 1 - expansion_prob
 
@@ -360,13 +378,14 @@ def print_combined_signal(df_full, direction_prob, dir_prob_63, expansion_prob,
     print(f"\n{'═'*w}")
     print(f"  COMBINED ENTRY SIGNAL — {TICKER} as of {latest_date}")
     print(f"{'═'*w}")
-    print(f"\n  DIRECTION — 15d entry timing  [threshold: {P2_THRESHOLD}]")
+    p2_mode = "calibrated" if P2_CALIBRATE else "raw"
+    print(f"\n  DIRECTION — 15d entry timing  [threshold: {P2_THRESHOLD} — {p2_mode}]")
     print(f"  Win Probability:    {direction_prob:.1%}  (base rate: {dir_base_rate:.1%})")
     print(f"  Signal:             {'WIN ✓' if dir_signal else 'NO SIGNAL ✗'}")
     print(f"  Drivers:            {fmt_contributors(dir_contributors)}")
     print(f"  Days to Earnings:   {days_to_earn}d")
     print(f"  Days to Catalyst:   {days_to_cat}")
-    print(f"\n  DIRECTION — 63d thesis        [threshold: {P2_THRESHOLD}]")
+    print(f"\n  DIRECTION — 63d thesis        [threshold: {P2B_THRESHOLD}]")
     print(f"  Win Probability:    {dir_prob_63:.1%}  (base rate: {dir_base_rate_63:.1%})")
     print(f"  Signal:             {'WIN ✓' if dir_signal_63 else 'NO SIGNAL ✗'}")
     print(f"  Drivers:            {fmt_contributors(dir_contributors_63)}")
@@ -441,6 +460,22 @@ def compute_vol_thresholds(df):
 # MAIN
 # ─────────────────────────────────────────
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Combined Phase 2/2B/3 entry signal.")
+    parser.add_argument(
+        "--calibrate", action=argparse.BooleanOptionalAction, default=False,
+        help="Use isotonic-calibrated Phase 2 (Decision 1, S11). Default OFF (NVDA regression: STRONG ENTRY 4.4% → -0.4%). Pass --calibrate to enable.",
+    )
+    args = parser.parse_args()
+    P2_CALIBRATE = args.calibrate
+    P2_THRESHOLD = 0.50 if P2_CALIBRATE else 0.55
+
+    mode_label = "CALIBRATED  (Decision 1 — isotonic, 5-fold CV)" if P2_CALIBRATE else "RAW  (Decision 1 disabled — class_weight=balanced)"
+    print("═" * 64)
+    print(f"  Phase 2 mode: {mode_label}")
+    print(f"  P2_THRESHOLD = {P2_THRESHOLD}  |  P2B_THRESHOLD = {P2B_THRESHOLD}  |  P3_THRESHOLD = {P3_THRESHOLD}")
+    print("═" * 64)
+    print()
+
     while True:
         try:
             ticker_in = input("  Ticker [XYZ]: ").strip().upper()
@@ -467,13 +502,13 @@ if __name__ == "__main__":
 
     df_full = build_features(df, benchmarks)
 
-    # Phase 2 — 15-day direction target
+    # Phase 2 — 15-day direction target (mode set via CLI flag — see banner)
     df_p2 = df_full.copy()
     future_close = df_p2["Close"].shift(-P2_FORWARD_DAYS)
     df_p2["direction_target"] = ((future_close / df_p2["Close"] - 1) >= WIN_THRESHOLD).astype(int)
     df_p2 = df_p2.iloc[:-P2_FORWARD_DAYS]
-    clf2, scaler2, fcols2, tr2, te2, base2 = train(df_p2, "direction_target")
-    print(f"Phase 2  (15d direction) — train precision: {tr2:.1%}  test precision: {te2:.1%}  base rate: {base2:.1%}")
+    clf2, scaler2, fcols2, tr2, te2, base2 = train(df_p2, "direction_target", calibrate=P2_CALIBRATE)
+    print(f"Phase 2  (15d direction, {'calibrated' if P2_CALIBRATE else 'raw'}) — train precision: {tr2:.1%}  test precision: {te2:.1%}  base rate: {base2:.1%}")
 
     # Phase 2B — 63-day direction target
     df_p2b = df_full.copy()
@@ -520,3 +555,5 @@ if __name__ == "__main__":
         exp_contributors,
         iv_info=iv_info,
     )
+
+    print(f"[Phase 2: {'CALIBRATED' if P2_CALIBRATE else 'RAW'} — P2_THRESHOLD={P2_THRESHOLD}]")
