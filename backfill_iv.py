@@ -106,7 +106,7 @@ def main():
             df[col] = pd.NA
 
     # Determine which dates need backfilling
-    cutoff = pd.Timestamp.today().normalize() - pd.DateOffset(days=5)
+    cutoff = pd.Timestamp.today().normalize() - pd.DateOffset(years=2)
     mask   = (df.index >= cutoff) & df["atm_iv_30d"].isna()
     dates  = df.index[mask].sort_values(ascending=False)   # newest -> oldest
 

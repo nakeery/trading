@@ -1,61 +1,57 @@
-"""End-to-end test of get_historical_iv_snapshot after fixes."""
+"""
+Validation: confirms S12 data quality fixes work correctly.
+  - 2025-11-03: previously returned 237% IV (v=1 artifact). Should now return None
+    or a plausible value after MIN_OPTION_VOLUME filter + max_iv=2.0 cap.
+  - 2025-10-01: clean trading day. Should return ~15-22% IV.
+"""
 import datetime
+import yfinance as yf
 from modules.massive import get_historical_iv_snapshot
 
-ticker = "QQQ"
-date   = datetime.date(2025, 11, 3)
-spot   = 490.0
-r      = 0.045
+def get_r(irx, d):
+    avail = irx[irx.index <= str(d)]
+    return float(avail.iloc[-1]) if not avail.empty else 0.05
 
-print(f"get_historical_iv_snapshot: {ticker} on {date} (spot={spot})")
-result = get_historical_iv_snapshot(ticker, date, spot, r)
-if result:
-    for k, v in result.items():
-        print(f"  {k}: {v}")
-else:
-    print("  Result: None — no valid inversion found")
+print("Fetching ^IRX for risk-free rates...")
+raw = yf.download("^IRX", period="5y", progress=False, auto_adjust=True)
+raw.columns = raw.columns.get_level_values(0)
+irx = raw["Close"].dropna() / 100.0
 
+tests = [
+    ("QQQ", datetime.date(2025, 11, 3),  "BAD  — was 237% IV (v=1 artifact)"),
+    ("QQQ", datetime.date(2025, 10, 1),  "GOOD — expect ~15-22% IV"),
+]
 
-# --- fetch contracts ---
-contracts = _fetch_historical_contracts(
-    ticker, date, target_dte - 7, target_dte + 7,
-    spot * 0.90, spot * 1.10, contract_type="call"
-)
-print(f"Reference returned {len(contracts)} contracts")
+# Fetch actual QQQ closing prices for test dates
+print("Fetching QQQ spot prices...")
+qqq_raw = yf.download("QQQ", start="2025-09-29", end="2025-11-05", progress=False, auto_adjust=True)
+qqq_raw.columns = qqq_raw.columns.get_level_values(0)
+qqq_close = qqq_raw["Close"].dropna()
 
-def parse_meta(c):
-    import datetime as dt
-    opt_ticker = c.get("ticker")
-    strike_raw = c.get("strike_price")
-    expiry_str = c.get("expiration_date")
-    if not (opt_ticker and strike_raw and expiry_str):
+def get_spot(d):
+    avail = qqq_close[qqq_close.index <= str(d)]
+    if avail.empty:
         return None
-    expiry = dt.date.fromisoformat(expiry_str)
-    dte = (expiry - date).days
-    if dte <= 0:
-        return None
-    return (opt_ticker, float(strike_raw), expiry, dte)
+    return float(avail.iloc[-1])
 
-parsed = [p for p in (parse_meta(c) for c in contracts) if p]
-parsed.sort(key=lambda p: abs(p[3] - target_dte) * 10 + abs(p[1] - spot))
-cands = parsed[:MAX_INVERT_PER_CATEGORY]
-
-print(f"\nTop {len(cands)} candidates by ATM score:")
-for p in cands:
-    print(f"  {p[0]}  K={p[1]}  dte={p[3]}")
-
-print(f"\nFetching agg prices and inverting:")
-for p in cands:
-    opt_ticker, strike, expiry, dte = p
-    T = dte / 252.0
-    price = _fetch_agg_price(opt_ticker, date)
-    if price is None:
-        print(f"  {opt_ticker}  K={strike}  -> NO PRICE")
+for ticker, date, label in tests:
+    r    = get_r(irx, date)
+    spot = get_spot(date)
+    if spot is None:
+        print(f"\n--- {date}  SKIP: no spot price ---")
         continue
-    try:
-        iv = implied_vol(price, spot, strike, r, T)
-    except Exception as e:
-        print(f"  {opt_ticker}  K={strike}  price={price:.4f}  -> INVERSION ERROR: {e}")
-        continue
-    ok = "OK" if 0.01 <= iv <= 5.0 else f"REJECTED (iv={iv:.4f} out of bounds)"
-    print(f"  {opt_ticker}  K={strike}  dte={dte}  price={price:.4f}  iv={iv:.4f}  -> {ok}")
+    print(f"\n--- {date}  {label}  spot={spot:.2f}  r={r:.4f} ---")
+    result = get_historical_iv_snapshot(ticker, date, spot, r)
+    if result is None:
+        print("  -> None (volume filter or IV cap rejected all candidates — fix working)")
+    else:
+        for k, v in result.items():
+            print(f"  {k}: {v}")
+        atm_iv = result.get("atm_iv_30d")
+        if atm_iv is not None:
+            if atm_iv > 2.0:
+                print(f"  !! FAIL: atm_iv_30d={atm_iv:.1%} exceeds max_iv=2.0")
+            elif atm_iv < 0.05 or atm_iv > 0.50:
+                print(f"  ?? WARN: atm_iv_30d={atm_iv:.1%} outside plausible 5-50% range")
+            else:
+                print(f"  OK: atm_iv_30d={atm_iv:.1%} looks plausible")

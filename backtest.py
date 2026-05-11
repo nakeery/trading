@@ -300,6 +300,7 @@ def run_backtest(df_full):
         print(f"  Window {window_num:2d}: train through {train_date} | test {test_s_date} to {test_e_date}")
 
         df_train = df_full.iloc[:train_end].copy()
+        compute_vol_thresholds(df_train, verbose=False)  # per-window: uses only training data
 
         # Phase 2 — 15-day direction target (mode set via CLI flag — see banner)
         df_p2 = df_train.copy()

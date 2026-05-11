@@ -340,6 +340,92 @@ clean data — see bugs discovered below.
 
 ────────────────────────────────────────────────────────────────────────
 
+Session 13 — Backfill Completion, Phase 3 Retrain, Threshold Calibration Fix (2026-05-10/11)
+
+1. QQQ 2-year IV backfill completed
+   - 266 / 447 target dates populated = 60% fill rate (40% NaN — no contracts traded
+     that day, or all aggregates records had v=1 artifact prices filtered out)
+   - Monthly-preference sort fix in modules/massive.py: contracts now sorted
+     by monthly expiry first (standard exchange cycles) before the DTE scoring pass,
+     preventing weekly weeklies from systematically outscoring monthly contracts.
+   - Full-history QQQ indicators CSV: 6,832 rows (1999-2026), 7 IV columns appended.
+     Historical IV rows: atm_iv_30d 266 real + rest NaN (imputed at train time).
+
+2. impute_iv_features() added to volatility.py (--iv-features mode)
+   - Without imputation: --iv-features dropna() collapsed training set to ~316 rows
+     (only rows with real atm_iv_30d), stripping 25y of direction/momentum history.
+     ECE ballooned to 0.2255 (model learned almost nothing).
+   - Fix: impute_iv_features() fills NaN IV with HV-based proxies + binary indicators:
+       atm_iv_30d    -> fill NaN with df["HV_20"]
+       iv_skew_25d   -> fill NaN with 0.0
+       term_structure -> fill NaN with 1.0
+       iv_available   -> 1 if real atm_iv_30d, else 0  (binary flag feature)
+       term_available -> 1 if real term_structure, else 0
+   - Training rows preserved: 5,240 (full history instead of 316).
+   - Called in volatility.py main flow: after normalize_features(), before df_full = df.copy()
+
+3. Phase 3 retrain results
+   - HV proxy (default, no --iv-features): expansion precision 74.2% @0.60, +32.9pt edge,
+     ECE 0.0335. 3,067 training rows, 767 test rows.
+   - --iv-features (imputed): expansion precision 75.0% @0.60, +33.7pt edge, ECE 0.0385.
+     5,240 training rows (full history preserved by imputation).
+   - Note: atm_iv_30d and HV_20 coefficients are nearly identical (-0.7869 each) in the
+     --iv-features model — expected near-collinearity, imputed values dominate the IV
+     feature in pre-2024 windows. Real incremental signal will emerge from iv_skew_25d
+     and term_structure as IV backfill history accumulates.
+
+4. Per-window threshold calibration fix in backtest.py
+   - Problem: compute_vol_thresholds() was called once on df_full before run_backtest().
+     For all 91 AMD windows, WIN_THRESHOLD was derived from full-history median_HV=49.8%,
+     which blends the 1980-2022 low-vol era with the post-2023 AI-pivot high-vol era.
+     Early windows (1981-2000) got a WIN_THRESHOLD calibrated partly on future vol data
+     they wouldn't have seen — a mild lookahead form.
+   - Fix: one line added inside run_backtest() loop, immediately after
+     df_train = df_full.iloc[:train_end].copy():
+       compute_vol_thresholds(df_train, verbose=False)
+     This updates the three globals using only the training window's HV history.
+   - The initial compute_vol_thresholds(df_full) call before the loop is preserved
+     (prints the full-history calibration header for reference).
+   - Impact on QQQ: minimal (STRONG ENTRY 64.9% -> 63.5% win rate, avg return unchanged
+     at 2.0%). QQQ has 25y of relatively stationary HV — full-history vs per-window
+     median barely differ.
+   - Impact on AMD: material (see results below). 40y of data means early windows used
+     1980s low-vol HV to train, which would have been contaminated by blending.
+
+5. QQQ backtest regression check (with per-window threshold fix)
+   - STRONG ENTRY: 586 signals, 2.0% avg, 63.5% win% (pre-fix: 619 / 2.0% / 64.9%)
+   - CAUTION: 1337 signals, 1.2% avg, 62.4% (pre-fix: 1364 / 1.1% / 62.1%)
+   - SHORT-TERM ONLY: 512 signals, 0.2% avg, 57.4% (pre-fix: 558 / 0.3% / 56.5%)
+   - STAY OUT: 3878 signals, 0.6% avg, 61.5% (unchanged)
+   - Signal hierarchy intact, avg returns essentially flat. Fix confirmed safe.
+
+6. AMD backtest — first full-history run (91 windows, 2000-2026)
+   - Full data range: 11,629 rows (1980-2026); 91 walk-forward windows.
+   - Global median HV: 49.8% (vs QQQ 18.2% — AMD is ~2.7× more volatile).
+   - WIN_THRESHOLD: 4.98% (vs QQQ 1.82%) — much harder 15d bar to clear.
+   - Results:
+       STRONG ENTRY:    377 signals, 3.9% avg, 57.0% win%, AvgWin 13.0%, AvgLoss -8.3%
+       CAUTION:         728 signals, 1.9% avg, 51.9% win%
+       SHORT-TERM ONLY: 560 signals, -1.4% avg, 44.5% win%
+       STAY OUT:       4783 signals, 1.9% avg, 52.1% win%
+   - Key findings:
+     a. STRONG ENTRY has clear edge: 3.9% avg vs 1.7% all-days (+2.2pt), AvgWin/AvgLoss
+        ratio (13.0% / -8.3%) is favorable positive skew even at 57% win rate.
+     b. SHORT-TERM ONLY is a hard NO on AMD: -1.4% avg, 44.5% win rate, worst label.
+        "Phase 2 fires but Phase 2B doesn't confirm" = do not trade AMD. The 63d
+        confirmation is load-bearing for this ticker.
+     c. CAUTION ≈ STAY OUT (both 1.9%, win rates 51.9% vs 52.1%): Phase 3 HV-proxy
+        IV expansion signal adds zero discriminating value between these two labels.
+        This contrasts with QQQ where CAUTION (1.2%) meaningfully beats STAY OUT (0.6%).
+        Implication: for AMD, treat CAUTION as STAY OUT and only size into STRONG ENTRY.
+     d. STRONG ENTRY AvgWin (13.0%) >> STRONG ENTRY AvgLoss (-8.3%): even if win rate
+        softens in live trading, the risk-reward profile supports FULL sizing as intended.
+     e. No AMD IV backfill exists yet. This run used HV-proxy Phase 3 (default). The
+        --iv-features flag would be degenerate until AMD backfill is complete (100% of
+        AMD atm_iv_30d would impute to HV_20, adding no new signal).
+
+────────────────────────────────────────────────────────────────────────
+
 Session 11 — Decision 1 Implementation + NVDA Regression (2026-05-08/09)
 
 Implemented S9-carryover Decision 1 (isotonic-calibrated Phase 2 production model).
@@ -484,12 +570,34 @@ SPY (31 years, 1995-2026, post-S8 features) — UNSUITABLE for this framework
   STRONG ENTRY beats ALL DAYS (0.7%) by 0.1pp = noise. Hierarchy broken (CAUTION>STRONG).
   Structural mismatch: framework's price-action lens vs SPY's macro-driven moves.
 
-AMD (15 windows, 2019-2026) — well-suited; baseline ticker
-  STRONG ENTRY 2.6% / 59.7% win | CAUTION 1.1% / 46.2% | SHORT-TERM ONLY 12.2% / 66.1% (best)
+QQQ (53 windows, 2001-2026, post-S13 threshold fix) — framework reference baseline
+  Mode: RAW (production default)
+  Signal           Count   Avg Ret   Median  Win%   Strong%  AvgWin  AvgLoss
+  STRONG ENTRY       586     2.0%     2.3%   63.5%   52.9%    5.5%   -4.2%   <- best
+  CAUTION           1337     1.2%     1.8%   62.4%   50.1%    4.5%   -4.3%
+  SHORT-TERM ONLY    512     0.2%     0.9%   57.4%   44.7%    3.9%   -4.8%
+  STAY OUT          3878     0.6%     1.2%   61.5%   42.7%    3.5%   -3.9%
+  Note: minimal delta vs pre-S13 (64.9% -> 63.5% STRONG win%). QQQ HV is stationary
+  enough that per-window vs full-history threshold calibration barely differs.
+
+AMD (91 windows, 2000-2026, post-S13 threshold fix) — well-suited
+  Signal           Count   Avg Ret   Median  Win%   Strong%  AvgWin  AvgLoss
+  STRONG ENTRY       377     3.9%     2.1%   57.0%   41.1%   13.0%   -8.3%   <- best
+  CAUTION            728     1.9%     0.8%   51.9%   39.0%   12.8%  -10.0%
+  SHORT-TERM ONLY    560    -1.4%    -2.0%   44.5%   30.9%   13.3%  -13.3%   <- hard NO
+  STAY OUT          4783     1.9%     0.7%   52.1%   38.4%   12.9%  -10.2%
+  Key: CAUTION ≈ STAY OUT (both 1.9%) — Phase 3 HV proxy adds no AMD discrimination.
+  SHORT-TERM ONLY is negative on AMD — 63d confirmation is load-bearing for this ticker.
+  Only trade AMD on STRONG ENTRY. HV threshold 4.98% (vs QQQ 1.82%) — much harder bar.
+  AMD IV backfill not yet done — --iv-features mode would be degenerate until complete.
 
 CRSP (17 windows, 2018-2026, post-S7 fix) — inversion fixed but sample thin
   STRONG ENTRY 3.8% / 51.1% win | only 45 STRONG signals — too thin for confident trading
   AvgLoss -12.1% reflects binary event risk on directional calls
+
+(Pre-S13 QQQ baseline preserved for reference)
+  STRONG ENTRY 619/2.0%/64.9% | CAUTION 1364/1.1%/62.1% | SHORT-TERM 558/0.3%/56.5%
+  Pre-S13 AMD (15 windows, 2019-2026 only): STRONG 2.6%/59.7% | SHORT-TERM 12.2%/66.1% (best)
 
 ────────────────────────────────────────────────────────────────────────
 
@@ -553,6 +661,19 @@ DONE
     - backfill_iv.py: standalone script with checkpointing, ^IRX rate lookup, resume
     - --iv-features/--no-iv-features toggle added to volatility/entry/backtest
     - Data quality bug PENDING: single-trade artifact prices need minimum volume filter
+- [S13] Backfill completion + imputation + threshold fix:
+    - QQQ backfill completed: 266/447 rows = 60% fill rate
+    - Monthly-preference sort fix in modules/massive.py (weeklies were outscoring monthlies)
+    - impute_iv_features() in volatility.py: fills NaN IV with HV_20/0.0/1.0 + binary
+      indicator flags (iv_available, term_available); preserves 5,240 training rows
+      (vs 316 without imputation); ECE improved from 0.2255 to 0.0385
+    - Per-window threshold calibration fix in backtest.py: compute_vol_thresholds(
+      df_train, verbose=False) inside run_backtest() loop after each df_train slice;
+      eliminates lookahead contamination from future vol data in early training windows
+    - Phase 3 retrain (HV proxy): 74.2% expansion precision, +32.9pt edge, ECE 0.0335
+    - Phase 3 retrain (--iv-features): 75.0% expansion precision, +33.7pt edge, ECE 0.0385
+    - AMD backtest (91 windows, full history): STRONG ENTRY 3.9%/57.0%; SHORT-TERM ONLY
+      -1.4% (hard NO on AMD); CAUTION ≈ STAY OUT (both 1.9% — Phase 3 not discriminating)
 
 PENDING DECISIONS
 - [S9 carryover, S11 verdict] Decision 2 (Platt scaling on Phase 2B) — DEPRIORITIZED
@@ -562,17 +683,18 @@ PENDING DECISIONS
     Investigate only if Phase 2B-specific probability-value use case emerges.
 
 NEXT MAJOR WORK
-- [S12 PARTIAL] Historical IV backfill — infrastructure complete, data quality fix pending
-    modules/bs_invert.py, backfill_iv.py, get_historical_iv_snapshot() all built.
-    Three API bugs fixed (as_of conflict, scoring units, candidate cap).
-    BLOCKING: single-trade artifact prices produce implausible IV (237% for QQQ).
-    Fix needed: minimum volume filter (v >= 5) in _fetch_agg_price + tighten IV
-    bounds from 5.0 to ~1.5 for non-event tickers.
-    After fix: validate on known-good date, then run full 2-year QQQ backfill.
-- [S13/TODO] Phase 3 retraining on real IV (depends on S12 backfill completion)
-    Replace HV-derived target with actual ATM IV expansion in next 10 days; use real
-    IV rank/percentile as features. Should sharpen Phase 3 expansion precision (0.64).
-    Run with --iv-features flag added to all ML scripts in S12.
+- [S13 DONE, S14 TODO] AMD IV backfill
+    QQQ at 60% fill. AMD has 0% backfill — run backfill_iv.py for AMD to enable
+    --iv-features mode. Without it, all AMD atm_iv_30d imputes to HV_20 (no new signal).
+    After backfill: retrain volatility.py with --iv-features for AMD; re-run backtest.
+- [S14 TODO] Phase 3 retraining on real IV (depends on AMD backfill)
+    QQQ --iv-features already shows 75.0% expansion precision (+0.8pt over HV proxy).
+    AMD Phase 3 CAUTION ≈ STAY OUT issue may resolve if real IV data adds discriminating
+    signal that HV-proxy can't capture (e.g. IV expansion ahead of earnings/events).
+- [S14 TODO] tighten backfill data quality filters
+    Current IV upper bound 5.0 accepts 237% outliers (artifact single-contract prints).
+    Fix: reject v < 5 (or n < 5) in _fetch_agg_price; tighten IV cap to 1.5 for
+    QQQ/SPY/NVDA/AMD, 1.0 for CRSP/biotech events. Validate on known-good date first.
 
 OTHER TODO (lower priority)
 - Earnings estimate revision direction (finviz/yfinance) for individual stocks
@@ -601,7 +723,8 @@ Known Issues (not yet fixed)
   guard. Fix needed before full 2-year backfill: reject records with v < 5 (or n < 5).
   Also tighten IV upper bound from 5.0 to ~1.5 for non-event tickers (QQQ/SPY/NVDA/AMD);
   event tickers like CRSP may reach 0.8-1.0 during binary events.
-- _diag_iv.py, _diag_iv2.py, _diag_iv3.py: diagnostic files in workspace root, can delete
+- _diag_iv.py, _diag_iv2.py, _diag_iv3.py, _diag_backfill.py: diagnostic files in workspace
+  root, can delete
 
 Important Notes
 - Use the PowerShell tool (NOT Bash) for piped script execution on Windows.

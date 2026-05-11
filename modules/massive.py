@@ -32,6 +32,22 @@ MAX_PAGES                = 5     # cap pagination — 5 × 250 = 1250 contracts 
 PAGE_LIMIT               = 250
 # MAX_INVERT_PER_CATEGORY removed — all contracts are tried (no cap)
 
+# Minimum thresholds for trusting an aggregates price for BS inversion.
+# v = total contracts traded; n = number of distinct transactions.
+# Both must be met: a 5-contract block (v=5, n=1) is still a single stale print.
+MIN_OPTION_VOLUME = 5   # total contracts traded
+MIN_OPTION_TRADES = 5   # distinct transactions (rejects block-trade artifacts)
+
+# Inversion search behaviour.
+#   N_INVERT_GOAL    — stop fetching once this many valid inversions are found.
+#                      Candidates are ATM-sorted so the best ones come first;
+#                      once we have enough there's no value in trying farther OTM.
+#   MAX_INVERT_TRIES — hard ceiling on API calls per category (safety net for
+#                      dates with no liquid data — prevents exhausting 1000+
+#                      contracts on empty historical days).
+N_INVERT_GOAL    = 5
+MAX_INVERT_TRIES = 40
+
 
 def _get(url, params=None):
     if not MASSIVE_API_KEY:
@@ -205,15 +221,21 @@ def _fetch_historical_contracts(ticker, date, dte_min, dte_max,
     as_of=DATE and expired=true for historical data.  Returns metadata only — prices
     are fetched separately via _fetch_agg_price().
     """
+    # For past dates whose expiry_cutoff has already passed: use expired=true so the
+    # API returns those now-expired contracts.  For recent/future dates where the target
+    # expiry hasn't passed yet, omit expired (defaults to active contracts only).
+    today = datetime.date.today()
+    expiry_cutoff = date + datetime.timedelta(days=dte_max)
     params = {
         "underlying_ticker":   ticker,
-        "expired":             "true",
         "expiration_date.gte": (date + datetime.timedelta(days=dte_min)).isoformat(),
-        "expiration_date.lte": (date + datetime.timedelta(days=dte_max)).isoformat(),
+        "expiration_date.lte": expiry_cutoff.isoformat(),
         "strike_price.gte":    round(float(strike_min), 2),
         "strike_price.lte":    round(float(strike_max), 2),
         "limit":               1000,
     }
+    if expiry_cutoff < today:
+        params["expired"] = "true"
     if contract_type:
         params["contract_type"] = contract_type
 
@@ -241,10 +263,26 @@ def _fetch_agg_price(contract_ticker, date):
     url = (f"{MASSIVE_URL}/v2/aggs/ticker/{contract_ticker}"
            f"/range/1/day/{date_str}/{date_str}")
     try:
-        data = _get(url)
+        # Use a short timeout — most no-data responses resolve immediately; the 15s
+        # default stacks up to ~10 min per empty date when MAX_INVERT_TRIES calls fire.
+        if not MASSIVE_API_KEY:
+            raise RuntimeError("MASSIVE_API_KEY env var not set — cannot call Massive API")
+        resp = requests.get(
+            url,
+            params={"apiKey": MASSIVE_API_KEY},
+            timeout=5,
+        )
+        resp.raise_for_status()
+        data = resp.json()
         results = data.get("results") or []
         if results:
             r = results[0]
+            # Reject thin / artifact prints — single-trade records (v < MIN_OPTION_VOLUME)
+            # or block trades (n < MIN_OPTION_TRADES) produce wildly implausible prices.
+            if (r.get("v") or 0) < MIN_OPTION_VOLUME:
+                return None
+            if (r.get("n") or 0) < MIN_OPTION_TRADES:
+                return None
             price = r.get("c") or r.get("vw")
             if price and float(price) > 0:
                 return float(price)
@@ -253,7 +291,7 @@ def _fetch_agg_price(contract_ticker, date):
     return None
 
 
-def get_historical_iv_snapshot(ticker, date, spot, r, target_dte=30, q=0.0):
+def get_historical_iv_snapshot(ticker, date, spot, r, target_dte=30, q=0.0, max_iv=2.0, min_iv=0.05, _debug=False):
     """
     Compute IV snapshot for a historical date via Black-Scholes inversion.
 
@@ -268,6 +306,9 @@ def get_historical_iv_snapshot(ticker, date, spot, r, target_dte=30, q=0.0):
         r:          risk-free rate for that date (annual decimal, e.g. 0.05)
         target_dte: target days-to-expiry for ATM IV (default 30)
         q:          continuous dividend yield (default 0)
+        min_iv:     minimum plausible IV (default 0.05 = 5%); rejects bad inversions
+                    on far-OTM / low-liquidity contracts and stale/artifact prices.
+                    QQQ 30-DTE IV has never dropped below ~9% historically — 5% is safe.
 
     Returns dict on success, None on failure. Keys:
         atm_iv_30d, atm_strike, atm_expiry, atm_dte  — ATM IV stats
@@ -330,55 +371,107 @@ def get_historical_iv_snapshot(ticker, date, spot, r, target_dte=30, q=0.0):
         return None
 
     # Sort by combined expiry + strike distance (normalized by spot so both terms
-    # are percentage-scale).  No cap — try all contracts; most will return NO PRICE
-    # quickly, and capping risks missing the one liquid contract on a thin day.
+    # are percentage-scale.  Candidates are ATM-sorted so the best ones come first.
+    # Early-exit: stop once N_INVERT_GOAL valid inversions found, or after
+    # MAX_INVERT_TRIES attempts (prevents exhausting 1000+ candidates on empty dates).
+    #
+    # Monthly expirations (3rd Friday of month, day 15-21) are sorted before weeklies.
+    # Without this, weeklies can sort first by DTE proximity (e.g. QQQ has weekly
+    # expirations every Friday), exhaust FAST_FAIL_MISSES on illiquid weekly contracts,
+    # and abort before ever attempting the liquid monthly — causing false FAILED results.
+    def is_monthly_expiry(expiry_date):
+        return expiry_date.weekday() == 4 and 15 <= expiry_date.day <= 21
+
     def meta_atm_score(p):
         return abs(p[3] - target_dte) * 10 + abs(p[1] - spot) / spot * 100
 
-    parsed_front_calls.sort(key=meta_atm_score)
+    parsed_front_calls.sort(key=lambda p: (not is_monthly_expiry(p[2]), meta_atm_score(p)))
     # Sort puts toward ~5% OTM (approximate 25-delta region at 30 DTE / 20% vol)
-    parsed_front_puts.sort(key=lambda p: abs(p[3] - target_dte) * 10 + abs(p[1] - spot * 0.95) / spot * 100)
-    parsed_back_calls.sort(key=lambda p: abs(p[1] - spot) / spot * 100)
+    parsed_front_puts.sort(key=lambda p: (not is_monthly_expiry(p[2]), abs(p[3] - target_dte) * 10 + abs(p[1] - spot * 0.95) / spot * 100))
+    parsed_back_calls.sort(key=lambda p: (not is_monthly_expiry(p[2]), abs(p[1] - spot) / spot * 100))
 
     front_calls_cands = parsed_front_calls
     front_puts_cands  = parsed_front_puts
     back_calls_cands  = parsed_back_calls
 
+    NO_PRICE = object()  # sentinel: agg endpoint returned no data (not a bad IV)
+
     def invert_call(p):
-        """Fetch price and BS-invert to (strike, expiry, dte, iv, delta) or None."""
+        """Fetch price and BS-invert to (strike, expiry, dte, iv, delta), NO_PRICE, or None."""
         opt_ticker, strike, expiry, dte = p
         T = dte / 252.0
         price = _fetch_agg_price(opt_ticker, date)
         if price is None:
-            return None
+            return NO_PRICE
         try:
             iv = implied_vol(price, spot, strike, r, T, q)
         except (ValueError, Exception):
             return None
-        if not (0.01 <= iv <= 5.0):  # reject implausible inversions
+        if not (min_iv <= iv <= max_iv):  # reject implausible inversions
             return None
         delta = bs_delta(spot, strike, r, T, iv, q, contract_type="call")
         return (strike, expiry, dte, iv, delta)
 
     def invert_put(p):
-        """Fetch price and BS-invert (via put-call parity) to (strike, expiry, dte, iv, delta) or None."""
+        """Fetch price and BS-invert (via put-call parity) to (strike, expiry, dte, iv, delta), NO_PRICE, or None."""
         opt_ticker, strike, expiry, dte = p
         T = dte / 252.0
         price = _fetch_agg_price(opt_ticker, date)
         if price is None:
-            return None
+            return NO_PRICE
         try:
             iv = implied_vol_put(price, spot, strike, r, T, q)
         except (ValueError, Exception):
             return None
-        if not (0.01 <= iv <= 5.0):
+        if not (min_iv <= iv <= max_iv):
             return None
         delta = bs_delta(spot, strike, r, T, iv, q, contract_type="put")
         return (strike, expiry, dte, iv, delta)
 
+    def _invert_list(cands, fn, goal=N_INVERT_GOAL, max_tries=MAX_INVERT_TRIES):
+        """Iterate cands calling fn; stop once `goal` successes or `max_tries` attempts.
+
+        Fast-fail: if the first FAST_FAIL_MISSES consecutive attempts all return no
+        price (not even a rejected IV — the agg endpoint returned empty), give up
+        immediately.  Dates with no historical data fail in FAST_FAIL_MISSES × timeout
+        rather than max_tries × timeout.
+        """
+        FAST_FAIL_MISSES = 5   # consecutive no-price responses before aborting
+        results      = []
+        consecutive_no_price = 0
+        for i, p in enumerate(cands):
+            if i >= max_tries:
+                break
+            r = fn(p)
+            if r is NO_PRICE:
+                consecutive_no_price += 1
+                if consecutive_no_price >= FAST_FAIL_MISSES:
+                    break   # date appears empty — stop wasting calls
+            elif r is not None:
+                results.append(r)
+                consecutive_no_price = 0   # reset on any success
+                if len(results) >= goal:
+                    break
+            # r is None = bad IV / inversion failed — don't count toward fast-fail
+        return results
+
     # Invert front-month calls; need at least one for ATM IV
-    inverted_calls = [r for r in (invert_call(p) for p in front_calls_cands) if r is not None]
+    inverted_calls = _invert_list(front_calls_cands, invert_call)
     if not inverted_calls:
+        return None
+
+    # Filter to near-ATM calls only (delta 0.30–0.70).
+    # Deep ITM calls (delta ~1) have tiny time premium → invert to unrealistically low IV.
+    # Deep OTM calls (delta ~0) are too sensitive to noise.
+    atm_calls = [p for p in inverted_calls if 0.30 <= p[4] <= 0.70]
+    if not atm_calls:
+        return None  # only got deep ITM/OTM hits — not reliable enough for ATM IV
+
+    # Require at least 2 qualifying ATM calls before trusting the inversion.
+    # A single contract hit has no corroboration — adjacent strikes/expiries
+    # may have had no trades, and that lone price could be an early-session
+    # print that doesn't reflect fair value.
+    if len(atm_calls) < 2:
         return None
 
     # ATM call: combined expiry-distance + strike-distance score (strike normalized by spot)
@@ -386,13 +479,18 @@ def get_historical_iv_snapshot(ticker, date, spot, r, target_dte=30, q=0.0):
         strike, expiry, dte, iv, delta = p
         return abs(dte - target_dte) * 10 + abs(strike - spot) / spot * 100
 
-    atm = min(inverted_calls, key=inv_atm_score)
-    atm_strike, atm_expiry, atm_dte, atm_iv, _ = atm
+    atm = min(atm_calls, key=inv_atm_score)
+    atm_strike, atm_expiry, atm_dte, atm_iv, atm_delta = atm
+
+    if _debug:
+        print(f"  [debug] ATM hit: strike={atm_strike:.0f} (spot={spot:.2f}), "
+              f"dte={atm_dte}, iv={atm_iv:.1%}, delta={atm_delta:.3f}, "
+              f"total_atm_calls_passing_delta_filter={len(atm_calls)}")
 
     # 25-delta skew at the same expiry tenor
     skew = None
-    inverted_puts = [r for r in (invert_put(p) for p in front_puts_cands) if r is not None]
-    near_calls = [p for p in inverted_calls if abs(p[2] - atm_dte) <= 7]
+    inverted_puts = _invert_list(front_puts_cands, invert_put)
+    near_calls = [p for p in atm_calls    if abs(p[2] - atm_dte) <= 7]
     near_puts  = [p for p in inverted_puts  if abs(p[2] - atm_dte) <= 7]
     if near_calls and near_puts:
         c25 = min(near_calls, key=lambda p: abs(p[4] - 0.25))
@@ -401,7 +499,7 @@ def get_historical_iv_snapshot(ticker, date, spot, r, target_dte=30, q=0.0):
 
     # Term structure: front ATM IV / back-month ATM IV  (>1 = backwardation)
     term = None
-    inverted_back = [r for r in (invert_call(p) for p in back_calls_cands) if r is not None]
+    inverted_back = _invert_list(back_calls_cands, invert_call, goal=3)
     if inverted_back:
         back_atm = min(inverted_back, key=lambda p: abs(p[0] - spot))
         back_iv = back_atm[3]

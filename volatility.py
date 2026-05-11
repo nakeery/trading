@@ -251,9 +251,31 @@ def print_calibration_diagnostic(y_true, y_prob, label):
         print(f"  {lo:.1f}-{hi:.1f}      {n:>5}  {pred:>7.1%}  {actual:>7.1%}  {gap:>+8.1%}{marker}")
 
 
+def impute_iv_features(df):
+    """When --iv-features is active: add binary missing-indicator columns and
+    impute NaN IV values so the full training history is preserved.
+
+      iv_available   = 1 where atm_iv_30d was measured, 0 where imputed
+      term_available = 1 where term_structure was measured, 0 where imputed
+
+    Imputation: atm_iv_30d -> HV_20,  iv_skew_25d -> 0.0,  term_structure -> 1.0
+    """
+    df["iv_available"]   = df["atm_iv_30d"].notna().astype(int)
+    df["term_available"] = df["term_structure"].notna().astype(int)
+    df["atm_iv_30d"]     = df["atm_iv_30d"].fillna(df["HV_20"])
+    df["iv_skew_25d"]    = df["iv_skew_25d"].fillna(0.0)
+    df["term_structure"] = df["term_structure"].fillna(1.0)
+    n_iv   = int(df["iv_available"].sum())
+    n_term = int(df["term_available"].sum())
+    print(f"  ✓ IV imputation: {n_iv} real atm_iv_30d rows, {n_term} real term_structure rows"
+          f" (remainder filled with HV_20/0.0/1.0 + binary indicators)")
+    return df
+
+
 def train_model(df):
-    # --iv-features: include IV_FEATURE_COLS (backfilled real IV) as features;
-    #   dropna() will auto-limit training to the ~2yr backfilled window.
+    # --iv-features: include IV_FEATURE_COLS + binary missing indicators as features;
+    #   impute_iv_features() called before this ensures no NaN in IV cols so
+    #   dropna() uses the full training history.
     # default (HV proxy): exclude all IV_COLS so full price history is used.
     exclude = {"Open", "High", "Low", "Close", "Volume", "target",
                *(IV_META_COLS if IV_FEATURES else IV_COLS)}
@@ -492,7 +514,7 @@ if __name__ == "__main__":
     args = parser.parse_args()
     IV_FEATURES = args.iv_features
 
-    iv_mode = ("REAL IV FEATURES  (backfilled — ~2yr training window)"
+    iv_mode = ("REAL IV FEATURES  (imputed missing → full history)"
                if IV_FEATURES else "HV PROXY  (full history)")
     print("\u2550" * 64)
     print(f"  Phase 3 IV features: {iv_mode}")
@@ -523,6 +545,8 @@ if __name__ == "__main__":
     df = add_earnings_proximity(df)
     df = add_catalyst_proximity(df, TICKER, MODULE_DIR)
     df = normalize_features(df)
+    if IV_FEATURES:
+        df = impute_iv_features(df)
 
     # Save full df before target truncation for signal summary and HV plot
     df_full = df.copy()
