@@ -16,6 +16,7 @@ Requirements:
     pip install yfinance pandas scikit-learn matplotlib
 """
 
+import argparse
 import os
 import sys
 import numpy as np
@@ -27,7 +28,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import classification_report, brier_score_loss
 from modules.benchmarks import detect_macro_features, add_macro_features, add_catalyst_proximity
-from modules.massive import IV_COLS
+from modules.massive import IV_COLS, IV_META_COLS, IV_FEATURE_COLS
 
 # ─────────────────────────────────────────
 # CONFIG
@@ -47,6 +48,8 @@ P3_VOL_MULTIPLE     = 0.20  # Sets expansion bar at 20% of median HV — practic
 TEST_SIZE           = 0.20
 DECISION_THRESHOLD  = 0.50
 RANDOM_STATE        = 42
+
+IV_FEATURES = False  # set by --iv-features CLI arg; when True, IV_FEATURE_COLS used as features
 
 
 # ─────────────────────────────────────────
@@ -249,7 +252,11 @@ def print_calibration_diagnostic(y_true, y_prob, label):
 
 
 def train_model(df):
-    exclude = {"Open", "High", "Low", "Close", "Volume", "target", *IV_COLS}
+    # --iv-features: include IV_FEATURE_COLS (backfilled real IV) as features;
+    #   dropna() will auto-limit training to the ~2yr backfilled window.
+    # default (HV proxy): exclude all IV_COLS so full price history is used.
+    exclude = {"Open", "High", "Low", "Close", "Volume", "target",
+               *(IV_META_COLS if IV_FEATURES else IV_COLS)}
     feature_cols = [c for c in df.columns if c not in exclude]
 
     df_model = df[feature_cols + ["target"]].dropna()
@@ -474,6 +481,24 @@ def compute_vol_thresholds(df):
 # MAIN
 # ─────────────────────────────────────────
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Phase 3: IV expansion forecasting.")
+    parser.add_argument(
+        "--iv-features", action=argparse.BooleanOptionalAction, default=False,
+        dest="iv_features",
+        help="Include real IV features (atm_iv_30d, iv_skew_25d, term_structure) from "
+             "backfilled indicators CSV. Default OFF — uses HV proxy (full history). "
+             "Requires backfill_iv.py to have been run first.",
+    )
+    args = parser.parse_args()
+    IV_FEATURES = args.iv_features
+
+    iv_mode = ("REAL IV FEATURES  (backfilled — ~2yr training window)"
+               if IV_FEATURES else "HV PROXY  (full history)")
+    print("\u2550" * 64)
+    print(f"  Phase 3 IV features: {iv_mode}")
+    print("\u2550" * 64)
+    print()
+
     while True:
         try:
             ticker_in = input("  Ticker [XYZ]: ").strip().upper()

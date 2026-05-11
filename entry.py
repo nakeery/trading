@@ -25,7 +25,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import precision_score
 from sklearn.preprocessing import StandardScaler
 from modules.benchmarks import detect_benchmarks, detect_macro_features, add_macro_features, add_catalyst_proximity
-from modules.massive import IV_COLS
+from modules.massive import IV_COLS, IV_META_COLS, IV_FEATURE_COLS
 
 # ─────────────────────────────────────────
 # CONFIG
@@ -53,6 +53,8 @@ P2_THRESHOLD        = 0.55   # Phase 2 (15d) cutoff. Set from P2_CALIBRATE in __
 P2B_THRESHOLD       = 0.55  # Phase 2B (63d) raw cutoff — calibration deferred to Decision 2
 P3_THRESHOLD        = 0.60  # IV expansion cutoff (best precision from Phase 3)
 RANDOM_STATE        = 42
+
+IV_FEATURES = False  # set by --iv-features CLI arg; when True, Phase 3 uses IV_FEATURE_COLS as features
 
 # IV/HV gate thresholds — ATM IV (30 DTE) divided by realized HV-20.
 # IV_HV_GATE_RICH triggers a STRONG ENTRY -> CAUTION downgrade when premium is
@@ -208,8 +210,12 @@ def build_features(df, benchmarks):
 # ─────────────────────────────────────────
 # 3. TRAIN MODELS
 # ─────────────────────────────────────────
-def train(df, target_col, calibrate=False):
-    exclude = {"Open", "High", "Low", "Close", "Volume", target_col, *IV_COLS}
+def train(df, target_col, calibrate=False, use_iv_features=False):
+    # use_iv_features=True: include IV_FEATURE_COLS as features (Phase 3 only when --iv-features);
+    #   dropna() auto-limits training to the ~2yr backfilled window.
+    # default: exclude all IV_COLS so full price history is used.
+    exclude = {"Open", "High", "Low", "Close", "Volume", target_col,
+               *(IV_META_COLS if use_iv_features else IV_COLS)}
     feature_cols = [c for c in df.columns if c not in exclude]
 
     df_model = df[feature_cols + [target_col]].dropna()
@@ -465,8 +471,15 @@ if __name__ == "__main__":
         "--calibrate", action=argparse.BooleanOptionalAction, default=False,
         help="Use isotonic-calibrated Phase 2 (Decision 1, S11). Default OFF (NVDA regression: STRONG ENTRY 4.4% → -0.4%). Pass --calibrate to enable.",
     )
+    parser.add_argument(
+        "--iv-features", action=argparse.BooleanOptionalAction, default=False,
+        dest="iv_features",
+        help="Use real IV features (atm_iv_30d, iv_skew_25d, term_structure) for Phase 3. "
+             "Default OFF — HV proxy, full history. Requires backfill_iv.py to have been run.",
+    )
     args = parser.parse_args()
     P2_CALIBRATE = args.calibrate
+    IV_FEATURES  = args.iv_features
     P2_THRESHOLD = 0.50 if P2_CALIBRATE else 0.55
 
     mode_label = "CALIBRATED  (Decision 1 — isotonic, 5-fold CV)" if P2_CALIBRATE else "RAW  (Decision 1 disabled — class_weight=balanced)"
@@ -523,7 +536,7 @@ if __name__ == "__main__":
     future_hv = df_p3["HV_20"].shift(-P3_FORWARD_DAYS)
     df_p3["iv_target"] = ((future_hv / df_p3["HV_20"] - 1) >= EXPANSION_THRESHOLD).astype(int)
     df_p3 = df_p3.iloc[:-P3_FORWARD_DAYS]
-    clf3, scaler3, fcols3, tr3, te3, base3 = train(df_p3, "iv_target")
+    clf3, scaler3, fcols3, tr3, te3, base3 = train(df_p3, "iv_target", use_iv_features=IV_FEATURES)
     print(f"Phase 3  (IV timing)     — train precision: {tr3:.1%}  test precision: {te3:.1%}  base rate: {base3:.1%}\n")
 
     # Current signals
@@ -556,4 +569,4 @@ if __name__ == "__main__":
         iv_info=iv_info,
     )
 
-    print(f"[Phase 2: {'CALIBRATED' if P2_CALIBRATE else 'RAW'} — P2_THRESHOLD={P2_THRESHOLD}]")
+    print(f"[Phase 2: {'CALIBRATED' if P2_CALIBRATE else 'RAW'} — P2_THRESHOLD={P2_THRESHOLD} | Phase 3 IV: {'REAL' if IV_FEATURES else 'HV proxy'}]")

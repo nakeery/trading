@@ -33,7 +33,10 @@ from modules.benchmarks import (
     detect_benchmarks, detect_macro_features, add_macro_features,
     add_catalyst_proximity,
 )
-from modules.massive import IV_COLS
+from modules.massive import IV_COLS, IV_META_COLS, IV_FEATURE_COLS  # noqa: F401
+# Note: --iv-features mode is not supported in calibrate_multipliers.py.
+# The sweep always uses the full IV_COLS exclusion (HV-proxy, full history)
+# to keep multiplier calibration consistent across the entire price history.
 
 # ─────────────────────────────────────────
 # CONFIG

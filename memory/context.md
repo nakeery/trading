@@ -229,6 +229,117 @@ and S12 (Phase 3 retraining on real IV).
 
 ────────────────────────────────────────────────────────────────────────
 
+Session 12 — Historical IV Backfill Pipeline + CLI Toggle (2026-05-09/10)
+
+Implemented the S12 BS-inversion pipeline, the --iv-features CLI toggle, and diagnosed
+the Massive API behavior for historical options data. Backfill is NOT yet producing
+clean data — see bugs discovered below.
+
+1. modules/bs_invert.py (new) — Black-Scholes solver
+   - black_scholes_call(S, K, r, T, sigma, q=0) — standard BSM call price
+   - vega(S, K, r, T, sigma, q=0) — used for Newton-Raphson convergence
+   - implied_vol(price, S, K, r, T, q=0) — NR + bisection fallback, raises ValueError
+     if no convergence
+   - implied_vol_put(price, S, K, r, T, q=0) — put-call parity wrapper
+   - bs_delta(S, K, r, T, sigma, q=0, contract_type="call") — Δ for 25Δ skew selection
+   - Unit tested: sigma=0.22 round-trips through BSM to ±1e-5.
+
+2. modules/massive.py — IV_COLS split + historical IV fetch
+   - IV_COLS split into:
+       IV_FEATURE_COLS = ["atm_iv_30d", "iv_skew_25d", "term_structure"]
+       IV_META_COLS    = ["atm_strike", "atm_expiry", "atm_dte", "put_call_oi_ratio"]
+       IV_COLS         = IV_FEATURE_COLS + IV_META_COLS  (backward compat)
+   - Downstream scripts use *(IV_META_COLS if use_iv_features else IV_COLS) to exclude
+     metadata-only cols when real IV features are active.
+   - get_historical_iv_snapshot(ticker, date, spot, r, target_dte=30, q=0) added:
+       Stage A: _fetch_historical_contracts (reference endpoint, expired=true) for front
+                calls + front puts + back calls
+       For each contract: _fetch_agg_price (aggregates endpoint) -> BS-invert -> IV
+       Returns same keys as get_chain_summary minus put_call_oi_ratio (historical OI
+       not available via Massive)
+
+3. backfill_iv.py (new) — standalone backfill script
+   - Prompts for ticker, loads indicators CSV, finds NaN rows within BACKFILL_YEARS (2y)
+   - Fetches ^IRX per-date for risk-free rate (yfinance 5y download)
+   - Calls get_historical_iv_snapshot per date, writes to CSV, checkpoints every 50 dates
+   - Resumable: already-populated rows are never overwritten (mask: atm_iv_30d.isna())
+   - Processes newest -> oldest (most recent data first)
+
+4. --iv-features / --no-iv-features CLI toggle
+   - Added to volatility.py, entry.py, backtest.py (argparse BooleanOptionalAction)
+   - Default: False (HV proxy — safe until backfill is complete and validated)
+   - When True: Phase 3 uses IV_FEATURE_COLS as features (atm_iv_30d, iv_skew_25d,
+     term_structure) instead of excluding them; IV_META_COLS still always excluded
+   - train_model()/train() gain use_iv_features=False param; exclusion set uses
+     *(IV_META_COLS if use_iv_features else IV_COLS)
+   - Banner + footer print active IV mode: "Phase 3 IV: REAL" vs "HV proxy"
+   - calibrate_multipliers.py: import updated to include IV_META_COLS/IV_FEATURE_COLS;
+     comment added noting --iv-features is not supported there (sweep uses HV proxy only)
+
+5. Massive API behavior discovered during diagnostic runs
+
+   BUG 1 (FIXED): as_of parameter silently ignored by reference endpoint
+   - _fetch_historical_contracts originally passed as_of=date.isoformat() + expired=true
+   - The API returns 0 results when both are present — as_of conflicts with expired=true
+   - Fix: removed as_of. The expiration_date.gte/lte window already scopes the tenor.
+   - Result: reference endpoint now returns correct contracts (121 for QQQ Nov 2025 test)
+
+   BUG 2 (FIXED): ATM scoring formula used incompatible units
+   - Original: abs(dte - target_dte) * 10 + abs(strike - spot)
+   - For QQQ at $490: a 5-DTE miss scores 50, same as a $50 strike miss — but $50 OTM
+     is 10% away from ATM, which is deep OTM. The DTE term dominated incorrectly.
+   - Fix: normalize strike distance by spot price:
+       abs(dte - target_dte) * 10 + abs(strike - spot) / spot * 100
+   - Now both terms are percentage-scale. A 5-DTE miss = 50 pts; a 2% strike miss = 2 pts.
+   - Applied in both meta_atm_score (pre-inversion sort) and inv_atm_score (ATM selection)
+
+   BUG 3 (FIXED): MAX_INVERT_PER_CATEGORY cap caused misses on thin markets
+   - Original cap of 8 (later raised to 30 during diagnosis) truncated candidates by ATM
+     score before fetching prices. For thin historical days, the one contract that actually
+     traded could be ranked 31st+ and never attempted.
+   - Fix: removed cap entirely. All contracts returned by reference endpoint are tried.
+     Most return NO PRICE quickly; the slowdown is acceptable vs missing the only trade.
+   - MAX_INVERT_PER_CATEGORY constant replaced with comment.
+
+   BUG 4 (PENDING): Single-trade artifact prices produce implausible IV
+   - After fixes 1-3, get_historical_iv_snapshot returns a result for QQQ 2025-11-03:
+       atm_iv_30d: 237% (should be ~15-25%)
+       iv_skew_25d: -188% (should be ±0.01-0.10)
+       term_structure: 1.68
+   - Root cause: the one contract with price data (O:QQQ251128C00490000) had v=1, n=1
+     in the aggregates — a single-contract print at $143.37. The fair price for an
+     ATM 25-DTE QQQ call was ~$12-13 at the time. The $143.37 print is a stale/erroneous
+     record (likely a mid-quote or historical artifact), not a real market transaction.
+   - BS-inversion correctly inverts it to ~237% IV, which just barely passes the
+     current 0.01 <= iv <= 5.0 guard (237% = 2.37 in decimal form, under 5.0).
+   - PROPOSED FIX (not yet implemented): add minimum volume filter in _fetch_agg_price.
+     Reject any aggregates record with v < MIN_OPTION_VOLUME (suggest 5-10 contracts).
+     This eliminates single-print artifacts while accepting legitimately thin but real
+     option flow. The 0.01 <= iv <= 5.0 guard should also be tightened — 3.0 (300% IV)
+     is already implausible for any non-biotech underlying, 1.5 (150%) would be
+     conservative but safe for QQQ/SPY/NVDA/AMD. CRSP could hit 80-100% during events.
+
+6. Pipeline run result — QQQ 2026-05-08/09
+   - indicators.py: ATM IV (~27d): 21.5%, skew +0.040, term 1.00 (noise), P/C OI 0.73
+   - entry.py (default --no-iv-features): STAY OUT
+       Phase 2: 47.4% (base 44.2%) — NO SIGNAL; RSI_23 is top negative driver (overbought)
+       Phase 2B: 39.2% (base 51.5%) — below base rate, medium-term mean-reversion expected
+       Phase 3: 30.9% expansion (base 42.1%) — CONTRACTION; overbought + above KC upper
+       IV/HV: 1.39 (rich) — would gate STRONG ENTRY if Phase 2 had fired
+       SIGNAL: STAY OUT — no directional edge, don't chase the run-up
+
+7. Diagnostic files created during session (temporary, can be deleted)
+   - _diag_iv.py, _diag_iv2.py, _diag_iv3.py in workspace root
+
+8. Next steps for backfill to produce clean data
+   a. Implement minimum volume filter (v >= 5 or 10) in _fetch_agg_price
+   b. Tighten IV bounds: 0.01 <= iv <= 1.5 for non-event tickers (adjust per ticker type)
+   c. Validate on a known-good date (e.g. pick a QQQ date, verify against realized HV)
+   d. Run full 2-year backfill for QQQ
+   e. Retrain Phase 3 with --iv-features and compare edge vs HV proxy
+
+────────────────────────────────────────────────────────────────────────
+
 Session 11 — Decision 1 Implementation + NVDA Regression (2026-05-08/09)
 
 Implemented S9-carryover Decision 1 (isotonic-calibrated Phase 2 production model).
@@ -433,6 +544,15 @@ DONE
       banner+footer indicating mode
     - REVERTED TO RAW AS DEFAULT after NVDA regression (-4.8pt STRONG ENTRY, hierarchy
       inversion). Calibrated mode retained as research toggle.
+- [S12] BS-inversion backfill infrastructure:
+    - modules/bs_invert.py: full Black-Scholes solver (call price, vega, implied_vol,
+      implied_vol_put, bs_delta); unit tested to ±1e-5
+    - modules/massive.py: IV_COLS split into IV_FEATURE_COLS + IV_META_COLS; three
+      API bugs fixed (as_of conflict, scoring unit mismatch, candidate cap removed);
+      get_historical_iv_snapshot() implemented
+    - backfill_iv.py: standalone script with checkpointing, ^IRX rate lookup, resume
+    - --iv-features/--no-iv-features toggle added to volatility/entry/backtest
+    - Data quality bug PENDING: single-trade artifact prices need minimum volume filter
 
 PENDING DECISIONS
 - [S9 carryover, S11 verdict] Decision 2 (Platt scaling on Phase 2B) — DEPRIORITIZED
@@ -442,18 +562,17 @@ PENDING DECISIONS
     Investigate only if Phase 2B-specific probability-value use case emerges.
 
 NEXT MAJOR WORK
-- [S12/TODO] Black-Scholes inversion pipeline for historical IV backfill (was S11/TODO,
-  bumped to S12 because S11 was consumed by Decision 1)
-    Use /v3/reference/options/contracts (as_of) + /v2/aggs/... to get historical option
-    OHLC, then BS-invert with risk-free rate + dividends to recover ATM IV per ticker
-    per day. Output: 2 years of historical IV in indicators CSV (per ticker).
-    Dependencies: scipy.optimize (brentq), FRED ^IRX for risk-free rate, yfinance
-    dividend yield.
-    Now the highest-leverage outstanding item (Phase 3 has 22pt edge on HV-derived IV;
-    real ATM IV history could push it higher).
-- [S13/TODO] Phase 3 retraining on real IV (depends on S12)
+- [S12 PARTIAL] Historical IV backfill — infrastructure complete, data quality fix pending
+    modules/bs_invert.py, backfill_iv.py, get_historical_iv_snapshot() all built.
+    Three API bugs fixed (as_of conflict, scoring units, candidate cap).
+    BLOCKING: single-trade artifact prices produce implausible IV (237% for QQQ).
+    Fix needed: minimum volume filter (v >= 5) in _fetch_agg_price + tighten IV
+    bounds from 5.0 to ~1.5 for non-event tickers.
+    After fix: validate on known-good date, then run full 2-year QQQ backfill.
+- [S13/TODO] Phase 3 retraining on real IV (depends on S12 backfill completion)
     Replace HV-derived target with actual ATM IV expansion in next 10 days; use real
     IV rank/percentile as features. Should sharpen Phase 3 expansion precision (0.64).
+    Run with --iv-features flag added to all ML scripts in S12.
 
 OTHER TODO (lower priority)
 - Earnings estimate revision direction (finviz/yfinance) for individual stocks
@@ -477,6 +596,12 @@ Known Issues (not yet fixed)
   still in source. Set the env var to keep token out of git.
 - modules/massive.py: MASSIVE_API_KEY uses empty-string default (no hardcoded fallback by
   design — calls fail clearly if env var unset)
+- modules/massive.py _fetch_agg_price: no minimum volume filter — single-trade artifact
+  prices (v=1, n=1) produce implausible IVs (e.g. 237%) that pass the `0.01<=iv<=5.0`
+  guard. Fix needed before full 2-year backfill: reject records with v < 5 (or n < 5).
+  Also tighten IV upper bound from 5.0 to ~1.5 for non-event tickers (QQQ/SPY/NVDA/AMD);
+  event tickers like CRSP may reach 0.8-1.0 during binary events.
+- _diag_iv.py, _diag_iv2.py, _diag_iv3.py: diagnostic files in workspace root, can delete
 
 Important Notes
 - Use the PowerShell tool (NOT Bash) for piped script execution on Windows.
