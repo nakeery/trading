@@ -698,6 +698,88 @@ NEXT MAJOR WORK
 
 OTHER TODO (lower priority)
 - Earnings estimate revision direction (finviz/yfinance) for individual stocks
+
+────────────────────────────────────────────────────────────────────────
+
+Session 14 — Shared Features Module Refactor (2026-05-12)
+
+Extracted ~700 lines of duplicated feature engineering code from backtest.py,
+direction.py, and volatility.py into a new shared module modules/features.py.
+
+1. modules/features.py (new)
+   - Centralizes all shared constants and feature functions:
+       HV_WINDOW=20, IV_RANK_WINDOW=252, P2_FORWARD_DAYS=15, P2B_FORWARD_DAYS=63,
+       P3_FORWARD_DAYS=10, P2_VOL_MULTIPLE=0.41, P3_VOL_MULTIPLE=0.20
+   - compute_hv_features(df, hv_window, rank_window):
+       Adds HV_20, IV_rank, IV_pct, HV_chg_5d, HV_chg_10d, HV_vs_ma20
+   - compute_vix_features(df, vix_df, vix9d_df, vix3m_df):
+       Handles MultiIndex column flattening internally; adds VIX, VIX_chg_5d,
+       VIX_vs_ma20, VIX9D_VIX_ratio, VIX_VIX3M_ratio
+   - add_earnings_proximity(df, ticker):
+       Signature change: takes explicit ticker arg (not TICKER global); defaults to 45
+   - normalize_features(df):
+       All column checks guarded with `if col in df.columns` (more defensive than
+       the prior direction.py version which lacked guards on KC/MACD/OBV)
+   - compute_vol_thresholds(df, verbose=True, p2_vol_multiple, p3_vol_multiple, ...):
+       Returns (win_threshold, win_threshold_63, expansion_threshold) tuple;
+       falls back to AMD defaults (0.05, 0.10, 0.10) if HV data insufficient
+
+2. backtest.py changes
+   - Imports: HV_WINDOW, IV_RANK_WINDOW, P2_FORWARD_DAYS, P2B_FORWARD_DAYS,
+     P3_FORWARD_DAYS, compute_hv_features, compute_vix_features, add_earnings_proximity,
+     normalize_features, compute_vol_thresholds from modules.features
+   - CONFIG: removed HV_WINDOW, IV_RANK_WINDOW, P2_FORWARD_DAYS, P2B_FORWARD_DAYS,
+     P3_FORWARD_DAYS; kept P2_VOL_MULTIPLE, P3_VOL_MULTIPLE, WIN_THRESHOLD,
+     WIN_THRESHOLD_63, EXPANSION_THRESHOLD as mutable globals
+   - build_features(): replaced inline HV + VIX + earnings + normalize blocks with
+     shared function calls; gap features remain (backtest-specific)
+   - run_backtest(): updated per-window call to unpack tuple return from shared
+     compute_vol_thresholds; removed local function definition
+   - __main__ and sweep mode call sites updated to tuple unpack pattern
+
+3. direction.py changes
+   - Imports added (same set as backtest.py minus P3_*)
+   - CONFIG: removed HV_WINDOW, P2_VOL_MULTIPLE, FORWARD_DAYS, FORWARD_DAYS_63;
+     added FORWARD_DAYS = P2_FORWARD_DAYS and FORWARD_DAYS_63 = P2B_FORWARD_DAYS aliases
+   - add_hv(): body replaced with compute_hv_features(df) call
+   - add_vix(): body replaced with 3 downloads + compute_vix_features() call;
+     Unicode handling issue: dead stub _add_vix_old_stub() + leftover old VIX loop
+     required separate cleanup pass (replace_string_in_file fails on Unicode in oldString)
+   - Removed local add_earnings_proximity(df), normalize_features(df),
+     compute_vol_thresholds(df) functions
+   - Call site: add_earnings_proximity(df) → add_earnings_proximity(df, TICKER)
+
+4. volatility.py changes
+   - Imports added (HV_WINDOW, IV_RANK_WINDOW, P3_FORWARD_DAYS, P3_VOL_MULTIPLE + funcs)
+   - CONFIG: removed HV_WINDOW, IV_RANK_WINDOW, P3_VOL_MULTIPLE, FORWARD_DAYS=10;
+     added FORWARD_DAYS = P3_FORWARD_DAYS alias
+   - add_iv_features(): body replaced with compute_hv_features(df) call
+   - add_vix(): body replaced with 3 downloads + compute_vix_features() call
+   - Removed local add_earnings_proximity(df), normalize_features(df),
+     compute_vol_thresholds(df) functions
+   - compute_vol_thresholds call site: `compute_vol_thresholds(df)` →
+     `_, _, EXPANSION_THRESHOLD = compute_vol_thresholds(df)` (tuple unpack)
+   - add_earnings_proximity(df) call site → add_earnings_proximity(df, TICKER)
+
+5. Implementation notes
+   - Unicode workaround: replace_string_in_file fails when oldString contains em-dashes
+     (U+2014) or checkmarks (U+2713). All Unicode-heavy removals done via Python
+     regex script written to a temp file (_patch_volatility.py, deleted after use).
+   - volatility.py call to compute_vol_thresholds previously mutated EXPANSION_THRESHOLD
+     as a side effect via `global`. The new shared function returns a tuple — the
+     assignment `_, _, EXPANSION_THRESHOLD = compute_vol_thresholds(df)` now makes
+     the update explicit.
+
+6. Regression verification — all three scripts passed with QQQ
+   - backtest.py:  STRONG ENTRY 587/1.9%/63.2% ✓ (matches post-S13 baseline)
+   - direction.py: Phase 2 47.8% precision at 0.55; Phase 2B 56.0% — consistent
+   - volatility.py: expansion precision 68.3% at 0.50 — consistent
+   - Exit code 1 on direction/volatility is expected (chart prompt receives EOF from pipe)
+
+NEXT MAJOR WORK (updated)
+- [S14 TODO] AMD IV backfill — run backfill_iv.py, then retrain Phase 3 with --iv-features
+- [S14 TODO] Tighten backfill data quality: reject v < 5 in _fetch_agg_price; tighten
+  IV cap to 1.5 for QQQ/SPY/NVDA/AMD
 - Short interest ratio (FINRA monthly) for squeeze-setup detection
 - Relative valuation (P/S, P/E vs 3-year history)
 - Macro feature layer for indexes (yield curve, credit spread, DXY) — only worth it if

@@ -29,25 +29,29 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay, brier_score_loss
 from modules.benchmarks import detect_benchmarks, detect_macro_features, add_macro_features, add_catalyst_proximity
 from modules.massive import IV_COLS
+from modules.features import (
+    HV_WINDOW, IV_RANK_WINDOW,
+    P2_FORWARD_DAYS, P2B_FORWARD_DAYS, P2_VOL_MULTIPLE,
+    compute_hv_features, compute_vix_features,
+    add_earnings_proximity, normalize_features, compute_vol_thresholds,
+)
 
 # ─────────────────────────────────────────
 # CONFIG
 # ─────────────────────────────────────────
-# TICKER         = "AMD"
+# HV_WINDOW, P2_FORWARD_DAYS, P2B_FORWARD_DAYS, P2_VOL_MULTIPLE imported from modules.features
+FORWARD_DAYS    = P2_FORWARD_DAYS   # 15-day direction window
+FORWARD_DAYS_63 = P2B_FORWARD_DAYS  # 63-day direction window
 START_DATE     = "1792-05-17"
 END_DATE       = ""  # set automatically from CSV
 DATA_DIR       = "data"
 MODULE_DIR     = "modules"
 # INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 
-HV_WINDOW      = 20     # Rolling window for realized vol (trading days)
-FORWARD_DAYS     = 15    # Days ahead to evaluate win/loss (entry timing)
-FORWARD_DAYS_63  = 63    # Medium-term direction window (~1 quarter)
-WIN_THRESHOLD    = 0.05  # Default (AMD). Overridden at runtime by compute_vol_thresholds()
-WIN_THRESHOLD_63 = 0.10  # Default (AMD). Overridden at runtime by compute_vol_thresholds()
-P2_VOL_MULTIPLE  = 0.41  # 0.41 sigma bar — practical range: 0.25 (aggressive) to 1.0 (conservative)
+WIN_THRESHOLD    = 0.05  # Default (AMD). Set by compute_vol_thresholds() in __main__
+WIN_THRESHOLD_63 = 0.10  # Default (AMD). Set by compute_vol_thresholds() in __main__
 TEST_SIZE      = 0.20   # Fraction of data held out as test set (time-based)
-N_ESTIMATORS       = 200    # Random forest trees
+N_ESTIMATORS       = 200    # Random forest trees (legacy constant, unused)
 DECISION_THRESHOLD = 0.55   # Probability cutoff for predicting Win (lower = more wins predicted)
 RANDOM_STATE       = 42
 
@@ -80,35 +84,17 @@ def load_indicators(path):
 # 2. FEATURE ENGINEERING
 # ─────────────────────────────────────────
 def add_hv(df):
-    log_ret = np.log(df["Close"] / df["Close"].shift(1))
-    df["HV_20"] = log_ret.rolling(HV_WINDOW).std() * np.sqrt(252)
-    print("  ✓ HV_20")
+    df = compute_hv_features(df)
+    print("  \u2713 HV_20, IV_rank, IV_pct, HV_chg_5d, HV_chg_10d, HV_vs_ma20")
     return df
 
 
 def add_vix(df):
-    raw = yf.download("^VIX", start=START_DATE, end=END_DATE, progress=False)
-    raw.columns = raw.columns.get_level_values(0)
-    vix = raw[["Close"]].rename(columns={"Close": "VIX"})
-    vix["VIX_chg_5d"]  = vix["VIX"].pct_change(5)
-    vix["VIX_vs_ma20"] = vix["VIX"] / vix["VIX"].rolling(20).mean() - 1
-    df = df.join(vix, how="left")
-    df[["VIX", "VIX_chg_5d", "VIX_vs_ma20"]] = (
-        df[["VIX", "VIX_chg_5d", "VIX_vs_ma20"]].ffill()
-    )
-
-    # VIX term structure: near-term vs spot vs 3-month
-    # VIX9D available ~2013+; VIX3M available ~2011+ — neutral fill (1.0) for missing history
-    for sym, col in [("^VIX9D", "VIX9D"), ("^VIX3M", "VIX3M")]:
-        r = yf.download(sym, start=START_DATE, end=END_DATE, progress=False)
-        r.columns = r.columns.get_level_values(0)
-        df = df.join(r[["Close"]].rename(columns={"Close": col}), how="left")
-        df[col] = df[col].ffill()
-    df["VIX9D_VIX_ratio"] = (df["VIX9D"] / df["VIX"]).fillna(1.0)  # >1 = near-term fear
-    df["VIX_VIX3M_ratio"] = (df["VIX"] / df["VIX3M"]).fillna(1.0)  # <1 = backwardation (stress)
-    df.drop(columns=["VIX9D", "VIX3M"], inplace=True)
-
-    print("  ✓ VIX, VIX_chg_5d, VIX_vs_ma20, VIX9D_VIX_ratio, VIX_VIX3M_ratio")
+    vix_raw   = yf.download("^VIX",   start=START_DATE, end=END_DATE, progress=False)
+    vix9d_raw = yf.download("^VIX9D", start=START_DATE, end=END_DATE, progress=False)
+    vix3m_raw = yf.download("^VIX3M", start=START_DATE, end=END_DATE, progress=False)
+    df = compute_vix_features(df, vix_raw, vix9d_raw, vix3m_raw)
+    print("  \u2713 VIX, VIX_chg_5d, VIX_vs_ma20, VIX9D_VIX_ratio, VIX_VIX3M_ratio")
     return df
 
 
@@ -128,84 +114,9 @@ def add_benchmarks(df, benchmarks):
     return df
 
 
-def add_earnings_proximity(df):
-    ticker = yf.Ticker(TICKER)
-    ed = []
-    try:
-        dates = ticker.get_earnings_dates(limit=20)
-        if dates is not None and len(dates) > 0:
-            idx = pd.DatetimeIndex(dates.index)
-            if idx.tz is not None:
-                idx = idx.tz_convert(None)
-            ed = sorted(idx.normalize().unique())
-    except Exception as e:
-        print(f"  ✗ Earnings dates unavailable ({e}) — filling with 45")
-        df["Days_to_earnings"] = 45  # neutral fallback: mid-cycle
-        return df
 
-    if not ed:
-        print("  ✗ Earnings dates empty — filling with 45")
-        df["Days_to_earnings"] = 45
-        return df
-
-    def _days_to_next(date):
-        future = [e for e in ed if e >= date]
-        # Cap at 90 if no future date found (end of dataset edge case)
-        return (future[0] - date).days if future else 90
-
-    df["Days_to_earnings"] = [_days_to_next(d) for d in df.index]
-    print("  ✓ Days_to_earnings")
-    return df
-
-
-# ─────────────────────────────────────────
-# 3. NORMALIZE PRICE-LEVEL FEATURES
-# ─────────────────────────────────────────
-def normalize_features(df):
-    """Replace absolute price-level indicators with scale-invariant ratios."""
-    close = df["Close"]
-
-    # Universal momentum / positioning features (generic for any ticker)
-    df["price_vs_52w_high"] = close / close.rolling(252).max() - 1
-    df["price_vs_52w_low"]  = close / close.rolling(252).min() - 1
-    df["vol_ratio"]         = df["Volume"] / df["Volume"].rolling(20).mean()
-
-    # MA → keep short (20), medium (50), long (200) — drop 100 (redundant between 50/200)
-    for period in [20, 50, 200]:
-        col = f"MA_{period}"
-        if col in df.columns:
-            df[f"price_vs_ma{period}"] = close / df[col] - 1
-    ma_drop = [c for c in df.columns if c.startswith("MA_")]
-    df.drop(columns=ma_drop, inplace=True)
-
-    # EMA → keep short (8), medium (21), long (89) — drop 34/55 (redundant)
-    for period in [8, 21, 89]:
-        col = f"EMA_{period}"
-        if col in df.columns:
-            df[f"price_vs_ema{period}"] = close / df[col] - 1
-    ema_drop = [c for c in df.columns if c.startswith("EMA_")]
-    df.drop(columns=ema_drop, inplace=True)
-
-    # Keltner Channels → price position relative to each band
-    for band, label in [("KC_upper", "kc_upper"), ("KC_middle", "kc_mid"), ("KC_lower", "kc_lower")]:
-        df[f"price_vs_{label}"] = close / df[band] - 1
-        df.drop(columns=[band], inplace=True)
-
-    # MACD values are in dollar terms — normalize by price
-    for col in ["MACD", "MACD_signal", "MACD_hist"]:
-        df[f"{col}_norm"] = df[col] / close
-        df.drop(columns=[col], inplace=True)
-
-    # OBV is cumulative and non-stationary — replace with 5-day rate of change
-    df["OBV_chg_5d"] = df["OBV"].pct_change(5)
-    df.drop(columns=["OBV"], inplace=True)
-
-    print("Features normalized:")
-    print("  ✓ MA/EMA → price_vs_ma/ema ratios")
-    print("  ✓ KC bands → price_vs_kc ratios")
-    print("  ✓ MACD/signal/hist → normalized by Close")
-    print("  ✓ OBV → OBV_chg_5d\n")
-    return df
+# add_earnings_proximity imported from modules.features (call: add_earnings_proximity(df, TICKER))
+# normalize_features  imported from modules.features
 
 
 # ─────────────────────────────────────────
@@ -421,31 +332,7 @@ def plot_results(clf, X_test, y_test, y_pred, feature_cols):
     plt.show()
 
 
-# ─────────────────────────────────────────
-# VOL-ADJUSTED THRESHOLD
-# ─────────────────────────────────────────
-def compute_vol_thresholds(df):
-    global WIN_THRESHOLD, WIN_THRESHOLD_63
-    log_ret   = np.log(df["Close"] / df["Close"].shift(1))
-    hv_series = log_ret.rolling(HV_WINDOW).std() * np.sqrt(252)
-    hv_valid  = hv_series.dropna()
-
-    print("\nVol-Adjusted Threshold Calibration")
-    print("─" * 42)
-    if len(hv_valid) < 20 or hv_valid.median() < 0.05:
-        print("  WARNING: Insufficient/invalid HV data — using AMD default.")
-        print("─" * 42)
-        return
-
-    median_hv    = hv_valid.median()
-    new_win      = P2_VOL_MULTIPLE * median_hv * np.sqrt(FORWARD_DAYS / 252)
-    new_win_63   = P2_VOL_MULTIPLE * median_hv * np.sqrt(FORWARD_DAYS_63 / 252)
-    print(f"  Ticker median HV (20-day, annualized): {median_hv:.1%}")
-    print(f"  WIN_THRESHOLD:    0.05 (AMD default)  ->  {new_win:.1%}  [computed]")
-    print(f"  WIN_THRESHOLD_63: 0.10 (AMD default)  ->  {new_win_63:.1%}  [computed]")
-    print("─" * 42)
-    WIN_THRESHOLD    = new_win
-    WIN_THRESHOLD_63 = new_win_63
+# compute_vol_thresholds imported from modules.features
 
 
 # ─────────────────────────────────────────
@@ -480,7 +367,7 @@ if __name__ == "__main__":
             sys.exit(0)
 
     df = load_indicators(INDICATORS_CSV)
-    compute_vol_thresholds(df)
+    WIN_THRESHOLD, WIN_THRESHOLD_63, _ = compute_vol_thresholds(df)
 
     print(f"  Detecting benchmarks for {TICKER}...")
     benchmarks = detect_benchmarks(TICKER)
@@ -500,7 +387,7 @@ if __name__ == "__main__":
     if macro:
         print("  Macro features:")
         df = add_macro_features(df, macro, START_DATE, END_DATE)
-    df = add_earnings_proximity(df)
+    df = add_earnings_proximity(df, TICKER)
     df = add_catalyst_proximity(df, TICKER, MODULE_DIR, for_direction=True)
     df = normalize_features(df)
 

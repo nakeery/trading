@@ -29,6 +29,11 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import classification_report, brier_score_loss
 from modules.benchmarks import detect_macro_features, add_macro_features, add_catalyst_proximity
 from modules.massive import IV_COLS, IV_META_COLS, IV_FEATURE_COLS
+from modules.features import (
+    HV_WINDOW, IV_RANK_WINDOW, P3_FORWARD_DAYS, P3_VOL_MULTIPLE,
+    compute_hv_features, compute_vix_features, add_earnings_proximity,
+    normalize_features, compute_vol_thresholds,
+)
 
 # ─────────────────────────────────────────
 # CONFIG
@@ -40,11 +45,8 @@ DATA_DIR       = "data"
 MODULE_DIR     = "modules"
 # INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 
-HV_WINDOW           = 20    # Days for realized vol calculation
-IV_RANK_WINDOW      = 252   # 1 trading year lookback for IV rank/percentile
-FORWARD_DAYS        = 10    # Days ahead to evaluate expansion
+FORWARD_DAYS        = P3_FORWARD_DAYS  # 10 — imported from modules.features
 EXPANSION_THRESHOLD = 0.10  # Default (AMD). Overridden at runtime by compute_vol_thresholds()
-P3_VOL_MULTIPLE     = 0.20  # Sets expansion bar at 20% of median HV — practical range: 0.10 to 0.40
 TEST_SIZE           = 0.20
 DECISION_THRESHOLD  = 0.50
 RANDOM_STATE        = 42
@@ -80,24 +82,7 @@ def load_indicators(path):
 # 2. IV FEATURES
 # ─────────────────────────────────────────
 def add_iv_features(df):
-    log_ret = np.log(df["Close"] / df["Close"].shift(1))
-    df["HV_20"] = log_ret.rolling(HV_WINDOW).std() * np.sqrt(252)
-
-    # IV rank: where current HV sits in its 1-year range (0 = cheapest, 1 = most expensive)
-    hv_high = df["HV_20"].rolling(IV_RANK_WINDOW).max()
-    hv_low  = df["HV_20"].rolling(IV_RANK_WINDOW).min()
-    df["IV_rank"] = (df["HV_20"] - hv_low) / (hv_high - hv_low)
-
-    # IV percentile: % of past year where HV was below current level
-    df["IV_pct"] = df["HV_20"].rolling(IV_RANK_WINDOW).apply(
-        lambda x: (x[:-1] < x[-1]).mean(), raw=True
-    )
-
-    # HV trend: is vol rising or falling?
-    df["HV_chg_5d"]  = df["HV_20"].pct_change(5)
-    df["HV_chg_10d"] = df["HV_20"].pct_change(10)
-    df["HV_vs_ma20"] = df["HV_20"] / df["HV_20"].rolling(20).mean() - 1
-
+    df = compute_hv_features(df)
     print("  ✓ HV_20, IV_rank, IV_pct, HV_chg_5d, HV_chg_10d, HV_vs_ma20")
     return df
 
@@ -106,103 +91,16 @@ def add_iv_features(df):
 # 3. VIX FEATURES
 # ─────────────────────────────────────────
 def add_vix(df):
-    raw = yf.download("^VIX", start=START_DATE, end=END_DATE, progress=False)
-    raw.columns = raw.columns.get_level_values(0)
-    vix = raw[["Close"]].rename(columns={"Close": "VIX"})
-    vix["VIX_chg_5d"]  = vix["VIX"].pct_change(5)
-    vix["VIX_vs_ma20"] = vix["VIX"] / vix["VIX"].rolling(20).mean() - 1
-    df = df.join(vix, how="left")
-    df[["VIX", "VIX_chg_5d", "VIX_vs_ma20"]] = df[["VIX", "VIX_chg_5d", "VIX_vs_ma20"]].ffill()
-
-    for sym, col in [("^VIX9D", "VIX9D"), ("^VIX3M", "VIX3M")]:
-        r = yf.download(sym, start=START_DATE, end=END_DATE, progress=False)
-        r.columns = r.columns.get_level_values(0)
-        df = df.join(r[["Close"]].rename(columns={"Close": col}), how="left")
-        df[col] = df[col].ffill()
-    df["VIX9D_VIX_ratio"] = (df["VIX9D"] / df["VIX"]).fillna(1.0)
-    df["VIX_VIX3M_ratio"] = (df["VIX"] / df["VIX3M"]).fillna(1.0)
-    df.drop(columns=["VIX9D", "VIX3M"], inplace=True)
-
+    vix_raw   = yf.download("^VIX",   start=START_DATE, end=END_DATE, progress=False)
+    vix9d_raw = yf.download("^VIX9D", start=START_DATE, end=END_DATE, progress=False)
+    vix3m_raw = yf.download("^VIX3M", start=START_DATE, end=END_DATE, progress=False)
+    df = compute_vix_features(df, vix_raw, vix9d_raw, vix3m_raw)
     print("  ✓ VIX, VIX_chg_5d, VIX_vs_ma20, VIX9D_VIX_ratio, VIX_VIX3M_ratio")
     return df
 
 
-# ─────────────────────────────────────────
-# 4. EARNINGS PROXIMITY
-# ─────────────────────────────────────────
-def add_earnings_proximity(df):
-    ticker = yf.Ticker(TICKER)
-    ed = []
-    try:
-        dates = ticker.get_earnings_dates(limit=20)
-        if dates is not None and len(dates) > 0:
-            idx = pd.DatetimeIndex(dates.index)
-            if idx.tz is not None:
-                idx = idx.tz_convert(None)
-            ed = sorted(idx.normalize().unique())
-    except Exception as e:
-        print(f"  ✗ Earnings dates unavailable ({e}) — filling with 45")
-        df["Days_to_earnings"] = 45
-        return df
-
-    if not ed:
-        print("  ✗ Earnings dates empty — filling with 45")
-        df["Days_to_earnings"] = 45
-        return df
-
-    def _days_to_next(date):
-        future = [e for e in ed if e >= date]
-        return (future[0] - date).days if future else 90
-
-    df["Days_to_earnings"] = [_days_to_next(d) for d in df.index]
-    print("  ✓ Days_to_earnings")
-    return df
-
-
-# ─────────────────────────────────────────
-# 5. NORMALIZE PRICE-LEVEL FEATURES
-# ─────────────────────────────────────────
-def normalize_features(df):
-    close = df["Close"]
-
-    # Universal momentum / positioning features (generic for any ticker)
-    df["price_vs_52w_high"] = close / close.rolling(252).max() - 1
-    df["price_vs_52w_low"]  = close / close.rolling(252).min() - 1
-    df["vol_ratio"]         = df["Volume"] / df["Volume"].rolling(20).mean()
-
-    for period in [20, 50, 200]:
-        col = f"MA_{period}"
-        if col in df.columns:
-            df[f"price_vs_ma{period}"] = close / df[col] - 1
-    df.drop(columns=[c for c in df.columns if c.startswith("MA_")], inplace=True)
-
-    for period in [8, 21, 89]:
-        col = f"EMA_{period}"
-        if col in df.columns:
-            df[f"price_vs_ema{period}"] = close / df[col] - 1
-    df.drop(columns=[c for c in df.columns if c.startswith("EMA_")], inplace=True)
-
-    for band, label in [("KC_upper", "kc_upper"), ("KC_middle", "kc_mid"), ("KC_lower", "kc_lower")]:
-        if band in df.columns:
-            df[f"price_vs_{label}"] = close / df[band] - 1
-            df.drop(columns=[band], inplace=True)
-
-    for col in ["MACD", "MACD_signal", "MACD_hist"]:
-        if col in df.columns:
-            df[f"{col}_norm"] = df[col] / close
-            df.drop(columns=[col], inplace=True)
-
-    if "OBV" in df.columns:
-        df["OBV_chg_5d"] = df["OBV"].pct_change(5)
-        df.drop(columns=["OBV"], inplace=True)
-
-    print("Features normalized:")
-    print("  ✓ MA/EMA → price_vs ratios")
-    print("  ✓ KC bands → price_vs ratios")
-    print("  ✓ MACD → normalized by Close")
-    print("  ✓ OBV → OBV_chg_5d\n")
-    return df
-
+# add_earnings_proximity imported from modules.features (call: add_earnings_proximity(df, TICKER))
+# normalize_features  imported from modules.features
 
 # ─────────────────────────────────────────
 # 6. TARGET VARIABLE
@@ -475,29 +373,7 @@ def plot_results(df_full, clf, feature_cols):
     plt.show()
 
 
-# ─────────────────────────────────────────
-# VOL-ADJUSTED THRESHOLD
-# ─────────────────────────────────────────
-def compute_vol_thresholds(df):
-    global EXPANSION_THRESHOLD
-    log_ret   = np.log(df["Close"] / df["Close"].shift(1))
-    hv_series = log_ret.rolling(HV_WINDOW).std() * np.sqrt(252)
-    hv_valid  = hv_series.dropna()
-
-    print("\nVol-Adjusted Threshold Calibration")
-    print("─" * 42)
-    if len(hv_valid) < 20 or hv_valid.median() < 0.05:
-        print("  WARNING: Insufficient/invalid HV data — using AMD default.")
-        print("─" * 42)
-        return
-
-    median_hv     = hv_valid.median()
-    new_expansion = P3_VOL_MULTIPLE * median_hv
-    print(f"  Ticker median HV (20-day, annualized): {median_hv:.1%}")
-    print(f"  EXPANSION_THRESHOLD:  0.10 (AMD default)  ->  {new_expansion:.1%}  [computed]")
-    print("─" * 42)
-    EXPANSION_THRESHOLD = new_expansion
-
+# compute_vol_thresholds imported from modules.features
 
 # ─────────────────────────────────────────
 # MAIN
@@ -533,7 +409,7 @@ if __name__ == "__main__":
             sys.exit(0)
 
     df = load_indicators(INDICATORS_CSV)
-    compute_vol_thresholds(df)
+    _, _, EXPANSION_THRESHOLD = compute_vol_thresholds(df)
 
     print("Building features...")
     df = add_iv_features(df)
@@ -542,7 +418,7 @@ if __name__ == "__main__":
     if macro:
         print("  Macro features:")
         df = add_macro_features(df, macro, START_DATE, END_DATE)
-    df = add_earnings_proximity(df)
+    df = add_earnings_proximity(df, TICKER)
     df = add_catalyst_proximity(df, TICKER, MODULE_DIR)
     df = normalize_features(df)
     if IV_FEATURES:

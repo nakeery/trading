@@ -29,6 +29,12 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from modules.benchmarks import detect_benchmarks, detect_macro_features, add_catalyst_proximity
 from modules.massive import IV_COLS, IV_META_COLS, IV_FEATURE_COLS
+from modules.features import (
+    HV_WINDOW, IV_RANK_WINDOW,
+    P2_FORWARD_DAYS, P2B_FORWARD_DAYS, P3_FORWARD_DAYS,
+    compute_hv_features, compute_vix_features,
+    add_earnings_proximity, normalize_features, compute_vol_thresholds,
+)
 
 # ─────────────────────────────────────────
 # CONFIG
@@ -40,15 +46,12 @@ DATA_DIR       = "data"
 MODULE_DIR     = "modules"
 # INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 
-HV_WINDOW           = 20
-IV_RANK_WINDOW      = 252
-P2_FORWARD_DAYS     = 15
-P2B_FORWARD_DAYS    = 63    # Medium-term direction window (~1 quarter)
-P3_FORWARD_DAYS     = 10
-WIN_THRESHOLD       = 0.05  # Default (AMD). Overridden at runtime by compute_vol_thresholds()
-WIN_THRESHOLD_63    = 0.10  # Default (AMD). Overridden at runtime by compute_vol_thresholds()
+# HV_WINDOW, IV_RANK_WINDOW, P2_FORWARD_DAYS, P2B_FORWARD_DAYS, P3_FORWARD_DAYS
+# imported from modules.features
+WIN_THRESHOLD       = 0.05  # Default (AMD). Set by compute_vol_thresholds() in __main__
+WIN_THRESHOLD_63    = 0.10  # Default (AMD). Set by compute_vol_thresholds() in __main__
 P2_VOL_MULTIPLE     = 0.41  # 0.41 sigma bar — practical range: 0.25 (aggressive) to 1.0 (conservative)
-EXPANSION_THRESHOLD = 0.10  # Default (AMD). Overridden at runtime by compute_vol_thresholds()
+EXPANSION_THRESHOLD = 0.10  # Default (AMD). Set by compute_vol_thresholds() in __main__
 P3_VOL_MULTIPLE     = 0.20  # Sets expansion bar at 20% of median HV — practical range: 0.10 to 0.40
 P2_CALIBRATE        = False  # Decision 1 (S11) reverted as default after NVDA regression (STRONG ENTRY 4.4% → -0.4%). Pass --calibrate to enable.
 P2_THRESHOLD        = 0.55   # Phase 2 (15d) cutoff. Set from P2_CALIBRATE in __main__: 0.50 calibrated / 0.55 raw.
@@ -120,35 +123,15 @@ def build_features(df, benchmarks):
     close = df["Close"]
 
     # HV and IV features
-    log_ret = np.log(close / close.shift(1))
-    df["HV_20"]      = log_ret.rolling(HV_WINDOW).std() * np.sqrt(252)
-    hv_high          = df["HV_20"].rolling(IV_RANK_WINDOW).max()
-    hv_low           = df["HV_20"].rolling(IV_RANK_WINDOW).min()
-    df["IV_rank"]    = (df["HV_20"] - hv_low) / (hv_high - hv_low)
-    df["IV_pct"]     = df["HV_20"].rolling(IV_RANK_WINDOW).apply(
-        lambda x: (x[:-1] < x[-1]).mean(), raw=True
+    df = compute_hv_features(df)
+
+    # VIX (uses local cache for performance across walk-forward windows)
+    df = compute_vix_features(
+        df,
+        _fetch_cached("^VIX",   "vix_cache.csv"),
+        _fetch_cached("^VIX9D", "vix9d_cache.csv"),
+        _fetch_cached("^VIX3M", "vix3m_cache.csv"),
     )
-    df["HV_chg_5d"]  = df["HV_20"].pct_change(5)
-    df["HV_chg_10d"] = df["HV_20"].pct_change(10)
-    df["HV_vs_ma20"] = df["HV_20"] / df["HV_20"].rolling(20).mean() - 1
-
-    # VIX
-    vix_raw = _fetch_cached("^VIX", "vix_cache.csv")
-    vix = vix_raw[["Close"]].rename(columns={"Close": "VIX"})
-    vix["VIX_chg_5d"]  = vix["VIX"].pct_change(5)
-    vix["VIX_vs_ma20"] = vix["VIX"] / vix["VIX"].rolling(20).mean() - 1
-    df = df.join(vix, how="left")
-    df[["VIX", "VIX_chg_5d", "VIX_vs_ma20"]] = df[["VIX", "VIX_chg_5d", "VIX_vs_ma20"]].ffill()
-
-    # VIX term structure: near-term vs spot vs 3-month
-    for sym, cache, col in [("^VIX9D", "vix9d_cache.csv", "VIX9D"),
-                             ("^VIX3M", "vix3m_cache.csv", "VIX3M")]:
-        r = _fetch_cached(sym, cache)
-        df = df.join(r[["Close"]].rename(columns={"Close": col}), how="left")
-        df[col] = df[col].ffill()
-    df["VIX9D_VIX_ratio"] = (df["VIX9D"] / df["VIX"]).fillna(1.0)
-    df["VIX_VIX3M_ratio"] = (df["VIX"] / df["VIX3M"]).fillna(1.0)
-    df.drop(columns=["VIX9D", "VIX3M"], inplace=True)
 
     # Sector/industry benchmark relative strength + sector trend
     for bench_ticker, bench_name in benchmarks:
@@ -179,59 +162,9 @@ def build_features(df, benchmarks):
             df["yield_curve"]        = df["UST10Y"] - df["UST3M"]
             df["yield_curve_chg_5d"] = df["yield_curve"].pct_change(5)
 
-    # Earnings proximity
-    ticker = yf.Ticker(TICKER)
-    ed = []
-    try:
-        dates = ticker.get_earnings_dates(limit=20)
-        if dates is not None and len(dates) > 0:
-            idx = pd.DatetimeIndex(dates.index)
-            if idx.tz is not None:
-                idx = idx.tz_convert(None)
-            ed = sorted(idx.normalize().unique())
-    except Exception:
-        pass
-    if ed:
-        def _days_to_next(date):
-            future = [e for e in ed if e >= date]
-            return (future[0] - date).days if future else 90
-        df["Days_to_earnings"] = [_days_to_next(d) for d in df.index]
-    else:
-        df["Days_to_earnings"] = 45
-
+    df = add_earnings_proximity(df, TICKER)
     df = add_catalyst_proximity(df, TICKER, MODULE_DIR, for_direction=True)
-
-    # Normalize price-level features
-    for period in [20, 50, 200]:
-        col = f"MA_{period}"
-        if col in df.columns:
-            df[f"price_vs_ma{period}"] = close / df[col] - 1
-    df.drop(columns=[c for c in df.columns if c.startswith("MA_")], inplace=True)
-
-    for period in [8, 21, 89]:
-        col = f"EMA_{period}"
-        if col in df.columns:
-            df[f"price_vs_ema{period}"] = close / df[col] - 1
-    df.drop(columns=[c for c in df.columns if c.startswith("EMA_")], inplace=True)
-
-    for band, label in [("KC_upper", "kc_upper"), ("KC_middle", "kc_mid"), ("KC_lower", "kc_lower")]:
-        if band in df.columns:
-            df[f"price_vs_{label}"] = close / df[band] - 1
-            df.drop(columns=[band], inplace=True)
-
-    for col in ["MACD", "MACD_signal", "MACD_hist"]:
-        if col in df.columns:
-            df[f"{col}_norm"] = df[col] / close
-            df.drop(columns=[col], inplace=True)
-
-    if "OBV" in df.columns:
-        df["OBV_chg_5d"] = df["OBV"].pct_change(5)
-        df.drop(columns=["OBV"], inplace=True)
-
-    # Universal momentum / positioning features (generic for any ticker)
-    df["price_vs_52w_high"] = close / close.rolling(252).max() - 1
-    df["price_vs_52w_low"]  = close / close.rolling(252).min() - 1
-    df["vol_ratio"]         = df["Volume"] / df["Volume"].rolling(20).mean()
+    df = normalize_features(df)
 
     # Overnight gap features — computed fresh (not read from CSV) for self-containment
     if "gap_pct" not in df.columns:
@@ -283,6 +216,7 @@ def train_model(df_train, target_col, calibrate=False, use_iv_features=False):
 # 5. WALK-FORWARD BACKTEST
 # ─────────────────────────────────────────
 def run_backtest(df_full):
+    global WIN_THRESHOLD, WIN_THRESHOLD_63, EXPANSION_THRESHOLD
     close = df_full["Close"]
     n     = len(df_full)
     results = []
@@ -300,7 +234,10 @@ def run_backtest(df_full):
         print(f"  Window {window_num:2d}: train through {train_date} | test {test_s_date} to {test_e_date}")
 
         df_train = df_full.iloc[:train_end].copy()
-        compute_vol_thresholds(df_train, verbose=False)  # per-window: uses only training data
+        WIN_THRESHOLD, WIN_THRESHOLD_63, EXPANSION_THRESHOLD = compute_vol_thresholds(
+            df_train, verbose=False,
+            p2_vol_multiple=P2_VOL_MULTIPLE, p3_vol_multiple=P3_VOL_MULTIPLE,
+        )
 
         # Phase 2 — 15-day direction target (mode set via CLI flag — see banner)
         df_p2 = df_train.copy()
@@ -475,38 +412,7 @@ def plot_results(df_stats, order, colors, results):
         plt.show()
 
 
-# ─────────────────────────────────────────
-# VOL-ADJUSTED THRESHOLDS
-# ─────────────────────────────────────────
-def compute_vol_thresholds(df, verbose=True):
-    global WIN_THRESHOLD, WIN_THRESHOLD_63, EXPANSION_THRESHOLD
-    log_ret   = np.log(df["Close"] / df["Close"].shift(1))
-    hv_series = log_ret.rolling(HV_WINDOW).std() * np.sqrt(252)
-    hv_valid  = hv_series.dropna()
-
-    if verbose:
-        print("\nVol-Adjusted Threshold Calibration")
-        print("─" * 42)
-    if len(hv_valid) < 20 or hv_valid.median() < 0.05:
-        if verbose:
-            print("  WARNING: Insufficient/invalid HV data — using AMD defaults.")
-            print("─" * 42)
-        return
-
-    median_hv     = hv_valid.median()
-    new_win       = P2_VOL_MULTIPLE * median_hv * np.sqrt(P2_FORWARD_DAYS / 252)
-    new_win_63    = P2_VOL_MULTIPLE * median_hv * np.sqrt(P2B_FORWARD_DAYS / 252)
-    new_expansion = P3_VOL_MULTIPLE * median_hv
-    if verbose:
-        print(f"  Ticker median HV (20-day, annualized): {median_hv:.1%}")
-        print(f"  P2_VOL_MULTIPLE = {P2_VOL_MULTIPLE}  |  P3_VOL_MULTIPLE = {P3_VOL_MULTIPLE}")
-        print(f"  WIN_THRESHOLD:       {new_win:.2%}")
-        print(f"  WIN_THRESHOLD_63:    {new_win_63:.2%}")
-        print(f"  EXPANSION_THRESHOLD: {new_expansion:.2%}")
-        print("─" * 42)
-    WIN_THRESHOLD       = new_win
-    WIN_THRESHOLD_63    = new_win_63
-    EXPANSION_THRESHOLD = new_expansion
+# compute_vol_thresholds imported from modules.features
 
 
 def collect_signal_stats(results):
@@ -618,7 +524,9 @@ if __name__ == "__main__":
             sys.exit(0)
 
     df = load_indicators(INDICATORS_CSV)
-    compute_vol_thresholds(df)
+    WIN_THRESHOLD, WIN_THRESHOLD_63, EXPANSION_THRESHOLD = compute_vol_thresholds(
+        df, p2_vol_multiple=P2_VOL_MULTIPLE, p3_vol_multiple=P3_VOL_MULTIPLE,
+    )
 
     print(f"  Detecting benchmarks for {TICKER}...")
     benchmarks = detect_benchmarks(TICKER)
@@ -647,7 +555,10 @@ if __name__ == "__main__":
             print("─" * 60)
             P2_VOL_MULTIPLE = p2_mult
             P3_VOL_MULTIPLE = p3_mult
-            compute_vol_thresholds(df, verbose=True)
+            WIN_THRESHOLD, WIN_THRESHOLD_63, EXPANSION_THRESHOLD = compute_vol_thresholds(
+                df, verbose=True,
+                p2_vol_multiple=p2_mult, p3_vol_multiple=p3_mult,
+            )
             results = run_backtest(df_full)
             stats   = collect_signal_stats(results)
             sweep_results.append({"p2": p2_mult, "p3": p3_mult,
