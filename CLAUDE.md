@@ -178,8 +178,9 @@ Threshold sweep auto-marks optimal using `max(precision - base_rate) × log(sign
   - Back: `dte=55-90`, strikes `spot×0.97` to `×1.03` → back-month ATM for term structure
 - Filters out `iv=20` placeholder (Massive returns this for deep ITM/OTM with empty greeks)
 - Snapshot endpoint is current-only — `expired=true` is ignored on `/v3/snapshot/options/`
-  (only honored on `/v3/reference/options/contracts`). Historical IV requires the BS-inversion
-  pipeline planned for S11 (use contracts reference + aggregates + Black-Scholes invert).
+  (only honored on `/v3/reference/options/contracts`). Historical IV uses the BS-inversion
+  pipeline in `backfill_iv.py` + `modules/bs_invert.py` (contracts reference + aggregates +
+  Black-Scholes invert). Fill rate is capped at ~2yr by the Massive Options Starter plan limit.
 
 ## Geopolitical / Exogenous Shock Limitation
 

@@ -818,6 +818,57 @@ Important Notes
   Banner at start and footer at end of each run prints the active mode.
 - backtest.py is SELF-CONTAINED — does NOT import from direction.py or volatility.py.
   If feature engineering changes there, backtest.py must be manually updated.
+
+────────────────────────────────────────────────────────────────────────
+
+Session 15 — LEAPS ONLY Signal Tier + 6-Month Forward Return Table (2026-05-12)
+
+1. LEAPS ONLY signal tier added to entry.py and backtest.py
+   - New 5th label: `not dir_signal and dir_signal_63` (15d model silent, 63d fires)
+   - Validated via leaps_test.py on qqq_backtest_results.csv before implementing:
+     STAY OUT + 63d >= 0.55: n=1618, avg +1.14%, win 63.3% — beats ALL DAYS (+0.84%)
+     STAY OUT + 63d <  0.55: n=3058, avg +0.50% — the real dead zone
+   - Signal block: `elif not dir_signal and dir_signal_63: signal = "LEAPS ONLY"`
+     placed between SHORT-TERM ONLY and STAY OUT branches in both scripts
+   - entry.py sizing: LEAPS ONLY -> sizing="LEAPS", note recommends 6-9 month options
+   - backtest.py: order/colors, collect_signal_stats, hierarchy check all updated
+     (STRONG > CAUTION > SHORT-TERM > LEAPS > STAY OUT)
+   - impute_iv_features() moved from volatility.py inline to modules/features.py;
+     imported by backtest.py
+
+2. QQQ backtest results post-LEAPS ONLY (53 windows, 2001-2026)
+   Signal           Count   Avg Ret   Median  Win%   Strong%  AvgWin  AvgLoss
+   STRONG ENTRY       586     1.9%     2.3%   63.3%   52.7%    5.5%   -4.2%  <- best 15d
+   CAUTION           1333     1.2%     1.8%   62.4%   50.3%    4.5%   -4.3%
+   SHORT-TERM ONLY    514     0.2%     1.0%   57.6%   44.9%    3.9%   -4.8%
+   LEAPS ONLY         817     0.8%     1.4%   63.0%   45.4%    3.7%   -4.0%
+   STAY OUT          3066     0.6%     1.1%   61.1%   41.9%    3.4%   -3.9%
+   - STAY OUT fell from 74% to 48.5% of days (4676 -> 3066 reclassified)
+   - LEAPS ONLY win rate (63.0%) beats STAY OUT (61.1%), matches ALL DAYS baseline
+
+3. 6-month forward return table added to backtest.py summarize()
+   - fwd_return_126d added to run_backtest() results dict
+     Formula: close.iloc[i+126] / close.iloc[i] - 1; NaN if i+126 >= len(close)
+   - Second summary block printed after 15d table; Win% threshold = breakeven (> 0)
+   - QQQ 6-month results:
+       STRONG ENTRY  543  +10.6%  77.3%  <- best 6mo avg
+       SHORT-TERM   510   +7.4%  81.2%  <- highest win rate
+       CAUTION     1294   +6.7%  70.0%
+       STAY OUT    3066   +6.7%  77.3%  (secular QQQ bid; ties STRONG ENTRY win rate)
+       LEAPS ONLY   792   +6.4%  70.6%  <- below ALL DAYS (7.0%, 75.2%)
+   - LEAPS ONLY does NOT outperform at 6-month horizon for QQQ. Use as informational
+     label only. For individual stocks 6mo table will be more discriminating.
+
+4. Interpretation guidance (applies when reading entry.py output against backtest tables)
+   - 15d table: use to decide whether to enter
+   - 6mo table: use to decide DTE — STRONG ENTRY is only signal with clear edge on
+     both horizons for QQQ
+   - SHORT-TERM ONLY 81.2% 6mo win rate despite +0.2% 15d — does NOT validate as a
+     LEAPS entry; the lack of near-term catalyst is the point
+   - CAUTION ≈ STAY OUT at 6mo for QQQ (~+6.7%) — Phase 3 does not discriminate at
+     index level over longer horizons
+
+5. Cleanup: leaps_test.py (temp validation script) deleted after use
 - IV_COLS exclusion pattern: any new ML script reading the indicators CSV must add
   *IV_COLS to its train()/train_model() exclude set, otherwise dropna() destroys
   training data (until S11 backfill populates historical values).

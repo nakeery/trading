@@ -107,14 +107,14 @@ def main():
 
     # Determine which dates need backfilling
     cutoff = pd.Timestamp.today().normalize() - pd.DateOffset(years=2)
-    mask   = (df.index >= cutoff) & df["atm_iv_30d"].isna()
+    mask   = (df.index >= cutoff) & (df["atm_iv_30d"].isna() | df["term_structure"].isna())
     dates  = df.index[mask].sort_values(ascending=False)   # newest -> oldest
 
     print(f"  -> Dates to backfill: {len(dates)}  "
-          f"(cutoff: {cutoff.date()}, NaN atm_iv_30d only)\n")
+          f"(cutoff: {cutoff.date()}, NaN atm_iv_30d or term_structure)\n")
 
     if len(dates) == 0:
-        print("  Nothing to backfill — atm_iv_30d is already populated for all dates in range.")
+        print("  Nothing to backfill — atm_iv_30d and term_structure are already populated for all dates in range.")
         sys.exit(0)
 
     # Load risk-free rates

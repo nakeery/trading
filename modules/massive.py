@@ -390,9 +390,16 @@ def get_historical_iv_snapshot(ticker, date, spot, r, target_dte=30, q=0.0, max_
     parsed_front_puts.sort(key=lambda p: (not is_monthly_expiry(p[2]), abs(p[3] - target_dte) * 10 + abs(p[1] - spot * 0.95) / spot * 100))
     parsed_back_calls.sort(key=lambda p: (not is_monthly_expiry(p[2]), abs(p[1] - spot) / spot * 100))
 
-    front_calls_cands = parsed_front_calls
-    front_puts_cands  = parsed_front_puts
-    back_calls_cands  = parsed_back_calls
+    # Prefer monthly expirations as primary candidates; fall back to all if none found.
+    # This prevents FAST_FAIL_MISSES from aborting on weeklies (which often have no
+    # agg data) before the liquid monthly is reached — critical for weekly-heavy tickers
+    # like QQQ.
+    monthly_front_calls = [p for p in parsed_front_calls if is_monthly_expiry(p[2])]
+    front_calls_cands   = monthly_front_calls if monthly_front_calls else parsed_front_calls
+    monthly_front_puts  = [p for p in parsed_front_puts  if is_monthly_expiry(p[2])]
+    front_puts_cands    = monthly_front_puts  if monthly_front_puts  else parsed_front_puts
+    monthly_back_calls  = [p for p in parsed_back_calls  if is_monthly_expiry(p[2])]
+    back_calls_cands    = monthly_back_calls  if monthly_back_calls  else parsed_back_calls
 
     NO_PRICE = object()  # sentinel: agg endpoint returned no data (not a bad IV)
 

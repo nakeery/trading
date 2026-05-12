@@ -34,6 +34,7 @@ from modules.features import (
     P2_FORWARD_DAYS, P2B_FORWARD_DAYS, P3_FORWARD_DAYS,
     compute_hv_features, compute_vix_features,
     add_earnings_proximity, normalize_features, compute_vol_thresholds,
+    impute_iv_features,
 )
 
 # ─────────────────────────────────────────
@@ -291,19 +292,27 @@ def run_backtest(df_full):
                 signal = "CAUTION"
             elif dir_signal and not dir_signal_63:
                 signal = "SHORT-TERM ONLY"
+            elif not dir_signal and dir_signal_63:
+                signal = "LEAPS ONLY"
             else:
                 signal = "STAY OUT"
 
             fwd_return = close.iloc[i + P2_FORWARD_DAYS] / close.iloc[i] - 1
+            fwd_126 = i + 126
+            fwd_return_126d = (
+                close.iloc[fwd_126] / close.iloc[i] - 1
+                if fwd_126 < len(close) else float("nan")
+            )
 
             results.append({
-                "date":       date,
-                "signal":     signal,
-                "dir_prob":   dir_prob,
-                "dir_prob_63": dir_prob_63,
-                "exp_prob":   exp_prob,
-                "fwd_return": fwd_return,
-                "window":     window_num,
+                "date":          date,
+                "signal":        signal,
+                "dir_prob":      dir_prob,
+                "dir_prob_63":   dir_prob_63,
+                "exp_prob":      exp_prob,
+                "fwd_return":    fwd_return,
+                "fwd_return_126d": fwd_return_126d,
+                "window":        window_num,
             })
 
         train_end += STEP_DAYS
@@ -315,9 +324,9 @@ def run_backtest(df_full):
 # 6. SUMMARIZE RESULTS
 # ─────────────────────────────────────────
 def summarize(results):
-    order  = ["STRONG ENTRY", "CAUTION", "SHORT-TERM ONLY", "STAY OUT", "ALL DAYS"]
+    order  = ["STRONG ENTRY", "CAUTION", "SHORT-TERM ONLY", "LEAPS ONLY", "STAY OUT", "ALL DAYS"]
     colors = {"STRONG ENTRY": "#3fb950", "CAUTION": "#ffa657",
-              "SHORT-TERM ONLY": "#d2a8ff", "STAY OUT": "#f85149", "ALL DAYS": "#58a6ff"}
+              "SHORT-TERM ONLY": "#d2a8ff", "LEAPS ONLY": "#a5d6ff", "STAY OUT": "#f85149", "ALL DAYS": "#58a6ff"}
 
     all_row = results.copy()
     all_row["signal"] = "ALL DAYS"
@@ -358,6 +367,46 @@ def summarize(results):
               f"{r['Median Return']:>8.1%} {r['Win Rate']:>7.1%} "
               f"{r['Strong Win']:>7.1%} {r['Avg Win']:>7.1%} "
               f"{r['Avg Loss']:>8.1%}{marker}")
+    print(f"{'─'*80}\n")
+
+    # ── 6-month forward return table ──────────────────────────────────────────
+    combined_126 = pd.concat([results.copy(), results.copy().assign(signal="ALL DAYS")])
+    stats_126 = []
+    for sig in order:
+        subset = combined_126[combined_126["signal"] == sig]["fwd_return_126d"].dropna()
+        if len(subset) == 0:
+            continue
+        stats_126.append({
+            "Signal":        sig,
+            "Count":         len(subset),
+            "Avg Return":    subset.mean(),
+            "Median Return": subset.median(),
+            "Win Rate":      (subset > 0).mean(),
+            "Avg Win":       subset[subset > 0].mean() if (subset > 0).any() else 0,
+            "Avg Loss":      subset[subset <= 0].mean() if (subset <= 0).any() else 0,
+        })
+    df_stats_126 = pd.DataFrame(stats_126).set_index("Signal")
+
+    n_nan = results["fwd_return_126d"].isna().sum()
+    print(f"{'─'*80}")
+    print(f"  6-MONTH FORWARD RETURNS — {TICKER}  "
+          f"(excl. last 126 trading days; {n_nan} rows NaN)")
+    print(f"{'─'*80}")
+    print(f"  {'Signal':<16} {'Count':>6} {'Avg Ret':>9} {'Median':>8} "
+          f"{'Win%':>7} {'AvgWin':>7} {'AvgLoss':>9}")
+    best_126 = df_stats_126.loc[
+        [s for s in order if s in df_stats_126.index and s != "ALL DAYS"],
+        "Avg Return",
+    ].idxmax()
+    print(f"{'─'*80}")
+    for sig in order:
+        if sig not in df_stats_126.index:
+            continue
+        r = df_stats_126.loc[sig]
+        marker = "  <- best avg return" if sig == best_126 else ""
+        print(f"  {sig:<16} {int(r['Count']):>6} {r['Avg Return']:>8.1%} "
+              f"{r['Median Return']:>8.1%} {r['Win Rate']:>7.1%} "
+              f"{r['Avg Win']:>7.1%} {r['Avg Loss']:>8.1%}{marker}")
     print(f"{'─'*80}\n")
 
     return df_stats, order, colors
@@ -418,7 +467,7 @@ def plot_results(df_stats, order, colors, results):
 def collect_signal_stats(results):
     """Returns a dict of per-signal stats for sweep comparison."""
     stats = {}
-    for sig in ["STRONG ENTRY", "CAUTION", "SHORT-TERM ONLY", "STAY OUT"]:
+    for sig in ["STRONG ENTRY", "CAUTION", "SHORT-TERM ONLY", "LEAPS ONLY", "STAY OUT"]:
         subset = results[results["signal"] == sig]["fwd_return"].dropna()
         stats[sig] = {
             "count":      len(subset),
@@ -446,12 +495,16 @@ def print_sweep_summary(sweep_results, ticker):
         strong, caution, short, stay = (
             s["STRONG ENTRY"], s["CAUTION"], s["SHORT-TERM ONLY"], s["STAY OUT"]
         )
-        # Clean hierarchy: STRONG > CAUTION > SHORT-TERM > STAY OUT (by avg return)
+        leaps = s.get("LEAPS ONLY", {"avg_return": float("nan"), "count": 0, "win_rate": float("nan")})
+        # Clean hierarchy: STRONG > CAUTION > SHORT-TERM > LEAPS > STAY OUT (by avg return)
         avgs = [strong["avg_return"], caution["avg_return"],
-                short["avg_return"], stay["avg_return"]]
+                short["avg_return"], leaps["avg_return"], stay["avg_return"]]
         valid = [a for a in avgs if not np.isnan(a)]
-        hierarchy_clean = (len(valid) == 4 and
-                           avgs[0] > avgs[1] and avgs[1] > avgs[2] and avgs[2] > avgs[3])
+        hierarchy_clean = (len(valid) >= 4 and all(
+            avgs[j] > avgs[j + 1]
+            for j in range(len(avgs) - 1)
+            if not (np.isnan(avgs[j]) or np.isnan(avgs[j + 1]))
+        ))
         rows.append({
             "p2": r["p2"], "p3": r["p3"],
             "strong_avg":  strong["avg_return"],
@@ -539,6 +592,8 @@ if __name__ == "__main__":
     print()
 
     df_full = build_features(df, benchmarks)
+    if IV_FEATURES:
+        df_full = impute_iv_features(df_full)
 
     print("Running walk-forward backtest...")
     print(f"  Min training window: {MIN_TRAIN_DAYS} days (~1 years)")

@@ -184,3 +184,24 @@ def compute_vol_thresholds(df, verbose=True,
         print("─" * 42)
 
     return win_threshold, win_threshold_63, expansion_threshold
+
+
+def impute_iv_features(df):
+    """When --iv-features is active: add binary missing-indicator columns and
+    impute NaN IV values so the full training history is preserved.
+
+      iv_available   = 1 where atm_iv_30d was measured, 0 where imputed
+      term_available = 1 where term_structure was measured, 0 where imputed
+
+    Imputation: atm_iv_30d -> HV_20,  iv_skew_25d -> 0.0,  term_structure -> 1.0
+    """
+    df["iv_available"]   = df["atm_iv_30d"].notna().astype(int)
+    df["term_available"] = df["term_structure"].notna().astype(int)
+    df["atm_iv_30d"]     = df["atm_iv_30d"].fillna(df["HV_20"])
+    df["iv_skew_25d"]    = df["iv_skew_25d"].fillna(0.0)
+    df["term_structure"] = df["term_structure"].fillna(1.0)
+    n_iv   = int(df["iv_available"].sum())
+    n_term = int(df["term_available"].sum())
+    print(f"  ✓ IV imputation: {n_iv} real atm_iv_30d rows, {n_term} real term_structure rows"
+          f" (remainder filled with HV_20/0.0/1.0 + binary indicators)")
+    return df

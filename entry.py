@@ -342,6 +342,8 @@ def print_combined_signal(df_full, direction_prob, dir_prob_63, expansion_prob,
             signal = "CAUTION"
         else:
             signal = "SHORT-TERM ONLY"
+    elif dir_signal_63:
+        signal = "LEAPS ONLY"
     else:
         signal = "STAY OUT"
 
@@ -360,8 +362,13 @@ def print_combined_signal(df_full, direction_prob, dir_prob_63, expansion_prob,
             sizing      = "REDUCED"
             sizing_note = f"IV {iv_regime.lower()} with {contraction_prob:.0%} contraction probability and medium-term model does not confirm — limit size."
     else:
-        sizing      = "N/A"
-        sizing_note = "No directional edge — wait for Phase 2 signal before sizing."
+        if dir_signal_63:  # LEAPS ONLY
+            sizing      = "LEAPS"
+            sizing_note = (f"15d edge absent but 63d model confirms ({dir_prob_63:.0%}) — "
+                           f"longer-dated options only (6\u20139 months).")
+        else:
+            sizing      = "N/A"
+            sizing_note = "No directional edge — wait for Phase 2 signal before sizing."
 
     # ── IV/HV gate: downgrade STRONG ENTRY if options-market premium is too rich ──
     signal_pre_gate = signal
