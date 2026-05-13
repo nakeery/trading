@@ -297,6 +297,10 @@ def harvest_iv_snapshot(df, ticker, csv_path):
     CSV before writing — without this, every indicators.py re-run would overwrite
     accumulated forward IV history with NaN.
 
+    If today is a weekday and yfinance hasn't returned today's bar yet (end is
+    exclusive), append a today-row with NaN OHLCV so the IV stamp lands on today's
+    date instead of overwriting yesterday's close-of-day IV.
+
     Graceful: any failure leaves the affected columns NaN and prints a warning."""
     for col in IV_COLS:
         if col not in df.columns:
@@ -313,7 +317,21 @@ def harvest_iv_snapshot(df, ticker, csv_path):
         except Exception as e:
             print(f"  Could not merge prior IV from {csv_path}: {e}")
 
-    spot = float(df["Close"].iloc[-1])
+    # Add today-row if today is a weekday and not already in df. Holiday edge case
+    # (e.g. Memorial Day) is accepted — the harvest still runs and stamps a row
+    # that won't reconcile with a yfinance bar later.
+    today = pd.Timestamp.today().normalize()
+    if today.weekday() < 5 and today not in df.index:
+        today_row = pd.DataFrame(index=[today], columns=df.columns)
+        df = pd.concat([df, today_row]).sort_index()
+
+    # Spot for ATM-strike anchor: latest non-NaN Close (skips today-row if just appended).
+    spot_series = df["Close"].dropna()
+    if spot_series.empty:
+        print("  WARNING: No Close prices available — skipping IV harvest")
+        return df
+    spot = float(spot_series.iloc[-1])
+
     summary = get_chain_summary(ticker, spot)
     last_idx = df.index[-1]
     if summary is None:
@@ -327,7 +345,7 @@ def harvest_iv_snapshot(df, ticker, csv_path):
     term_s = f"{summary['term_structure']:.2f}" if summary["term_structure"] is not None else "n/a"
     pc_s   = f"{summary['put_call_oi_ratio']:.2f}" if summary["put_call_oi_ratio"] is not None else "n/a"
     print(f"  ATM IV (~{summary['atm_dte']}d): {summary['atm_iv_30d']:.1%} | "
-          f"25Δ skew: {skew_s} | term: {term_s} | P/C OI: {pc_s}")
+          f"25Δ skew: {skew_s} | term: {term_s} | P/C OI: {pc_s}  → row {last_idx.date()}")
     return df
 
 

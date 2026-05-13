@@ -26,6 +26,13 @@ from sklearn.metrics import precision_score
 from sklearn.preprocessing import StandardScaler
 from modules.benchmarks import detect_benchmarks, detect_macro_features, add_macro_features, add_catalyst_proximity
 from modules.massive import IV_COLS, IV_META_COLS, IV_FEATURE_COLS
+from modules.features import (
+    HV_WINDOW, IV_RANK_WINDOW,
+    P2_FORWARD_DAYS, P2B_FORWARD_DAYS, P3_FORWARD_DAYS,
+    P2_VOL_MULTIPLE, P3_VOL_MULTIPLE,
+    compute_hv_features, compute_vix_features,
+    add_earnings_proximity, normalize_features, compute_vol_thresholds,
+)
 
 # ─────────────────────────────────────────
 # CONFIG
@@ -37,16 +44,10 @@ DATA_DIR       = "data"
 MODULE_DIR     = "modules"
 # INDICATORS_CSV = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 
-HV_WINDOW           = 20
-IV_RANK_WINDOW      = 252
-P2_FORWARD_DAYS     = 15    # Phase 2: direction window
-P2B_FORWARD_DAYS    = 63    # Phase 2B: medium-term direction window (~1 quarter)
-P3_FORWARD_DAYS     = 10    # Phase 3: IV expansion window
+# HV_WINDOW, IV_RANK_WINDOW, P2/P2B/P3 forward days, P2/P3 vol multiples imported from modules.features
 WIN_THRESHOLD       = 0.05  # Default (AMD). Overridden at runtime by compute_vol_thresholds()
 WIN_THRESHOLD_63    = 0.10  # Default (AMD). Overridden at runtime by compute_vol_thresholds()
-P2_VOL_MULTIPLE     = 0.41  # 0.41 sigma bar — practical range: 0.25 (aggressive) to 1.0 (conservative)
 EXPANSION_THRESHOLD = 0.10  # Default (AMD). Overridden at runtime by compute_vol_thresholds()
-P3_VOL_MULTIPLE     = 0.20  # Sets expansion bar at 20% of median HV — practical range: 0.10 to 0.40
 TEST_SIZE           = 0.20
 P2_CALIBRATE        = False  # Decision 1 (S11) reverted as default after NVDA regression (STRONG ENTRY 4.4% → -0.4%). Pass --calibrate to enable.
 P2_THRESHOLD        = 0.55   # Phase 2 (15d) cutoff. Set from P2_CALIBRATE in __main__: 0.50 calibrated / 0.55 raw.
@@ -99,41 +100,16 @@ def load_indicators(path):
 # 2. FEATURE ENGINEERING
 # ─────────────────────────────────────────
 def build_features(df, benchmarks):
-    close = df["Close"]
+    print("Building features...")
+    df = compute_hv_features(df)
 
-    # HV and IV features
-    log_ret = np.log(close / close.shift(1))
-    df["HV_20"] = log_ret.rolling(HV_WINDOW).std() * np.sqrt(252)
-    hv_high = df["HV_20"].rolling(IV_RANK_WINDOW).max()
-    hv_low  = df["HV_20"].rolling(IV_RANK_WINDOW).min()
-    df["IV_rank"]    = (df["HV_20"] - hv_low) / (hv_high - hv_low)
-    df["IV_pct"]     = df["HV_20"].rolling(IV_RANK_WINDOW).apply(
-        lambda x: (x[:-1] < x[-1]).mean(), raw=True
-    )
-    df["HV_chg_5d"]  = df["HV_20"].pct_change(5)
-    df["HV_chg_10d"] = df["HV_20"].pct_change(10)
-    df["HV_vs_ma20"] = df["HV_20"] / df["HV_20"].rolling(20).mean() - 1
-
-    # VIX
-    raw = yf.download("^VIX", start=START_DATE, end=END_DATE, progress=False)
-    raw.columns = raw.columns.get_level_values(0)
-    vix = raw[["Close"]].rename(columns={"Close": "VIX"})
-    vix["VIX_chg_5d"]  = vix["VIX"].pct_change(5)
-    vix["VIX_vs_ma20"] = vix["VIX"] / vix["VIX"].rolling(20).mean() - 1
-    df = df.join(vix, how="left")
-    df[["VIX", "VIX_chg_5d", "VIX_vs_ma20"]] = df[["VIX", "VIX_chg_5d", "VIX_vs_ma20"]].ffill()
-
-    # VIX term structure: near-term vs spot vs 3-month
-    for sym, col in [("^VIX9D", "VIX9D"), ("^VIX3M", "VIX3M")]:
-        r = yf.download(sym, start=START_DATE, end=END_DATE, progress=False)
-        r.columns = r.columns.get_level_values(0)
-        df = df.join(r[["Close"]].rename(columns={"Close": col}), how="left")
-        df[col] = df[col].ffill()
-    df["VIX9D_VIX_ratio"] = (df["VIX9D"] / df["VIX"]).fillna(1.0)
-    df["VIX_VIX3M_ratio"] = (df["VIX"] / df["VIX3M"]).fillna(1.0)
-    df.drop(columns=["VIX9D", "VIX3M"], inplace=True)
+    vix_raw   = yf.download("^VIX",   start=START_DATE, end=END_DATE, progress=False)
+    vix9d_raw = yf.download("^VIX9D", start=START_DATE, end=END_DATE, progress=False)
+    vix3m_raw = yf.download("^VIX3M", start=START_DATE, end=END_DATE, progress=False)
+    df = compute_vix_features(df, vix_raw, vix9d_raw, vix3m_raw)
 
     # Sector/industry benchmark relative strength + sector trend
+    close = df["Close"]
     for bench_ticker, bench_name in benchmarks:
         raw = yf.download(bench_ticker, start=START_DATE, end=END_DATE, progress=False)
         raw.columns = raw.columns.get_level_values(0)
@@ -146,74 +122,26 @@ def build_features(df, benchmarks):
         df[f"{bench_name}_vs_ma200"] = df[col] / df[col].rolling(200).mean() - 1
         df.drop(columns=[col], inplace=True)
 
-    # Macro features (rate-sensitive tickers, etc.)
     macro = detect_macro_features(TICKER)
     df = add_macro_features(df, macro, START_DATE, END_DATE)
 
-    # Earnings proximity
-    ticker = yf.Ticker(TICKER)
-    ed = []
-    try:
-        dates = ticker.get_earnings_dates(limit=20)
-        if dates is not None and len(dates) > 0:
-            idx = pd.DatetimeIndex(dates.index)
-            if idx.tz is not None:
-                idx = idx.tz_convert(None)
-            ed = sorted(idx.normalize().unique())
-    except Exception:
-        pass
-    if ed:
-        def _days_to_next(date):
-            future = [e for e in ed if e >= date]
-            return (future[0] - date).days if future else 90
-        df["Days_to_earnings"] = [_days_to_next(d) for d in df.index]
-    else:
-        df["Days_to_earnings"] = 45
-
+    df = add_earnings_proximity(df, TICKER)
     df = add_catalyst_proximity(df, TICKER, MODULE_DIR, for_direction=True)
-    # Normalize price-level features
-    for period in [20, 50, 200]:
-        col = f"MA_{period}"
-        if col in df.columns:
-            df[f"price_vs_ma{period}"] = close / df[col] - 1
-    df.drop(columns=[c for c in df.columns if c.startswith("MA_")], inplace=True)
+    df = normalize_features(df)
 
-    for period in [8, 21, 89]:
-        col = f"EMA_{period}"
-        if col in df.columns:
-            df[f"price_vs_ema{period}"] = close / df[col] - 1
-    df.drop(columns=[c for c in df.columns if c.startswith("EMA_")], inplace=True)
-
-    for band, label in [("KC_upper", "kc_upper"), ("KC_middle", "kc_mid"), ("KC_lower", "kc_lower")]:
-        if band in df.columns:
-            df[f"price_vs_{label}"] = close / df[band] - 1
-            df.drop(columns=[band], inplace=True)
-
-    for col in ["MACD", "MACD_signal", "MACD_hist"]:
-        if col in df.columns:
-            df[f"{col}_norm"] = df[col] / close
-            df.drop(columns=[col], inplace=True)
-
-    if "OBV" in df.columns:
-        df["OBV_chg_5d"] = df["OBV"].pct_change(5)
-        df.drop(columns=["OBV"], inplace=True)
-
-    # Universal momentum / positioning features (generic for any ticker)
-    df["price_vs_52w_high"] = close / close.rolling(252).max() - 1
-    df["price_vs_52w_low"]  = close / close.rolling(252).min() - 1
-    df["vol_ratio"]         = df["Volume"] / df["Volume"].rolling(20).mean()
-
-    print("Features built.\n")
     return df
 
 
 # ─────────────────────────────────────────
 # 3. TRAIN MODELS
 # ─────────────────────────────────────────
-def train(df, target_col, calibrate=False, use_iv_features=False):
+def train(df, target_col, calibrate=False, use_iv_features=False, decision_threshold=0.50):
     # use_iv_features=True: include IV_FEATURE_COLS as features (Phase 3 only when --iv-features);
     #   dropna() auto-limits training to the ~2yr backfilled window.
     # default: exclude all IV_COLS so full price history is used.
+    # decision_threshold: probability cutoff used for precision reporting — must match the
+    # production threshold for the phase (P2/P2B/P3) so the printed precision reflects the
+    # signal that will actually fire.
     exclude = {"Open", "High", "Low", "Close", "Volume", target_col,
                *(IV_META_COLS if use_iv_features else IV_COLS)}
     feature_cols = [c for c in df.columns if c not in exclude]
@@ -248,8 +176,10 @@ def train(df, target_col, calibrate=False, use_iv_features=False):
                                  max_iter=1000, random_state=RANDOM_STATE)
         clf.fit(X_train_s, y_train)
 
-    train_prec = precision_score(y_train, clf.predict(X_train_s), zero_division=0)
-    test_prec  = precision_score(y_test,  clf.predict(X_test_s),  zero_division=0)
+    y_pred_train = (clf.predict_proba(X_train_s)[:, 1] >= decision_threshold).astype(int)
+    y_pred_test  = (clf.predict_proba(X_test_s)[:, 1]  >= decision_threshold).astype(int)
+    train_prec = precision_score(y_train, y_pred_train, zero_division=0)
+    test_prec  = precision_score(y_test,  y_pred_test,  zero_division=0)
     base_rate  = y_train.mean()
 
     return clf, scaler, feature_cols, train_prec, test_prec, base_rate
@@ -440,36 +370,6 @@ def print_combined_signal(df_full, direction_prob, dir_prob_63, expansion_prob,
 
 
 # ─────────────────────────────────────────
-# VOL-ADJUSTED THRESHOLDS
-# ─────────────────────────────────────────
-def compute_vol_thresholds(df):
-    global WIN_THRESHOLD, WIN_THRESHOLD_63, EXPANSION_THRESHOLD
-    log_ret   = np.log(df["Close"] / df["Close"].shift(1))
-    hv_series = log_ret.rolling(HV_WINDOW).std() * np.sqrt(252)
-    hv_valid  = hv_series.dropna()
-
-    print("\nVol-Adjusted Threshold Calibration")
-    print("─" * 42)
-    if len(hv_valid) < 20 or hv_valid.median() < 0.05:
-        print("  WARNING: Insufficient/invalid HV data — using AMD defaults.")
-        print("─" * 42)
-        return
-
-    median_hv     = hv_valid.median()
-    new_win       = P2_VOL_MULTIPLE * median_hv * np.sqrt(P2_FORWARD_DAYS / 252)
-    new_win_63    = P2_VOL_MULTIPLE * median_hv * np.sqrt(P2B_FORWARD_DAYS / 252)
-    new_expansion = P3_VOL_MULTIPLE * median_hv
-    print(f"  Ticker median HV (20-day, annualized): {median_hv:.1%}")
-    print(f"  WIN_THRESHOLD:       0.05 (AMD default)  ->  {new_win:.1%}  [computed]")
-    print(f"  WIN_THRESHOLD_63:    0.10 (AMD default)  ->  {new_win_63:.1%}  [computed]")
-    print(f"  EXPANSION_THRESHOLD: 0.10 (AMD default)  ->  {new_expansion:.1%}  [computed]")
-    print("─" * 42)
-    WIN_THRESHOLD       = new_win
-    WIN_THRESHOLD_63    = new_win_63
-    EXPANSION_THRESHOLD = new_expansion
-
-
-# ─────────────────────────────────────────
 # MAIN
 # ─────────────────────────────────────────
 if __name__ == "__main__":
@@ -508,7 +408,7 @@ if __name__ == "__main__":
             sys.exit(0)
 
     df = load_indicators(INDICATORS_CSV)
-    compute_vol_thresholds(df)
+    WIN_THRESHOLD, WIN_THRESHOLD_63, EXPANSION_THRESHOLD = compute_vol_thresholds(df)
 
     print(f"  Detecting benchmarks for {TICKER}...")
     benchmarks = detect_benchmarks(TICKER)
@@ -527,7 +427,7 @@ if __name__ == "__main__":
     future_close = df_p2["Close"].shift(-P2_FORWARD_DAYS)
     df_p2["direction_target"] = ((future_close / df_p2["Close"] - 1) >= WIN_THRESHOLD).astype(int)
     df_p2 = df_p2.iloc[:-P2_FORWARD_DAYS]
-    clf2, scaler2, fcols2, tr2, te2, base2 = train(df_p2, "direction_target", calibrate=P2_CALIBRATE)
+    clf2, scaler2, fcols2, tr2, te2, base2 = train(df_p2, "direction_target", calibrate=P2_CALIBRATE, decision_threshold=P2_THRESHOLD)
     print(f"Phase 2  (15d direction, {'calibrated' if P2_CALIBRATE else 'raw'}) — train precision: {tr2:.1%}  test precision: {te2:.1%}  base rate: {base2:.1%}")
 
     # Phase 2B — 63-day direction target
@@ -535,7 +435,7 @@ if __name__ == "__main__":
     future_close_63 = df_p2b["Close"].shift(-P2B_FORWARD_DAYS)
     df_p2b["direction_target_63"] = ((future_close_63 / df_p2b["Close"] - 1) >= WIN_THRESHOLD_63).astype(int)
     df_p2b = df_p2b.iloc[:-P2B_FORWARD_DAYS]
-    clf2b, scaler2b, fcols2b, tr2b, te2b, base2b = train(df_p2b, "direction_target_63")
+    clf2b, scaler2b, fcols2b, tr2b, te2b, base2b = train(df_p2b, "direction_target_63", decision_threshold=P2B_THRESHOLD)
     print(f"Phase 2B (63d direction) — train precision: {tr2b:.1%}  test precision: {te2b:.1%}  base rate: {base2b:.1%}")
 
     # Phase 3 — IV expansion target
@@ -543,7 +443,7 @@ if __name__ == "__main__":
     future_hv = df_p3["HV_20"].shift(-P3_FORWARD_DAYS)
     df_p3["iv_target"] = ((future_hv / df_p3["HV_20"] - 1) >= EXPANSION_THRESHOLD).astype(int)
     df_p3 = df_p3.iloc[:-P3_FORWARD_DAYS]
-    clf3, scaler3, fcols3, tr3, te3, base3 = train(df_p3, "iv_target", use_iv_features=IV_FEATURES)
+    clf3, scaler3, fcols3, tr3, te3, base3 = train(df_p3, "iv_target", use_iv_features=IV_FEATURES, decision_threshold=P3_THRESHOLD)
     print(f"Phase 3  (IV timing)     — train precision: {tr3:.1%}  test precision: {te3:.1%}  base rate: {base3:.1%}\n")
 
     # Current signals
