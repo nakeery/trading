@@ -32,6 +32,7 @@ from modules.massive import IV_COLS, IV_META_COLS, IV_FEATURE_COLS
 from modules.features import (
     HV_WINDOW, IV_RANK_WINDOW,
     P2_FORWARD_DAYS, P2B_FORWARD_DAYS, P3_FORWARD_DAYS,
+    P2_VOL_MULTIPLE, P2B_VOL_MULTIPLE, P3_VOL_MULTIPLE,
     compute_hv_features, compute_vix_features,
     add_earnings_proximity, normalize_features, compute_vol_thresholds,
     impute_iv_features,
@@ -51,9 +52,8 @@ MODULE_DIR     = "modules"
 # imported from modules.features
 WIN_THRESHOLD       = 0.05  # Default (AMD). Set by compute_vol_thresholds() in __main__
 WIN_THRESHOLD_63    = 0.10  # Default (AMD). Set by compute_vol_thresholds() in __main__
-P2_VOL_MULTIPLE     = 0.41  # 0.41 sigma bar — practical range: 0.25 (aggressive) to 1.0 (conservative)
 EXPANSION_THRESHOLD = 0.10  # Default (AMD). Set by compute_vol_thresholds() in __main__
-P3_VOL_MULTIPLE     = 0.20  # Sets expansion bar at 20% of median HV — practical range: 0.10 to 0.40
+# P2_VOL_MULTIPLE, P2B_VOL_MULTIPLE, P3_VOL_MULTIPLE imported from modules.features
 P2_CALIBRATE        = False  # Decision 1 (S11) reverted as default after NVDA regression (STRONG ENTRY 4.4% → -0.4%). Pass --calibrate to enable.
 P2_THRESHOLD        = 0.55   # Phase 2 (15d) cutoff. Set from P2_CALIBRATE in __main__: 0.50 calibrated / 0.55 raw.
 P2B_THRESHOLD       = 0.55  # Phase 2B (63d) raw cutoff — calibration deferred to Decision 2
@@ -67,8 +67,8 @@ IV_FEATURES = False  # set by --iv-features CLI arg; when True, Phase 3 uses IV_
 MIN_TRAIN_DAYS = 252   # ~1 year minimum training window
 STEP_DAYS      = 126   # ~6 months between retrains
 
-# Multiplier sweep — list of (P2_VOL_MULTIPLE, P3_VOL_MULTIPLE) tuples.
-# Empty list = single run with the production constants above (default behavior).
+# Multiplier sweep — list of (P2_VOL_MULTIPLE, P2B_VOL_MULTIPLE, P3_VOL_MULTIPLE) tuples.
+# Empty list = single run with the production constants from modules.features (default behavior).
 # When non-empty, runs the full walk-forward backtest for each combination,
 # then prints a comparison table identifying the best by STRONG ENTRY avg return.
 # Features are built once and reused; only target labels and model fits vary per run.
@@ -237,7 +237,7 @@ def run_backtest(df_full):
         df_train = df_full.iloc[:train_end].copy()
         WIN_THRESHOLD, WIN_THRESHOLD_63, EXPANSION_THRESHOLD = compute_vol_thresholds(
             df_train, verbose=False,
-            p2_vol_multiple=P2_VOL_MULTIPLE, p3_vol_multiple=P3_VOL_MULTIPLE,
+            p2_vol_multiple=P2_VOL_MULTIPLE, p2b_vol_multiple=P2B_VOL_MULTIPLE, p3_vol_multiple=P3_VOL_MULTIPLE,
         )
 
         # Phase 2 — 15-day direction target (mode set via CLI flag — see banner)
@@ -480,14 +480,14 @@ def collect_signal_stats(results):
 def print_sweep_summary(sweep_results, ticker):
     """Compare multiplier combinations side-by-side; flag the best by STRONG ENTRY avg return."""
     print()
-    print("=" * 92)
+    print("=" * 98)
     print(f"  MULTIPLIER SWEEP SUMMARY — {ticker}  ({len(sweep_results)} combinations)")
-    print("=" * 92)
-    print(f"  {'P2':>5} {'P3':>5}  {'STRONG':<22}  {'CAUTION':<19}  "
+    print("=" * 98)
+    print(f"  {'P2':>5} {'P2B':>5} {'P3':>5}  {'STRONG':<22}  {'CAUTION':<19}  "
           f"{'SHORT':<19}  {'STAY':<13}  {'Hierarchy':>10}")
-    print(f"  {'mult':>5} {'mult':>5}  {'cnt   avg     win%':<22}  "
+    print(f"  {'mult':>5} {'mult':>5} {'mult':>5}  {'cnt   avg     win%':<22}  "
           f"{'cnt   avg':<19}  {'cnt   avg':<19}  {'cnt   avg':<13}  {'monotonic?':>10}")
-    print("-" * 92)
+    print("-" * 98)
 
     rows = []
     for r in sweep_results:
@@ -506,7 +506,7 @@ def print_sweep_summary(sweep_results, ticker):
             if not (np.isnan(avgs[j]) or np.isnan(avgs[j + 1]))
         ))
         rows.append({
-            "p2": r["p2"], "p3": r["p3"],
+            "p2": r["p2"], "p2b": r["p2b"], "p3": r["p3"],
             "strong_avg":  strong["avg_return"],
             "strong_cnt":  strong["count"],
             "hierarchy":   hierarchy_clean,
@@ -516,14 +516,14 @@ def print_sweep_summary(sweep_results, ticker):
     # Sort by STRONG ENTRY avg return descending
     rows.sort(key=lambda x: x["strong_avg"] if not np.isnan(x["strong_avg"]) else -1,
               reverse=True)
-    best_p2_p3 = (rows[0]["p2"], rows[0]["p3"])
+    best = (rows[0]["p2"], rows[0]["p2b"], rows[0]["p3"])
 
     for r in rows:
         s = r["stats"]
-        marker = "  <-- best" if (r["p2"], r["p3"]) == best_p2_p3 else ""
+        marker = "  <-- best" if (r["p2"], r["p2b"], r["p3"]) == best else ""
         hier   = "Y" if r["hierarchy"] else "N"
         line = (
-            f"  {r['p2']:>5.2f} {r['p3']:>5.2f}  "
+            f"  {r['p2']:>5.2f} {r['p2b']:>5.2f} {r['p3']:>5.2f}  "
             f"{s['STRONG ENTRY']['count']:>4} {s['STRONG ENTRY']['avg_return']:>+6.1%} "
             f"{s['STRONG ENTRY']['win_rate']:>6.0%}  "
             f"{s['CAUTION']['count']:>4} {s['CAUTION']['avg_return']:>+6.1%}      "
@@ -532,10 +532,10 @@ def print_sweep_summary(sweep_results, ticker):
             f"{hier:>10}{marker}"
         )
         print(line)
-    print("=" * 92)
-    print(f"\n  Best by STRONG ENTRY avg return: P2={best_p2_p3[0]}, P3={best_p2_p3[1]}")
+    print("=" * 98)
+    print(f"\n  Best by STRONG ENTRY avg return: P2={best[0]}, P2B={best[1]}, P3={best[2]}")
     print(f"  Hierarchy column flags whether STRONG > CAUTION > SHORT-TERM > STAY OUT (Y/N).")
-    print(f"  Production values: P2=0.41, P3=0.20.")
+    print(f"  Production values: P2={P2_VOL_MULTIPLE}, P2B={P2B_VOL_MULTIPLE}, P3={P3_VOL_MULTIPLE}.")
 
 
 # ─────────────────────────────────────────
@@ -578,7 +578,7 @@ if __name__ == "__main__":
 
     df = load_indicators(INDICATORS_CSV)
     WIN_THRESHOLD, WIN_THRESHOLD_63, EXPANSION_THRESHOLD = compute_vol_thresholds(
-        df, p2_vol_multiple=P2_VOL_MULTIPLE, p3_vol_multiple=P3_VOL_MULTIPLE,
+        df, p2_vol_multiple=P2_VOL_MULTIPLE, p2b_vol_multiple=P2B_VOL_MULTIPLE, p3_vol_multiple=P3_VOL_MULTIPLE,
     )
 
     print(f"  Detecting benchmarks for {TICKER}...")
@@ -604,19 +604,16 @@ if __name__ == "__main__":
         # Sweep mode: rerun walk-forward for each (p2, p3) combo, compare summaries.
         print(f"\n*** MULTIPLIER SWEEP MODE — {len(MULTIPLIER_SWEEP)} combinations ***\n")
         sweep_results = []
-        for i, (p2_mult, p3_mult) in enumerate(MULTIPLIER_SWEEP, 1):
-            print(f"\n[{i}/{len(MULTIPLIER_SWEEP)}] P2_VOL_MULTIPLE={p2_mult}, "
-                  f"P3_VOL_MULTIPLE={p3_mult}")
+        for i, (p2_mult, p2b_mult, p3_mult) in enumerate(MULTIPLIER_SWEEP, 1):
+            print(f"\n[{i}/{len(MULTIPLIER_SWEEP)}] P2={p2_mult}, P2B={p2b_mult}, P3={p3_mult}")
             print("─" * 60)
-            P2_VOL_MULTIPLE = p2_mult
-            P3_VOL_MULTIPLE = p3_mult
             WIN_THRESHOLD, WIN_THRESHOLD_63, EXPANSION_THRESHOLD = compute_vol_thresholds(
                 df, verbose=True,
-                p2_vol_multiple=p2_mult, p3_vol_multiple=p3_mult,
+                p2_vol_multiple=p2_mult, p2b_vol_multiple=p2b_mult, p3_vol_multiple=p3_mult,
             )
             results = run_backtest(df_full)
             stats   = collect_signal_stats(results)
-            sweep_results.append({"p2": p2_mult, "p3": p3_mult,
+            sweep_results.append({"p2": p2_mult, "p2b": p2b_mult, "p3": p3_mult,
                                   "stats": stats, "results": results})
             print(f"  STRONG ENTRY: {stats['STRONG ENTRY']['count']} signals, "
                   f"avg {stats['STRONG ENTRY']['avg_return']:+.1%}, "
@@ -630,6 +627,7 @@ if __name__ == "__main__":
             for sig, s in r["stats"].items():
                 sweep_rows.append({
                     "p2_mult":    r["p2"],
+                    "p2b_mult":   r["p2b"],
                     "p3_mult":    r["p3"],
                     "signal":     sig,
                     "count":      s["count"],

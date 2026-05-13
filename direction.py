@@ -32,7 +32,7 @@ from modules.massive import IV_COLS
 from modules.features import (
     HV_WINDOW, IV_RANK_WINDOW,
     P2_FORWARD_DAYS, P2B_FORWARD_DAYS, P2_VOL_MULTIPLE,
-    compute_hv_features, compute_vix_features,
+    compute_hv_features, compute_vix_features, add_vix, add_benchmarks,
     add_earnings_proximity, normalize_features, compute_vol_thresholds,
 )
 
@@ -51,7 +51,6 @@ MODULE_DIR     = "modules"
 WIN_THRESHOLD    = 0.05  # Default (AMD). Set by compute_vol_thresholds() in __main__
 WIN_THRESHOLD_63 = 0.10  # Default (AMD). Set by compute_vol_thresholds() in __main__
 TEST_SIZE      = 0.20   # Fraction of data held out as test set (time-based)
-N_ESTIMATORS       = 200    # Random forest trees (legacy constant, unused)
 DECISION_THRESHOLD = 0.55   # Probability cutoff for predicting Win (lower = more wins predicted)
 RANDOM_STATE       = 42
 
@@ -86,31 +85,6 @@ def load_indicators(path):
 def add_hv(df):
     df = compute_hv_features(df)
     print("  \u2713 HV_20, IV_rank, IV_pct, HV_chg_5d, HV_chg_10d, HV_vs_ma20")
-    return df
-
-
-def add_vix(df):
-    vix_raw   = yf.download("^VIX",   start=START_DATE, end=END_DATE, progress=False)
-    vix9d_raw = yf.download("^VIX9D", start=START_DATE, end=END_DATE, progress=False)
-    vix3m_raw = yf.download("^VIX3M", start=START_DATE, end=END_DATE, progress=False)
-    df = compute_vix_features(df, vix_raw, vix9d_raw, vix3m_raw)
-    print("  \u2713 VIX, VIX_chg_5d, VIX_vs_ma20, VIX9D_VIX_ratio, VIX_VIX3M_ratio")
-    return df
-
-
-def add_benchmarks(df, benchmarks):
-    for bench_ticker, bench_name in benchmarks:
-        raw = yf.download(bench_ticker, start=START_DATE, end=END_DATE, progress=False)
-        raw.columns = raw.columns.get_level_values(0)
-        col = f"_BENCH_{bench_name}"
-        bench = raw[["Close"]].rename(columns={"Close": col})
-        df = df.join(bench, how="left")
-        df[col] = df[col].ffill()
-        for window in [5, 20]:
-            df[f"{bench_name}_RS_{window}d"] = df["Close"].pct_change(window) - df[col].pct_change(window)
-        df[f"{bench_name}_vs_ma200"] = df[col] / df[col].rolling(200).mean() - 1
-        df.drop(columns=[col], inplace=True)
-        print(f"  ✓ {bench_name}_RS_5d, {bench_name}_RS_20d, {bench_name}_vs_ma200")
     return df
 
 
@@ -381,8 +355,8 @@ if __name__ == "__main__":
 
     print("Building features...")
     df = add_hv(df)
-    df = add_vix(df)
-    df = add_benchmarks(df, benchmarks)
+    df = add_vix(df, START_DATE, END_DATE)
+    df = add_benchmarks(df, benchmarks, START_DATE, END_DATE)
     macro = detect_macro_features(TICKER)
     if macro:
         print("  Macro features:")

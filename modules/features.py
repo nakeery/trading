@@ -1,12 +1,12 @@
 """
-Shared feature engineering — direction.py, volatility.py, backtest.py.
+Shared feature engineering — direction.py, volatility.py, entry.py, backtest.py.
 
 Import pattern:
     from modules.features import (
         HV_WINDOW, IV_RANK_WINDOW,
         P2_FORWARD_DAYS, P2B_FORWARD_DAYS, P3_FORWARD_DAYS,
         P2_VOL_MULTIPLE, P3_VOL_MULTIPLE,
-        compute_hv_features, compute_vix_features,
+        compute_hv_features, compute_vix_features, add_vix, add_benchmarks,
         add_earnings_proximity, normalize_features, compute_vol_thresholds,
     )
 """
@@ -24,6 +24,7 @@ P2B_FORWARD_DAYS = 63    # Phase 2B direction window (~1 quarter, LEAPS-aligned)
 P3_FORWARD_DAYS  = 10    # Phase 3 IV expansion window
 
 P2_VOL_MULTIPLE  = 0.41  # 0.41-sigma bar; range 0.25 (aggressive) to 1.0 (conservative)
+P2B_VOL_MULTIPLE = 0.55  # 63d bar — higher than P2 to offset secular drift inflating QQQ base rate; tune via backtest
 P3_VOL_MULTIPLE  = 0.20  # 20% of median HV; range 0.10 to 0.40
 
 
@@ -147,6 +148,7 @@ def normalize_features(df):
 
 def compute_vol_thresholds(df, verbose=True,
                             p2_vol_multiple=P2_VOL_MULTIPLE,
+                            p2b_vol_multiple=P2B_VOL_MULTIPLE,
                             p3_vol_multiple=P3_VOL_MULTIPLE,
                             hv_window=HV_WINDOW,
                             p2_forward_days=P2_FORWARD_DAYS,
@@ -171,19 +173,46 @@ def compute_vol_thresholds(df, verbose=True,
         return AMD_DEFAULTS
 
     median_hv           = hv_valid.median()
-    win_threshold       = p2_vol_multiple * median_hv * np.sqrt(p2_forward_days / 252)
-    win_threshold_63    = p2_vol_multiple * median_hv * np.sqrt(p2b_forward_days / 252)
-    expansion_threshold = p3_vol_multiple * median_hv
+    win_threshold       = p2_vol_multiple  * median_hv * np.sqrt(p2_forward_days / 252)
+    win_threshold_63    = p2b_vol_multiple * median_hv * np.sqrt(p2b_forward_days / 252)
+    expansion_threshold = p3_vol_multiple  * median_hv
 
     if verbose:
         print(f"  Ticker median HV (20-day, annualized): {median_hv:.1%}")
-        print(f"  P2_VOL_MULTIPLE = {p2_vol_multiple}  |  P3_VOL_MULTIPLE = {p3_vol_multiple}")
+        print(f"  P2_VOL_MULTIPLE = {p2_vol_multiple}  |  P2B_VOL_MULTIPLE = {p2b_vol_multiple}  |  P3_VOL_MULTIPLE = {p3_vol_multiple}")
         print(f"  WIN_THRESHOLD:       {win_threshold:.2%}")
         print(f"  WIN_THRESHOLD_63:    {win_threshold_63:.2%}")
         print(f"  EXPANSION_THRESHOLD: {expansion_threshold:.2%}")
         print("─" * 42)
 
     return win_threshold, win_threshold_63, expansion_threshold
+
+
+def add_vix(df, start_date, end_date):
+    """Download VIX/VIX9D/VIX3M and compute all VIX feature columns."""
+    vix_raw   = yf.download("^VIX",   start=start_date, end=end_date, progress=False)
+    vix9d_raw = yf.download("^VIX9D", start=start_date, end=end_date, progress=False)
+    vix3m_raw = yf.download("^VIX3M", start=start_date, end=end_date, progress=False)
+    df = compute_vix_features(df, vix_raw, vix9d_raw, vix3m_raw)
+    print("  ✓ VIX, VIX_chg_5d, VIX_vs_ma20, VIX9D_VIX_ratio, VIX_VIX3M_ratio")
+    return df
+
+
+def add_benchmarks(df, benchmarks, start_date, end_date):
+    """Download benchmark tickers and add relative strength + trend features."""
+    for bench_ticker, bench_name in benchmarks:
+        raw = yf.download(bench_ticker, start=start_date, end=end_date, progress=False)
+        raw.columns = raw.columns.get_level_values(0)
+        col = f"_BENCH_{bench_name}"
+        bench = raw[["Close"]].rename(columns={"Close": col})
+        df = df.join(bench, how="left")
+        df[col] = df[col].ffill()
+        for window in [5, 20]:
+            df[f"{bench_name}_RS_{window}d"] = df["Close"].pct_change(window) - df[col].pct_change(window)
+        df[f"{bench_name}_vs_ma200"] = df[col] / df[col].rolling(200).mean() - 1
+        df.drop(columns=[col], inplace=True)
+        print(f"  ✓ {bench_name}_RS_5d, {bench_name}_RS_20d, {bench_name}_vs_ma200")
+    return df
 
 
 def impute_iv_features(df):

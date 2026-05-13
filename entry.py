@@ -357,6 +357,19 @@ def print_combined_signal(df_full, direction_prob, dir_prob_63, expansion_prob,
     else:
         print(f"\n  OPTIONS-MARKET CHECK: skipped (IV not in indicators CSV)")
 
+    # ── Market stress warning: Phase 3 CONTRACTION but options market signals near-term risk ──
+    stress_tells = []
+    if not exp_signal and iv_info is not None:
+        if iv_info.get("term") is not None and iv_info["term"] >= 1.05:
+            stress_tells.append(f"term structure {iv_info['term']:.2f} (backwardation)")
+        if iv_info["ratio"] >= IV_HV_GATE_RICH:
+            stress_tells.append(f"IV/HV {iv_info['ratio']:.2f} (very rich)")
+    if stress_tells:
+        print(f"\n  WARNING: Phase 3 CONTRACTION under market stress")
+        print(f"  Tells:              {', '.join(stress_tells)}")
+        print(f"  Options market may be pricing near-term risk not visible in price history.")
+        print(f"  Treat contraction sizing with extra conservatism.")
+
     print(f"\n  {'─'*w}")
     if gate_msg:
         print(f"  SIGNAL:             {signal_pre_gate} -> {signal}  ({gate_msg})")

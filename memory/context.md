@@ -50,10 +50,13 @@ split, RANDOM_STATE=42.
   Phase 3  (IV expansion)   threshold 0.60  — sizing modulation
 
 Vol-adjusted thresholds (compute_vol_thresholds in modules/features.py):
-  WIN_THRESHOLD       = 0.41 × median_HV × sqrt(15/252)
-  WIN_THRESHOLD_63    = 0.41 × median_HV × sqrt(63/252)
-  EXPANSION_THRESHOLD = 0.20 × median_HV
+  WIN_THRESHOLD       = 0.41 × median_HV × sqrt(15/252)   [P2_VOL_MULTIPLE=0.41]
+  WIN_THRESHOLD_63    = 0.55 × median_HV × sqrt(63/252)   [P2B_VOL_MULTIPLE=0.55]
+  EXPANSION_THRESHOLD = 0.20 × median_HV                  [P3_VOL_MULTIPLE=0.20]
   Falls back to AMD defaults (0.05/0.10/0.10) if HV data insufficient.
+  P2B uses a higher multiple than P2 to offset secular drift inflating the 63d
+  base rate on index ETFs (QQQ at 0.41 → ~70% win rate, nearly no losers to
+  learn from). Validated on QQQ; needs NVDA co-validation before permanent default.
 
 Calibration: RAW is production default. Isotonic calibration tested in S11 —
 helped indices marginally, destroyed individual-stock edge (NVDA STRONG ENTRY
@@ -68,21 +71,23 @@ rows. Validated on QQQ (75.0% expansion precision, +0.8pp over HV proxy).
 Current Backtest Baselines
 --------------------------
 
-QQQ (53 windows, 2001-2026, post-S15) — framework reference baseline
+QQQ (53 windows, 2001-2026, post-S17) — framework reference baseline
+  P2_VOL_MULTIPLE=0.41, P2B_VOL_MULTIPLE=0.55, P3_VOL_MULTIPLE=0.20
+  WIN_THRESHOLD 1.82%, WIN_THRESHOLD_63 5.00%, EXPANSION_THRESHOLD 3.64%
   Signal           Count   Avg    Win%   AvgWin  AvgLoss
-  STRONG ENTRY       586   1.9%   63.3%   5.5%   -4.2%   ← best 15d
-  CAUTION           1333   1.2%   62.4%   4.5%   -4.3%
-  SHORT-TERM ONLY    514   0.2%   57.6%   3.9%   -4.8%
-  LEAPS ONLY         817   0.8%   63.0%   3.7%   -4.0%
-  STAY OUT          3066   0.6%   61.1%   3.4%   -3.9%
+  STRONG ENTRY       574   1.9%   63.2%   5.6%   -4.4%   ← best 15d
+  CAUTION           1308   1.2%   62.4%   4.6%   -4.4%
+  SHORT-TERM ONLY    551   0.4%   58.1%   3.9%   -4.5%
+  LEAPS ONLY         799   0.7%   62.2%   3.8%   -4.3%
+  STAY OUT          3084   0.6%   61.3%   3.4%   -3.8%
 
-QQQ 6-month forward returns (added in S15 for DTE selection):
-  STRONG ENTRY    +10.6%  77.3%  ← only signal with edge on BOTH 15d + 6mo
-  SHORT-TERM       +7.4%  81.2%  (highest 6mo win, but lack of near-term catalyst
-                                   is the point — not a LEAPS validation)
-  CAUTION          +6.7%  70.0%  ≈ STAY OUT (Phase 3 doesn't discriminate at index)
-  STAY OUT         +6.7%  77.3%  (secular QQQ bid)
-  LEAPS ONLY       +6.4%  70.6%  ← below ALL DAYS (7.0%) — informational only
+QQQ 6-month forward returns (post-S17):
+  STRONG ENTRY    +10.9%  77.6%  ← only signal with edge on BOTH 15d + 6mo
+  LEAPS ONLY       +7.5%  72.0%  ← now above ALL DAYS (7.0%) — real edge at 6mo horizon
+  SHORT-TERM       +7.3%  81.5%  (high win rate but no 63d confirmation — not LEAPS validation)
+  CAUTION          +6.6%  69.5%  ≈ STAY OUT (Phase 3 doesn't discriminate at index)
+  STAY OUT         +6.4%  76.9%  (secular QQQ bid)
+  ALL DAYS         +7.0%  75.2%
 
 AMD (91 windows, 2000-2026, post-S13 — pre-S15 LEAPS reclassification)
   STRONG ENTRY      377   3.9%   57.0%  13.0%   -8.3%   ← best (only signal worth trading)
@@ -274,13 +279,10 @@ Active TODO
 - Complete AAPL backfill (180 rows from interrupted run)
 - After NVDA/AAPL backfill: retrain Phase 3 with --iv-features and compare
   edge vs HV proxy per ticker
-- Refactor add_vix() and add_benchmarks() out of direction.py / volatility.py
-  into modules/features.py (S14/S16 finishing work — ~30 LOC each, duplicated)
+- Re-run AMD and NVDA backtests with P2B_VOL_MULTIPLE=0.55 (current tables
+  are pre-S17; co-validate new multiple before treating 0.55 as permanent default)
 - Restore MASSIVE_API_KEY env-var-only pattern (currently HARDCODED in
   modules/massive.py:16 — security regression). Rotate the key as part of fix.
-- Delete diag/_diag_*.py files (workspace clutter; flagged for removal in S12)
-- Re-run AMD and NVDA backtests to capture LEAPS ONLY tier reclassification
-  (current tables are pre-S15 baselines)
 
 Backlog (prioritized by leverage)
 - Exit-signal model (sibling to Phase 2/2B/3 — currently entry-only)
@@ -310,12 +312,6 @@ Known Issues
   env-var pattern + rotate key.
 - modules/tradier.py: TRADIER_TOKEN reads $env:TRADIER_TOKEN if set, else
   hardcoded fallback. Set the env var to keep token out of git.
-- direction.py: dead `N_ESTIMATORS = 200` constant (Random Forest leftover)
-- direction.py + volatility.py: still have inline add_vix() and
-  add_benchmarks() wrappers (~30 LOC each, duplicated). S14/S16 refactor
-  incomplete.
-- indicators.py: unused `import mdates`
-- diag/_diag_*.py: 6 diagnostic files; flagged for removal in S12, never deleted
 
 ────────────────────────────────────────────────────────────────────────
 
@@ -362,6 +358,35 @@ Tradier Config (modules/tradier.py + sizing.py)
 
 Recent Session Log
 ------------------
+
+S17 (2026-05-13) — Code Cleanup + Market Stress Warning + P2B Multiple
+1. Code cleanup completed:
+   - Deleted 7 diag/_diag_*.py files (flagged since S12)
+   - Removed dead N_ESTIMATORS=200 constant from direction.py
+   - Removed unused `import matplotlib.dates as mdates` from indicators.py
+   - Completed S14/S16 refactor: add_vix(df, start_date, end_date) and
+     add_benchmarks(df, benchmarks, start_date, end_date) moved from inline
+     copies in direction.py/volatility.py into modules/features.py. Call sites
+     updated to pass START_DATE/END_DATE explicitly.
+   - backtest.py now imports P2_VOL_MULTIPLE, P2B_VOL_MULTIPLE, P3_VOL_MULTIPLE
+     from modules.features (single source of truth). Local copies removed.
+     Dead reassignments inside sweep loop removed.
+2. Market stress warning added to entry.py (display-only, no logic change):
+   - Fires when Phase 3 = CONTRACTION and options market signals near-term risk
+   - Triggers on term_structure >= 1.05 (backwardation) OR IV/HV >= 1.40
+   - Prints tells and advisory under OPTIONS-MARKET CHECK section
+   - Threshold rationale: 1.05 is the existing framework stress level; 1.02
+     (slight backwardation) rejected as too noisy
+3. P2B_VOL_MULTIPLE = 0.55 added as separate constant from P2_VOL_MULTIPLE = 0.41:
+   - Rationale: 63d bar uses same sqrt(T) scaling as 15d but ignores secular
+     drift — for QQQ the drift makes the 63d bar too easy to clear (~2.9%),
+     producing ~70% base rate and near-zero discriminative power at low thresholds
+   - 0.55 raises QQQ 63d bar to 5.0% (from 2.9%), creating more balanced classes
+   - MULTIPLIER_SWEEP updated to 3-tuples: (P2_mult, P2B_mult, P3_mult)
+4. QQQ backtest validation (53 windows, P2B=0.55):
+   - STRONG ENTRY: 1.9% / 63.2% — no regression vs pre-S17 baseline
+   - LEAPS ONLY 6-month: 6.4% → 7.5% (now above ALL DAYS 7.0% — first time)
+   - P2B=0.55 validated on QQQ; needs co-validation on NVDA before permanent default
 
 S16 (2026-05-12/05-13) — Pipeline Verification + entry.py Refactor + Today-Row Fix
 1. Full QQQ pipeline verification uncovered three issues:

@@ -31,8 +31,8 @@ from modules.benchmarks import detect_macro_features, add_macro_features, add_ca
 from modules.massive import IV_COLS, IV_META_COLS, IV_FEATURE_COLS
 from modules.features import (
     HV_WINDOW, IV_RANK_WINDOW, P3_FORWARD_DAYS, P3_VOL_MULTIPLE,
-    compute_hv_features, compute_vix_features, add_earnings_proximity,
-    normalize_features, compute_vol_thresholds, impute_iv_features,
+    compute_hv_features, compute_vix_features, add_vix,
+    add_earnings_proximity, normalize_features, compute_vol_thresholds, impute_iv_features,
 )
 
 # ─────────────────────────────────────────
@@ -87,18 +87,7 @@ def add_iv_features(df):
     return df
 
 
-# ─────────────────────────────────────────
-# 3. VIX FEATURES
-# ─────────────────────────────────────────
-def add_vix(df):
-    vix_raw   = yf.download("^VIX",   start=START_DATE, end=END_DATE, progress=False)
-    vix9d_raw = yf.download("^VIX9D", start=START_DATE, end=END_DATE, progress=False)
-    vix3m_raw = yf.download("^VIX3M", start=START_DATE, end=END_DATE, progress=False)
-    df = compute_vix_features(df, vix_raw, vix9d_raw, vix3m_raw)
-    print("  ✓ VIX, VIX_chg_5d, VIX_vs_ma20, VIX9D_VIX_ratio, VIX_VIX3M_ratio")
-    return df
-
-
+# add_vix imported from modules.features (call: add_vix(df, START_DATE, END_DATE))
 # add_earnings_proximity imported from modules.features (call: add_earnings_proximity(df, TICKER))
 # normalize_features  imported from modules.features
 
@@ -395,7 +384,7 @@ if __name__ == "__main__":
 
     print("Building features...")
     df = add_iv_features(df)
-    df = add_vix(df)
+    df = add_vix(df, START_DATE, END_DATE)
     macro = detect_macro_features(TICKER)
     if macro:
         print("  Macro features:")

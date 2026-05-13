@@ -23,7 +23,6 @@ import yfinance as yf
 import pandas as pd
 import ta
 import matplotlib.pyplot as plt
-import matplotlib.dates as mdates
 from matplotlib.gridspec import GridSpec
 
 from modules.massive import IV_COLS, get_chain_summary
