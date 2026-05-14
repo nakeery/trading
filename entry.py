@@ -141,7 +141,8 @@ def build_features(df, benchmarks):
 # 3. TRAIN MODELS
 # ─────────────────────────────────────────
 def train(df, target_col, calibrate=False, use_iv_features=False, decision_threshold=0.50):
-    # use_iv_features=True: include IV_FEATURE_COLS as features (Phase 3 only when --iv-features);
+    # use_iv_features=True: include IV_FEATURE_COLS as features (Phase 3 only when --iv-features
+    # );
     #   dropna() auto-limits training to the ~2yr backfilled window.
     # default: exclude all IV_COLS so full price history is used.
     # decision_threshold: probability cutoff used for precision reporting — must match the
@@ -282,6 +283,7 @@ def print_combined_signal(df_full, direction_prob, dir_prob_63, expansion_prob,
 
     iv_regime = "Low IV" if iv_rank < 0.33 else "High IV" if iv_rank > 0.67 else "Mid IV"
 
+    # Signal label matches backtest.py terminology
     signal = determine_signal(dir_signal, dir_signal_63, exp_signal)
 
     # Sizing: Phase 3 is primary sizing input; Phase 2B adds a REDUCED override
