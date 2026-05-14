@@ -71,23 +71,26 @@ rows. Validated on QQQ (75.0% expansion precision, +0.8pp over HV proxy).
 Current Backtest Baselines
 --------------------------
 
-QQQ (53 windows, 2001-2026, post-S17) — framework reference baseline
+QQQ (53 windows, 2001-2026, post-S18) — framework reference baseline
   P2_VOL_MULTIPLE=0.41, P2B_VOL_MULTIPLE=0.55, P3_VOL_MULTIPLE=0.20
   WIN_THRESHOLD 1.82%, WIN_THRESHOLD_63 5.00%, EXPANSION_THRESHOLD 3.64%
-  Signal           Count   Avg    Win%   AvgWin  AvgLoss
-  STRONG ENTRY       574   1.9%   63.2%   5.6%   -4.4%   ← best 15d
-  CAUTION           1308   1.2%   62.4%   4.6%   -4.4%
-  SHORT-TERM ONLY    551   0.4%   58.1%   3.9%   -4.5%
-  LEAPS ONLY         799   0.7%   62.2%   3.8%   -4.3%
-  STAY OUT          3084   0.6%   61.3%   3.4%   -3.8%
+  Signal           Count   Avg    Win%   Strong%  AvgWin  AvgLoss
+  STRONG ENTRY       570   1.8%   64.2%   51.9%    5.2%   -4.3%   ← best 15d
+  CAUTION           1285   1.1%   61.3%   49.3%    4.5%   -4.4%
+  SHORT-TERM ONLY    607   0.6%   59.5%   44.6%    3.8%   -4.2%
+  LEAPS ONLY         766   0.7%   60.7%   44.1%    3.9%   -4.2%
+  STAY OUT          3088   0.6%   61.8%   43.0%    3.5%   -3.9%
 
-QQQ 6-month forward returns (post-S17):
-  STRONG ENTRY    +10.9%  77.6%  ← only signal with edge on BOTH 15d + 6mo
-  LEAPS ONLY       +7.5%  72.0%  ← now above ALL DAYS (7.0%) — real edge at 6mo horizon
-  SHORT-TERM       +7.3%  81.5%  (high win rate but no 63d confirmation — not LEAPS validation)
-  CAUTION          +6.6%  69.5%  ≈ STAY OUT (Phase 3 doesn't discriminate at index)
-  STAY OUT         +6.4%  76.9%  (secular QQQ bid)
-  ALL DAYS         +7.0%  75.2%
+QQQ 6-month forward returns (post-S18):
+  STRONG ENTRY    +9.4%   76.3%  ← only signal with edge on BOTH 15d + 6mo
+  LEAPS ONLY      +7.5%   69.5%  ← above ALL DAYS (7.0%) — real 6mo edge
+  SHORT-TERM      +6.8%   78.2%  (high win rate but no 63d confirmation)
+  CAUTION         +7.3%   70.5%
+  STAY OUT        +6.5%   77.7%  (secular QQQ bid)
+  ALL DAYS        +7.0%   75.2%
+
+(Minor numerical drift from pre-S18 baseline expected — today-row addition
+in S16 shifts the train/test split by 1 each indicators.py run.)
 
 AMD (91 windows, 2000-2026, post-S13 — pre-S15 LEAPS reclassification)
   STRONG ENTRY      377   3.9%   57.0%  13.0%   -8.3%   ← best (only signal worth trading)
@@ -97,9 +100,13 @@ AMD (91 windows, 2000-2026, post-S13 — pre-S15 LEAPS reclassification)
   WIN_THRESHOLD 4.98% (vs QQQ 1.82%) — much harder bar.
   AMD IV backfill complete (459 rows) but Phase 3 --iv-features retrain not yet run.
 
-NVDA (53 windows, 2001-2026, RAW mode)
-  STRONG ENTRY 391 / 4.4% / 65.5% — best in project.
-  CALIBRATED mode COLLAPSES this to -0.4% / 52% (S11 regression — drove default-revert).
+NVDA (53 windows, 2001-2026, RAW mode, post-S18 with P2B=0.55)
+  STRONG ENTRY 355 / 2.9% / 59.2% / 6mo 33.4% / 71.2%
+  Pre-S17 baseline was 391 / 4.4% / 65.5% — drop reflects P2B threshold
+  tightening (0.41 → 0.55), not regression. Hierarchy intact; edge concentrated
+  in high-confidence tail (see S11 calibration test for the destructive
+  effect of any regularization that compresses the tail).
+  CALIBRATED mode COLLAPSES STRONG ENTRY to -0.4% / 52% (S11 regression — drove default-revert).
 
 SPY: STRUCTURALLY UNSUITABLE — 0.1pp edge over base, hierarchy broken.
   Framework's price-action lens vs SPY's macro-driven moves don't match.
@@ -281,18 +288,83 @@ Active TODO
   edge vs HV proxy per ticker
 - Re-run AMD and NVDA backtests with P2B_VOL_MULTIPLE=0.55 (current tables
   are pre-S17; co-validate new multiple before treating 0.55 as permanent default)
-- Restore MASSIVE_API_KEY env-var-only pattern (currently HARDCODED in
-  modules/massive.py:16 — security regression). Rotate the key as part of fix.
+- Rotate MASSIVE_API_KEY at Massive.com — the prior key was committed to git
+  during the hardcode regression and must be considered compromised. Env-var
+  pattern restored 2026-05-13; old key still works until rotated.
+- Phase 4 / exit.py follow-ups:
+  - Co-validate on AMD + SOFI before treating 15d as universal default
+    for exit.py output. AMD's vol scale (4.98% WIN_THRESHOLD vs QQQ
+    1.82%) may favor 5d.
+  - Option B (P4 gate) REJECTED by S18 backtest validation — keep code
+    behind --p4-gate flag (default OFF). Future experiments:
+    * Shorter gate window (5d) to avoid filtering 15d-wobble winners
+    * Compound gate (require BOTH P4 + IV/HV to fire) — stricter trigger
+    * Per-ticker gate enablement (NVDA showed +0.48pp on STRONG ENTRY,
+      borderline on sample size; AMD/SOFI unknown)
+  - Tune P4_VOL_MULTIPLE = 1.0 starting point via per-ticker calibration
+    sweep (analogous to MULTIPLIER_SWEEP in backtest.py).
+  - Option C (held-position mode) deferred — needs position-state features
+    (days held, current unrealized P&L) not present in framework today.
 
 Backlog (prioritized by leverage)
-- Exit-signal model (sibling to Phase 2/2B/3 — currently entry-only)
-- Regime detection layer (HMM / change-point / VIX regime tagging)
-- Net-of-cost backtest returns (gross numbers eat ~0.3-0.8pp on 6-12mo options)
-- Portfolio-level context (correlated exposure, sector concentration)
-- Kelly-style continuous sizing (vs current FULL/REDUCED bins)
-- Smoke-test layer (zero tests in repo; S14/S16 drift would have been caught)
-- Short interest ratio (FINRA monthly) — squeeze-setup detection
-- Earnings estimate revisions — individual-stock alpha
+
+1. ~~Exit-signal model~~  SHIPPED 2026-05-13 (S18) as Phase 4 / exit.py.
+   Target: max drawdown over N days <= -(P4_VOL_MULTIPLE × σ × sqrt(N/252))
+   with P4_VOL_MULTIPLE = 1.0. Trains 3 candidate windows (5d/15d/63d) per
+   ticker, ships winner. QQQ best at 15d (+17.7pp edge), NVDA best at 5d
+   (+19.7pp); 63d collapses on individual stocks (NVDA -20.7pp tail inversion)
+   and is excluded from production. 15d is the framework default — symmetric
+   with Phase 2 entry window. Not yet integrated into entry.py SIGNAL output.
+
+2. Regime detection layer (HMM / change-point / VIX regime tagging)
+   Phase 2 averages over a single distribution but the world has multiple
+   regimes (calm trend / calm chop / vol expansion / crisis). Regime tag
+   from HMM on VIX+term structure, change-point detector, or rule-based VIX
+   bands, used as gating filter or feature, lets signals behave differently
+   per regime. Most direct mitigation of the geopolitical-shock limitation:
+   can't predict the shock but can know you're in a stress regime and
+   downweight contraction signals.
+
+3. Net-of-cost backtest returns (gross numbers eat ~0.3-0.8pp on 6-12mo options)
+   All backtest numbers are gross. Bid-ask + commissions eat ~0.3-0.8pp per
+   round trip on long-dated options. QQQ STRONG ENTRY 1.9% → ~1.4% net;
+   CAUTION 1.2% likely drops below STAY OUT after costs. Doesn't change
+   signal hierarchy but changes sizing + marginal cases (SHORT-TERM ONLY
+   especially). Implementation is mechanical in backtest.py:summarize().
+
+4. Portfolio-level context (correlated exposure, sector concentration)
+   Models score tickers in isolation. Simultaneous STRONG ENTRY on AMD+NVDA
+   is one concentrated semi bet, not two independent ones. Needs correlation
+   matrix + sector exposure tracking. Output: max-position-size multiplier
+   on top of FULL/REDUCED bins. No new alpha — caps drawdown when correlated
+   signals cluster.
+
+5. Kelly-style continuous sizing (vs current FULL/REDUCED bins)
+   Sizing is binary today; LogReg returns continuous probabilities. 0.62 vs
+   0.84 both clear 0.55 but have very different expected edge. Kelly =
+   (edge/variance) off predicted prob extracts more from high-confidence
+   tail (where NVDA edge lives — see S11). Risk: Kelly is aggressive on
+   noisy probabilities; half-Kelly / fractional safer.
+
+6. Smoke-test layer (zero tests in repo; S14/S16 drift would have been caught)
+   Zero tests today. S14/S16 drift (entry.py un-refactored + reporting
+   precision at wrong threshold) went undetected until manual pipeline
+   verification. ~5 pytest regression tests pinning QQQ baselines + asserting
+   entry.py / direction.py identical precision would have caught it
+   immediately. Prevents future feature/threshold changes from silently
+   breaking things.
+
+7. Short interest ratio (FINRA monthly) — squeeze-setup detection
+   New feature, not structural change. Monthly FINRA SI captures squeeze
+   setups (rapid buildup) that price/vol features miss. AMD/NVDA/SOFI/RIVN
+   tier — high-beta individual stocks where short-squeeze moves are common
+   and currently invisible. Monthly cadence, individual-stocks only.
+
+8. Earnings estimate revisions — individual-stock alpha
+   Framework has Days_to_earnings but not whether Street is revising up/down.
+   Revision momentum is durable individual-stock alpha. Data acquisition is
+   the bulk of the work: yfinance doesn't expose this; needs paid feed
+   (FactSet/Zacks) or scraping. Lowest priority for that reason.
 
 Won't Fix / Structural Limits
 - Binary event direction (FDA decisions, trial readouts) — direction unknowable
@@ -307,11 +379,11 @@ Won't Fix / Structural Limits
 
 Known Issues
 ------------
-- modules/massive.py: MASSIVE_API_KEY HARDCODED (regression — was env-var-only
-  by design per CLAUDE.md). Active security risk: file is in git. Restore
-  env-var pattern + rotate key.
 - modules/tradier.py: TRADIER_TOKEN reads $env:TRADIER_TOKEN if set, else
   hardcoded fallback. Set the env var to keep token out of git.
+- Old MASSIVE_API_KEY (used during S10-S17 hardcode regression) must be
+  rotated at Massive.com — it lived in git. Env-var pattern restored
+  2026-05-13; rotation still pending.
 
 ────────────────────────────────────────────────────────────────────────
 
@@ -358,6 +430,96 @@ Tradier Config (modules/tradier.py + sizing.py)
 
 Recent Session Log
 ------------------
+
+S18 (2026-05-13) — Phase 4 (Exit Signal) Shipped + Massive Env-Var Restored
+1. Massive API key regression resolved:
+   - modules/massive.py:15-16: restored env-var-only pattern; deleted
+     hardcoded fallback. Compromised key (was in git) must still be rotated
+     at Massive.com — flagged in Active TODO.
+   - CLAUDE.md + context.md cleaned: removed "HARDCODED" warnings, pruned
+     stale Known Issues (diag files / N_ESTIMATORS / mdates / add_vix
+     wrappers — all resolved in S17 but list never updated).
+2. Phase 4 / exit signal shipped as exit.py:
+   - Target: max drawdown over N days <= -(P4_VOL_MULTIPLE × median_HV ×
+     sqrt(N/252)) with P4_VOL_MULTIPLE = 1.0. Captures forward-window MAE
+     using shift(-N).rolling(N).min() on Low column.
+   - Trains 3 candidate windows jointly (5d / 15d / 63d) and reports
+     per-window edge so per-ticker winners are visible.
+   - New shared functions in modules/features.py:
+     - add_trend_break_features() — backward-looking trend-vulnerability
+       features (above_ma20/50, dist_above_ma20/50_pct, ma20/50_slope_5d,
+       days_above_ma20/50). Must run BEFORE normalize_features (drops MA cols).
+     - compute_p4_drawdown_threshold(df, n) — vol-adjusted threshold from
+       median HV (prefers HV_20 col if present; falls back to log-return
+       computation; final fallback 0.20 if data insufficient).
+     - add_p4_drawdown_target(df, n, threshold, target_col) — apply forward
+       drawdown target via Low.shift(-n).rolling(n).min(); truncates last
+       n rows. Used by both exit.py (loop over 3 windows) and entry.py.
+3. Cross-ticker validation (per project rule):
+   QQQ:  5d +16.2pp | 15d +17.7pp ◄ best | 63d  +2.3pp
+   NVDA: 5d +19.7pp ◄ best | 15d +15.8pp | 63d -20.7pp ◄ tail inversion
+   Both: 5d and 15d both produce real edge (+15-20pp). 63d unsafe on
+   individual stocks — NVDA 63d model has 0% precision at thresholds
+   >= 0.60 (high-confidence anti-prediction; same failure pattern as S11
+   calibration). 63d excluded from production surface.
+4. Production default: 15d (QQQ-best, NVDA only 4pp behind 5d, symmetric
+   with Phase 2 entry window). 5d available as aggressive alternative.
+   Top features that paid off: price_vs_kc_lower (+), days_above_ma50 (+),
+   dist_above_ma50_pct (+) — the trend-break features earned their keep.
+   Counterintuitive but correct: price_vs_kc_upper has NEGATIVE coefficient
+   (breaking above upper Keltner = momentum protection, less near-term
+   drawdown). Mean reversion isn't immediate.
+5. Option A integration shipped to entry.py: display-only "EXIT RISK
+   (Phase 4 — 15d drawdown)" section between Phase 3 IV TIMING and
+   OPTIONS-MARKET CHECK. Shows drawdown bar, probability, signal
+   (EXIT ⚠ / NO EXIT ✓), and top drivers. Does NOT affect SIGNAL or
+   POSITION SIZING — those still come from P2/P2B/P3 only.
+6. Option B (P4 gate) implemented and REJECTED via backtest validation:
+   - Gate logic: one-tier-down (STRONG ENTRY → CAUTION, CAUTION /
+     SHORT-TERM ONLY → STAY OUT, LEAPS ONLY unchanged) when exit_prob
+     >= P4_THRESHOLD (0.55).
+   - Implementation: --p4-gate flag in entry.py (default OFF), Phase 4
+     model trained per walk-forward window in backtest.py (mirrors P2/P2B/P3),
+     A/B summary table compares ungated vs gated signal distributions.
+     summarize() refactored to take signal_col parameter; new
+     summarize_p4_gate_ab() function prints A/B verdict.
+   - Cross-ticker results:
+     QQQ:  STRONG ENTRY 1.8% → 1.5% (-0.24pp), 6mo 9.4% → 7.6% (-1.8pp)
+     NVDA: STRONG ENTRY 2.9% → 3.4% (+0.48pp), 6mo 33.4% → 29.1% (-4.3pp)
+            gated count 294 < 300 floor — sample-size REJECT regardless
+   - Diagnostic signature: gated win rate UP, avg return DOWN — gate is
+     filtering winners along with losers at a worse ratio. The 15d
+     drawdown horizon is too short for LEAPS — filters out 6mo winners
+     that had 15d wobbles.
+   - Code retained as opt-in (--p4-gate flag, default OFF). Future
+     experiments could try shorter window (5d) or compound gate logic
+     (require BOTH P4 + IV/HV to fire before downgrade).
+   - Full edge-vs-horizon curve mapped post-rejection (32d/126d added then
+     removed from P4_FORWARD_DAYS_LIST after data collected). Shows hard
+     horizon ceiling for drawdown prediction:
+                  QQQ                     NVDA
+       5d:   +16.2pp                +19.7pp ◄ NVDA peak
+      15d:   +17.7pp ◄ QQQ peak     +15.8pp
+      32d:   +16.0pp                 -3.2pp ◄ stocks break
+      63d:    +2.3pp                -20.7pp ◄ NVDA worst (confident wrong)
+     126d:    -5.1pp ◄ QQQ breaks  -15.7pp (noise floor — only 30 signals)
+     Insight: drawdown predictability has a hard ceiling — ~15d for
+     individual stocks, ~30d for index ETFs. The 32-63d range is where
+     stock models are most confidently wrong (tail inversion). LEAPS gate
+     use case (60-180d holding) is structurally outside P4's predictive
+     horizon for ANY ticker — no N solves the gate problem.
+     P4_FORWARD_DAYS_LIST trimmed to [5, 15] for production cleanliness.
+7. Process note: re-ask cycle on design questions (user pushed back on
+   "10d forward window" recommendation that lacked rigor; reformulated as
+   "tactical 5-10d / symmetric 15d / strategic 63d / train all three").
+   User picked "train all three" — surfaced the 63d tail inversion that
+   would have been invisible if we'd hardcoded a single window.
+8. As-a-side-effect: this backtest run is the first full QQQ + NVDA
+   re-run under P2B=0.55 (from S17). Co-validation now satisfied. Updated
+   QQQ baseline: STRONG ENTRY 570 / 1.8% / 64.2% / 6mo 9.4% / 76.3%.
+   Updated NVDA baseline: STRONG ENTRY 355 / 2.9% / 59.2% (vs pre-S17
+   391 / 4.4% / 65.5% — drop reflects P2B threshold tightening, not
+   regression). Older CLAUDE.md figures (574/1.9%/63.2%) are pre-S17/S18.
 
 S17 (2026-05-13) — Code Cleanup + Market Stress Warning + P2B Multiple
 1. Code cleanup completed:

@@ -17,10 +17,9 @@ python entry.py
 python sizing.py
 ```
 
-`indicators.py` requires a Massive API key for the chain harvest. The key is currently HARDCODED
-in `modules/massive.py:16` (regression — see Known Issues). Once the env-var pattern is restored,
-set `$env:MASSIVE_API_KEY` and add it to `$PROFILE` for persistence across PowerShell sessions.
-If the env var ever goes unset and the hardcode is removed, IV columns are written as NaN and
+`indicators.py` requires a Massive API key for the chain harvest. Set `$env:MASSIVE_API_KEY` and
+add it to `$PROFILE` for persistence across PowerShell sessions. If the env var is unset, the
+Massive client raises `RuntimeError` on the first API call; IV columns are written as NaN and
 `entry.py` warns to re-run.
 
 As-needed analysis:
@@ -31,6 +30,9 @@ python direction.py
 
 # IV expansion model detail (Phase 3)
 python volatility.py
+
+# Exit signal detail (Phase 4) — drawdown forecast across 5d/15d/63d windows
+python exit.py
 
 # Walk-forward backtest (periodic validation)
 python backtest.py
@@ -49,6 +51,7 @@ pip install -r requirements.txt
 | indicators.py | 3 (ticker, start date, end date) + trailing chart prompt |
 | direction.py | 2 (ticker, benchmarks — blank = default) |
 | volatility.py | 1 (ticker) |
+| exit.py | 2 (ticker, benchmarks — blank = default) |
 | entry.py | 2 (ticker, benchmarks — blank = default) |
 | backtest.py | 2 (ticker, benchmarks) + trailing chart prompt |
 | sizing.py | interactive (ticker, budget, strikes) |
@@ -74,11 +77,12 @@ cmd /c "(echo TICKER && echo.) | python -X utf8 script.py" 2>&1
 | `indicators.py` | Fetch OHLCV, compute 30+ indicators, harvest today's chain summary from Massive | `data/{ticker}_indicators.csv` (with IV cols), `data/{ticker}_dashboard.png` |
 | `direction.py` | Direction ML models (Phase 2 + 2B) | `data/{ticker}_ml_features.csv`, `data/{ticker}_ml_results.png` |
 | `volatility.py` | IV expansion ML model (Phase 3) | `data/{ticker}_phase3_features.csv`, `data/{ticker}_phase3_results.png` |
+| `exit.py` | Exit signal ML model (Phase 4) — drawdown forecast across 5d/15d/63d windows | `data/{ticker}_exit_features.csv`, `data/{ticker}_exit_results.png` |
 | `entry.py` | Combines all models → SIGNAL + POSITION SIZING (reads IV from CSV — no live API) | Console only |
 | `backtest.py` | Walk-forward backtest + 6-month forward return table (53 windows QQQ; 91 AMD; 53 NVDA; 31y SPY; 17 CRSP) | `data/{ticker}_backtest.png`, `data/{ticker}_backtest_results.csv` |
 | `sizing.py` | Live options chain sizing via Tradier API | Console only |
 | `backfill_iv.py` | Standalone 2-year historical IV backfill via BS-inversion (one-off per ticker) | Updates `data/{ticker}_indicators.csv` in place; checkpointed |
-| `modules/features.py` | Shared feature engineering (HV, VIX, earnings, normalize, vol thresholds, IV imputation) + constants (S14/S16) | Imported by direction/volatility/entry/backtest |
+| `modules/features.py` | Shared feature engineering (HV, VIX, earnings, normalize, vol thresholds, IV imputation, P4 drawdown threshold + target, trend-break features) + constants | Imported by direction/volatility/exit/entry/backtest |
 | `modules/benchmarks.py` | Sector benchmarks, macro features, catalyst proximity | Imported by direction/entry/backtest/volatility |
 | `modules/massive.py` | Massive.com API client + `get_chain_summary()` + `get_historical_iv_snapshot()`; exports `IV_COLS`, `IV_FEATURE_COLS`, `IV_META_COLS` | Imported by `indicators.py` (harvest), `backfill_iv.py` (history), and 5 ML scripts (exclude from features) |
 | `modules/bs_invert.py` | Black-Scholes implied-vol solver (Newton-Raphson + bisection fallback) — used by `backfill_iv.py` | Imported by `modules/massive.py` |
@@ -168,13 +172,18 @@ All CSVs and PNGs are written to the `data/` subdirectory (must exist — create
 
 All models: `LogisticRegression(C=0.1, class_weight="balanced")`, 80/20 time-based split, `RANDOM_STATE=42`.
 
-| | Phase 2 (15d) | Phase 2B (63d) | Phase 3 (IV) |
-|---|---|---|---|
-| Target | Vol-adjusted gain in 15d | Vol-adjusted gain in 63d | HV expansion in 10d |
-| Threshold | 0.55 | 0.55 | 0.60 |
+| | Phase 2 (15d) | Phase 2B (63d) | Phase 3 (IV) | Phase 4 (Exit) |
+|---|---|---|---|---|
+| Target | Vol-adjusted gain in 15d | Vol-adjusted gain in 63d | HV expansion in 10d | Max drawdown over N days ≥ vol-adjusted threshold |
+| Threshold | 0.55 | 0.55 | 0.60 | 0.55 |
+| Window | 15d (fixed) | 63d (fixed) | 10d (fixed) | 5d / 15d / 63d (trained jointly; 15d production default) |
 
 Volatility is more predictable than direction — Phase 3 has roughly 3× the edge of either direction model
 (QQQ: Phase 2 +1.5pt edge, Phase 2B +6.3pt, Phase 3 +27pt at production thresholds).
+Phase 4 exit signal validates with comparable edge to Phase 3 (QQQ 15d +17.7pp, NVDA 5d +19.7pp);
+63d window collapses on individual stocks (NVDA -20.7pp at τ=0.55 — high-confidence tail inverts) and
+is excluded from production. Drawdown threshold = `P4_VOL_MULTIPLE × median_HV × sqrt(N/252)` with
+`P4_VOL_MULTIPLE = 1.0` (one-sigma drawdown bar).
 
 Threshold sweep auto-marks optimal using `max(precision - base_rate) × log(signals)` — rewards edge
 above base rate and signal volume simultaneously.
@@ -185,6 +194,12 @@ CLI flags (default OFF on all three; available on direction/entry/backtest):
 - `--iv-features` — Phase 3 uses real Massive IV (`atm_iv_30d`, `iv_skew_25d`, `term_structure`)
   with HV-based imputation for pre-backfill rows. Default uses HV proxy (full price history).
   Validated on QQQ (75.0% expansion precision, +0.8pp over HV proxy).
+- `--p4-gate` (entry.py only) — Phase 4 exit gate. One-tier-down downgrade: STRONG ENTRY → CAUTION,
+  CAUTION / SHORT-TERM ONLY → STAY OUT, LEAPS ONLY unchanged. **REJECTED by S18 backtest validation**:
+  QQQ STRONG ENTRY 1.8% → 1.5% (−0.24pp 15d), 9.4% → 7.6% (−1.8pp 6mo); NVDA gated count 294 < 300
+  sample-size floor. 15d gate filters 6mo winners that had 15d wobbles. Retained as opt-in flag for
+  future experimentation. backtest.py always reports gated/ungated A/B (no flag) so re-validation
+  is automatic if upstream changes alter behavior.
 
 ## Sizing Config (`sizing.py`)
 
@@ -198,9 +213,8 @@ CLI flags (default OFF on all three; available on direction/entry/backtest):
 
 ## Massive Config (`modules/massive.py`)
 
-- ⚠️ **`MASSIVE_API_KEY` is currently HARDCODED** at `modules/massive.py:16` (regression — was
-  env-var-only by design). Active security risk: file is in git. Restore env-var pattern + rotate
-  the key as part of the fix. The commented-out env-var line is preserved on line 15 for the fix.
+- `MASSIVE_API_KEY` reads `$env:MASSIVE_API_KEY`; calls fail with `RuntimeError` if unset.
+  Set in `$PROFILE` for persistence across PowerShell sessions.
 - Plan tier: Options Starter (15-min delayed snapshots, 2yr historical, unlimited rate limit)
 - `MASSIVE_URL = https://api.massive.com` — surface is functionally identical to Polygon.io
 - `get_chain_summary(ticker, underlying_price, target_dte=30)` returns:
@@ -245,16 +259,8 @@ See `memory/context.md` "Geopolitical Risk Limitation" for proposed mitigations 
 
 ## Known Issues (not yet fixed)
 
-- ⚠️ `modules/massive.py:16`: `MASSIVE_API_KEY` is HARDCODED (regression — was env-var-only by design).
-  File is in git. Restore env-var pattern + rotate the key. The commented-out env-var line is
-  preserved on line 15 as a one-line revert path.
 - `modules/tradier.py`: `TRADIER_TOKEN` reads `$env:TRADIER_TOKEN` if set, else falls back to hardcoded
   constant. Set the env var to keep the token out of git.
-- `direction.py` + `volatility.py`: still have inline `add_vix()` and `add_benchmarks()` wrappers
-  (~30 LOC each, duplicated between the two files). S14/S16 refactor incomplete — pending follow-up.
-- `direction.py`: dead `N_ESTIMATORS = 200` constant (Random Forest leftover)
-- `indicators.py`: unused `import mdates`
-- `diag/_diag_*.py`: 6 diagnostic files in workspace root, flagged for removal in S12, never deleted.
 - `data/iv_log.csv` (deprecated as of S10): file preserved on disk as historical record but no new rows
   are written. IV history now lives in `data/{ticker}_indicators.csv`.
 - AAPL backfill is partial (180 IV rows since 2025-07-24 — interrupted run, restartable).

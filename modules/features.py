@@ -1,12 +1,14 @@
 """
-Shared feature engineering — direction.py, volatility.py, entry.py, backtest.py.
+Shared feature engineering — direction.py, volatility.py, exit.py, entry.py, backtest.py.
 
 Import pattern:
     from modules.features import (
         HV_WINDOW, IV_RANK_WINDOW,
-        P2_FORWARD_DAYS, P2B_FORWARD_DAYS, P3_FORWARD_DAYS,
-        P2_VOL_MULTIPLE, P3_VOL_MULTIPLE,
-        compute_hv_features, compute_vix_features, add_vix, add_benchmarks,
+        P2_FORWARD_DAYS, P2B_FORWARD_DAYS, P3_FORWARD_DAYS, P4_FORWARD_DAYS_LIST,
+        P2_VOL_MULTIPLE, P2B_VOL_MULTIPLE, P3_VOL_MULTIPLE, P4_VOL_MULTIPLE,
+        compute_hv_features, add_trend_break_features,
+        compute_p4_drawdown_threshold, add_p4_drawdown_target,
+        compute_vix_features, add_vix, add_benchmarks,
         add_earnings_proximity, normalize_features, compute_vol_thresholds,
     )
 """
@@ -22,10 +24,15 @@ IV_RANK_WINDOW   = 252   # 1-year lookback for IV rank / percentile
 P2_FORWARD_DAYS  = 15    # Phase 2 direction window (entry timing)
 P2B_FORWARD_DAYS = 63    # Phase 2B direction window (~1 quarter, LEAPS-aligned)
 P3_FORWARD_DAYS  = 10    # Phase 3 IV expansion window
+P4_FORWARD_DAYS_LIST = [5, 15]  # Phase 4 candidate exit windows — tactical / symmetric.
+                                # 32d/63d/126d tested S18 and dropped: tail inversion past ~15d on individual
+                                # stocks (NVDA 15d=+15.8pp → 32d=-3.2pp → 63d=-20.7pp). QQQ holds up through
+                                # 32d then breaks (+16.0pp → 63d=+2.3pp → 126d=-5.1pp). See context.md S18.
 
 P2_VOL_MULTIPLE  = 0.41  # 0.41-sigma bar; range 0.25 (aggressive) to 1.0 (conservative)
 P2B_VOL_MULTIPLE = 0.55  # 63d bar — higher than P2 to offset secular drift inflating QQQ base rate; tune via backtest
 P3_VOL_MULTIPLE  = 0.20  # 20% of median HV; range 0.10 to 0.40
+P4_VOL_MULTIPLE  = 1.0   # Drawdown threshold = P4_VOL_MULTIPLE × median_HV × sqrt(N/252); starting point, tune via per-ticker backtest
 
 
 # ─── Feature computation functions ───────────────────────────────────────────
@@ -45,6 +52,78 @@ def compute_hv_features(df, hv_window=HV_WINDOW, rank_window=IV_RANK_WINDOW):
     df["HV_chg_10d"] = df["HV_20"].pct_change(10)
     df["HV_vs_ma20"] = df["HV_20"] / df["HV_20"].rolling(20).mean() - 1
     return df
+
+
+def add_trend_break_features(df):
+    """Add backward-looking trend-vulnerability features for Phase 4 (exit signal).
+
+    Proxies the "trend break" concept (above MA today, about to drop below) using
+    only past data — distance to MA, MA slope, streak length. The naive forward-
+    looking definition would be lookahead bias.
+
+    Must run BEFORE normalize_features (which drops MA_20/MA_50).
+    No-ops with a warning if MA_20/MA_50 are missing from df.
+    """
+    if "MA_20" not in df.columns or "MA_50" not in df.columns:
+        print("  ⚠ MA_20 or MA_50 missing — skipping trend-break features")
+        return df
+
+    df["above_ma20"] = (df["Close"] > df["MA_20"]).astype(int)
+    df["above_ma50"] = (df["Close"] > df["MA_50"]).astype(int)
+
+    dist20 = (df["Close"] - df["MA_20"]) / df["MA_20"]
+    dist50 = (df["Close"] - df["MA_50"]) / df["MA_50"]
+    df["dist_above_ma20_pct"] = dist20.where(dist20 > 0, 0)
+    df["dist_above_ma50_pct"] = dist50.where(dist50 > 0, 0)
+
+    df["ma20_slope_5d"] = df["MA_20"].pct_change(5)
+    df["ma50_slope_5d"] = df["MA_50"].pct_change(5)
+
+    for col, mask in [("days_above_ma20", df["above_ma20"]), ("days_above_ma50", df["above_ma50"])]:
+        groups = (mask != mask.shift()).cumsum()
+        df[col] = mask.groupby(groups).cumsum()
+
+    print("  ✓ above_ma20/50, dist_above_ma20/50_pct, ma20/50_slope_5d, days_above_ma20/50")
+    return df
+
+
+def compute_p4_drawdown_threshold(df, forward_days, vol_multiple=None, fallback_hv=0.20):
+    """Vol-adjusted Phase 4 drawdown threshold: vol_multiple × median_HV × sqrt(N/252).
+
+    Prefers df['HV_20'] if present, else recomputes HV from log-returns. Falls back
+    to fallback_hv (default 0.20, AMD-like) if the resulting median is < 5%.
+    """
+    if vol_multiple is None:
+        vol_multiple = P4_VOL_MULTIPLE
+
+    median_hv = None
+    if "HV_20" in df.columns:
+        s = df["HV_20"].dropna()
+        if len(s) >= 20:
+            median_hv = s.median()
+    if median_hv is None or not np.isfinite(median_hv) or median_hv < 0.05:
+        log_ret = np.log(df["Close"] / df["Close"].shift(1))
+        s = (log_ret.rolling(HV_WINDOW).std() * np.sqrt(252)).dropna()
+        median_hv = s.median() if len(s) >= 20 else None
+    if median_hv is None or not np.isfinite(median_hv) or median_hv < 0.05:
+        median_hv = fallback_hv
+
+    return vol_multiple * median_hv * np.sqrt(forward_days / 252)
+
+
+def add_p4_drawdown_target(df, forward_days, drawdown_threshold, target_col="exit_target"):
+    """Apply forward-window max-drawdown target.
+
+    target_col = 1 if min(Low[t+1..t+N]) drops drawdown_threshold-or-more below Close[t].
+    drawdown_threshold is a positive number (e.g. 0.04 = 4% drawdown bar).
+    Returns df with target_col added and last N rows dropped (no forward window).
+    """
+    n = forward_days
+    future_min_low = df["Low"].shift(-n).rolling(n, min_periods=n).min()
+    forward_drawdown = (future_min_low - df["Close"]) / df["Close"]
+    df = df.copy()
+    df[target_col] = (forward_drawdown <= -drawdown_threshold).astype(int)
+    return df.iloc[:-n]
 
 
 def compute_vix_features(df, vix_df, vix9d_df, vix3m_df):

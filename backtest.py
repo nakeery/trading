@@ -32,8 +32,9 @@ from modules.massive import IV_COLS, IV_META_COLS, IV_FEATURE_COLS
 from modules.features import (
     HV_WINDOW, IV_RANK_WINDOW,
     P2_FORWARD_DAYS, P2B_FORWARD_DAYS, P3_FORWARD_DAYS,
-    P2_VOL_MULTIPLE, P2B_VOL_MULTIPLE, P3_VOL_MULTIPLE,
-    compute_hv_features, compute_vix_features,
+    P2_VOL_MULTIPLE, P2B_VOL_MULTIPLE, P3_VOL_MULTIPLE, P4_VOL_MULTIPLE,
+    compute_hv_features, compute_vix_features, add_trend_break_features,
+    compute_p4_drawdown_threshold, add_p4_drawdown_target,
     add_earnings_proximity, normalize_features, compute_vol_thresholds,
     impute_iv_features,
 )
@@ -58,6 +59,8 @@ P2_CALIBRATE        = False  # Decision 1 (S11) reverted as default after NVDA r
 P2_THRESHOLD        = 0.55   # Phase 2 (15d) cutoff. Set from P2_CALIBRATE in __main__: 0.50 calibrated / 0.55 raw.
 P2B_THRESHOLD       = 0.55  # Phase 2B (63d) raw cutoff — calibration deferred to Decision 2
 P3_THRESHOLD        = 0.60
+P4_FORWARD_DAYS     = 5    # Phase 4 exit window (15d production default — S18)
+P4_THRESHOLD        = 0.55  # Phase 4 drawdown cutoff
 RANDOM_STATE        = 42
 
 IV_FEATURES = False  # set by --iv-features CLI arg; when True, Phase 3 uses IV_FEATURE_COLS as features
@@ -165,6 +168,7 @@ def build_features(df, benchmarks):
 
     df = add_earnings_proximity(df, TICKER)
     df = add_catalyst_proximity(df, TICKER, MODULE_DIR, for_direction=True)
+    df = add_trend_break_features(df)  # must precede normalize_features (drops MA cols)
     df = normalize_features(df)
 
     # Overnight gap features — computed fresh (not read from CSV) for self-containment
@@ -261,7 +265,12 @@ def run_backtest(df_full):
         df_p3 = df_p3.iloc[:-P3_FORWARD_DAYS]
         clf3, scaler3, fcols3 = train_model(df_p3, "_target", use_iv_features=IV_FEATURES)
 
-        if clf2 is None or clf2b is None or clf3 is None:
+        # Phase 4 — exit risk target (15d max drawdown). Per-window threshold avoids lookahead.
+        p4_threshold_window = compute_p4_drawdown_threshold(df_train, P4_FORWARD_DAYS)
+        df_p4 = add_p4_drawdown_target(df_train, P4_FORWARD_DAYS, p4_threshold_window, target_col="_target")
+        clf4, scaler4, fcols4 = train_model(df_p4, "_target")
+
+        if clf2 is None or clf2b is None or clf3 is None or clf4 is None:
             train_end += STEP_DAYS
             continue
 
@@ -272,19 +281,23 @@ def run_backtest(df_full):
             row2  = df_full[fcols2].iloc[i]
             row2b = df_full[fcols2b].iloc[i]
             row3  = df_full[fcols3].iloc[i]
-            if row2.isna().any() or row2b.isna().any() or row3.isna().any():
+            row4  = df_full[fcols4].iloc[i]
+            if row2.isna().any() or row2b.isna().any() or row3.isna().any() or row4.isna().any():
                 continue
 
             X2  = pd.DataFrame([row2],  columns=fcols2)
             X2b = pd.DataFrame([row2b], columns=fcols2b)
             X3  = pd.DataFrame([row3],  columns=fcols3)
+            X4  = pd.DataFrame([row4],  columns=fcols4)
             dir_prob    = clf2.predict_proba(scaler2.transform(X2))[0, 1]
             dir_prob_63 = clf2b.predict_proba(scaler2b.transform(X2b))[0, 1]
             exp_prob    = clf3.predict_proba(scaler3.transform(X3))[0, 1]
+            exit_prob   = clf4.predict_proba(scaler4.transform(X4))[0, 1]
 
             dir_signal    = dir_prob    >= P2_THRESHOLD
             dir_signal_63 = dir_prob_63 >= P2B_THRESHOLD
             exp_signal    = exp_prob    >= P3_THRESHOLD
+            exit_signal   = exit_prob   >= P4_THRESHOLD
 
             if dir_signal and dir_signal_63 and exp_signal:
                 signal = "STRONG ENTRY"
@@ -297,6 +310,15 @@ def run_backtest(df_full):
             else:
                 signal = "STAY OUT"
 
+            # Option B (S18): P4 gate — one-tier-down downgrade when exit_signal fires.
+            # STRONG ENTRY → CAUTION; CAUTION / SHORT-TERM ONLY → STAY OUT; LEAPS ONLY unchanged.
+            if exit_signal and signal == "STRONG ENTRY":
+                signal_gated = "CAUTION"
+            elif exit_signal and signal in ("CAUTION", "SHORT-TERM ONLY"):
+                signal_gated = "STAY OUT"
+            else:
+                signal_gated = signal
+
             fwd_return = close.iloc[i + P2_FORWARD_DAYS] / close.iloc[i] - 1
             fwd_126 = i + 126
             fwd_return_126d = (
@@ -307,9 +329,11 @@ def run_backtest(df_full):
             results.append({
                 "date":          date,
                 "signal":        signal,
+                "signal_gated":  signal_gated,
                 "dir_prob":      dir_prob,
                 "dir_prob_63":   dir_prob_63,
                 "exp_prob":      exp_prob,
+                "exit_prob":     exit_prob,
                 "fwd_return":    fwd_return,
                 "fwd_return_126d": fwd_return_126d,
                 "window":        window_num,
@@ -323,18 +347,18 @@ def run_backtest(df_full):
 # ─────────────────────────────────────────
 # 6. SUMMARIZE RESULTS
 # ─────────────────────────────────────────
-def summarize(results):
+def summarize(results, signal_col="signal", label="UNGATED"):
     order  = ["STRONG ENTRY", "CAUTION", "SHORT-TERM ONLY", "LEAPS ONLY", "STAY OUT", "ALL DAYS"]
     colors = {"STRONG ENTRY": "#3fb950", "CAUTION": "#ffa657",
               "SHORT-TERM ONLY": "#d2a8ff", "LEAPS ONLY": "#a5d6ff", "STAY OUT": "#f85149", "ALL DAYS": "#58a6ff"}
 
     all_row = results.copy()
-    all_row["signal"] = "ALL DAYS"
+    all_row[signal_col] = "ALL DAYS"
     combined = pd.concat([results, all_row])
 
     stats = []
     for sig in order:
-        subset = combined[combined["signal"] == sig]["fwd_return"].dropna()
+        subset = combined[combined[signal_col] == sig]["fwd_return"].dropna()
         if len(subset) == 0:
             continue
         stats.append({
@@ -351,7 +375,7 @@ def summarize(results):
     df_stats = pd.DataFrame(stats).set_index("Signal")
 
     print(f"\n{'─'*80}")
-    print(f"  WALK-FORWARD BACKTEST RESULTS — {TICKER}  "
+    print(f"  WALK-FORWARD BACKTEST RESULTS — {TICKER}  [{label}]  "
           f"({results.index[0].date()} to {results.index[-1].date()})")
     print(f"{'─'*80}")
     print(f"  {'Signal':<16} {'Count':>6} {'Avg Ret':>9} {'Median':>8} "
@@ -370,10 +394,10 @@ def summarize(results):
     print(f"{'─'*80}\n")
 
     # ── 6-month forward return table ──────────────────────────────────────────
-    combined_126 = pd.concat([results.copy(), results.copy().assign(signal="ALL DAYS")])
+    combined_126 = pd.concat([results.copy(), results.copy().assign(**{signal_col: "ALL DAYS"})])
     stats_126 = []
     for sig in order:
-        subset = combined_126[combined_126["signal"] == sig]["fwd_return_126d"].dropna()
+        subset = combined_126[combined_126[signal_col] == sig]["fwd_return_126d"].dropna()
         if len(subset) == 0:
             continue
         stats_126.append({
@@ -389,7 +413,7 @@ def summarize(results):
 
     n_nan = results["fwd_return_126d"].isna().sum()
     print(f"{'─'*80}")
-    print(f"  6-MONTH FORWARD RETURNS — {TICKER}  "
+    print(f"  6-MONTH FORWARD RETURNS — {TICKER}  [{label}]  "
           f"(excl. last 126 trading days; {n_nan} rows NaN)")
     print(f"{'─'*80}")
     print(f"  {'Signal':<16} {'Count':>6} {'Avg Ret':>9} {'Median':>8} "
@@ -410,6 +434,46 @@ def summarize(results):
     print(f"{'─'*80}\n")
 
     return df_stats, order, colors
+
+
+def summarize_p4_gate_ab(results):
+    """A/B comparison of ungated vs P4-gated STRONG ENTRY metrics.
+
+    Accept criterion: gated STRONG ENTRY avg return strictly > ungated
+    AND signal count doesn't collapse below 300 (sample-size floor).
+    """
+    print(f"\n{'═'*80}")
+    print(f"  PHASE 4 GATE — A/B COMPARISON (15d forward returns)")
+    print(f"{'═'*80}")
+    print(f"  {'Signal':<18} {'Count U':>8} {'Count G':>8} {'Avg U':>8} {'Avg G':>8} {'Δ Avg':>8} {'Win U':>7} {'Win G':>7}")
+    print(f"  {'─'*78}")
+    for sig in ["STRONG ENTRY", "CAUTION", "SHORT-TERM ONLY", "LEAPS ONLY", "STAY OUT"]:
+        u = results[results["signal"] == sig]["fwd_return"].dropna()
+        g = results[results["signal_gated"] == sig]["fwd_return"].dropna()
+        if len(u) == 0 and len(g) == 0:
+            continue
+        u_avg  = u.mean() if len(u) > 0 else 0
+        g_avg  = g.mean() if len(g) > 0 else 0
+        u_win  = (u > 0).mean() if len(u) > 0 else 0
+        g_win  = (g > 0).mean() if len(g) > 0 else 0
+        delta  = g_avg - u_avg
+        print(f"  {sig:<18} {len(u):>8} {len(g):>8} {u_avg:>7.1%} {g_avg:>7.1%} "
+              f"{delta:>+7.2%} {u_win:>7.1%} {g_win:>7.1%}")
+
+    # Verdict on STRONG ENTRY (the primary signal)
+    u_strong = results[results["signal"] == "STRONG ENTRY"]["fwd_return"].dropna()
+    g_strong = results[results["signal_gated"] == "STRONG ENTRY"]["fwd_return"].dropna()
+    u_avg = u_strong.mean() if len(u_strong) > 0 else 0
+    g_avg = g_strong.mean() if len(g_strong) > 0 else 0
+    print(f"  {'─'*78}")
+    print(f"  STRONG ENTRY verdict:")
+    if len(g_strong) < 300:
+        print(f"    ✗ REJECT — gated count {len(g_strong)} below sample-size floor (300)")
+    elif g_avg > u_avg:
+        print(f"    ✓ ACCEPT — gated avg {g_avg:.2%} > ungated {u_avg:.2%}  (Δ {g_avg - u_avg:+.2%})")
+    else:
+        print(f"    ✗ REJECT — gated avg {g_avg:.2%} not strictly above ungated {u_avg:.2%}  (Δ {g_avg - u_avg:+.2%})")
+    print(f"{'═'*80}\n")
 
 
 # ─────────────────────────────────────────
@@ -639,7 +703,16 @@ if __name__ == "__main__":
         print(f"\nSweep summary saved -> {out}")
     else:
         results = run_backtest(df_full)
-        df_stats, order, colors = summarize(results)
+
+        # Ungated (baseline) — current production hierarchy
+        df_stats, order, colors = summarize(results, signal_col="signal", label="UNGATED")
+
+        # Gated (Option B candidate) — P4 downgrades STRONG ENTRY → CAUTION, CAUTION/SHORT-TERM → STAY OUT
+        summarize(results, signal_col="signal_gated", label="GATED (Phase 4)")
+
+        # A/B comparison + accept/reject verdict on STRONG ENTRY
+        summarize_p4_gate_ab(results)
+
         plot_results(df_stats, order, colors, results)
 
         out = os.path.join(DATA_DIR, f"{TICKER.lower()}_backtest_results.csv")

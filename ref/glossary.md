@@ -1438,3 +1438,129 @@ AMD also reads STAY OUT today, but the numbers behind that decision look very di
   ├──────────────────────────┼────────────────────────────────────────────────────────────────────────────────┤
   │ All three phases agree   │ (None of these today — what STRONG ENTRY actually looks like)                  │
   └──────────────────────────┴────────────────────────────────────────────────────────────────────────────────┘
+
+   # Backlog priorities — explained
+
+  1. Exit-signal model (highest leverage)
+
+  The framework is entirely entry-side: it tells you when to open a position but says nothing about when to close. Today an exit is implicit — you ride the
+  15d / 63d / 6mo horizon and hope. For 6-12 month LEAPS, the gap between "STRONG ENTRY fires" and "thesis breaks" can be 4-5 months of unrealized P&L that
+  you're managing by feel. A sibling logistic-regression model — same feature set, target = "max drawdown within next 10d exceeds X" or "63d forward return
+  turns negative conditional on currently held position" — would give a symmetric framework. Hardest part is the target definition; the features and
+  infrastructure are already there.
+
+  2. Regime detection layer
+
+  Phase 2 is trained on a single distribution but the world has multiple — calm trend, calm chop, vol expansion, crisis. The 2020-2026 training window mixes
+   all of these and the model averages over them. A regime tag (HMM on VIX + term structure, or a simple change-point detector, or even rule-based VIX
+  bands) used as either a gating filter or a feature would let signals behave differently in different regimes. Most directly addresses the
+  geopolitical-shock limitation called out in the framework — you can't predict the shock but you can know you're in a stress regime and downweight
+  contraction signals accordingly.
+
+  3. Net-of-cost backtest returns
+
+  All current backtest numbers are gross. For 6-12 month options, bid-ask spread + commissions eat roughly 0.3-0.8pp per round trip. STRONG ENTRY QQQ at
+  +1.9% / 15d becomes ~+1.4% net, and CAUTION at +1.2% likely drops below STAY OUT once you net costs. This wouldn't change the signal hierarchy but would
+  change sizing decisions and the marginal cases (SHORT-TERM ONLY especially). Implementation is mechanical: add an estimated cost per signal type to
+  backtest.py:summarize().
+
+  4. Portfolio-level context
+
+  Models score one ticker in isolation. If STRONG ENTRY fires simultaneously on AMD + NVDA, that's not two independent bets — it's one concentrated
+  semiconductor bet. Same for QQQ + any megacap component. Needs (a) a correlation matrix layer and (b) sector exposure tracking. Output: a "max position
+  size given existing portfolio" multiplier on top of the FULL/REDUCED bins. Lower-leverage than the first three because it doesn't generate new alpha, but
+  it caps drawdown when correlated signals cluster.
+
+  5. Kelly-style continuous sizing
+
+  Current sizing is binary (FULL or REDUCED). Logistic regression actually returns a continuous probability — 0.62 and 0.84 both clear the 0.55 threshold
+  but have very different expected edge. Kelly fraction = (edge / variance) sized off the predicted probability would extract more from the high-confidence
+  tail (where NVDA's edge lives — see the S11 finding). Risk: Kelly is notoriously aggressive on noisy probabilities; a half-Kelly or fractional-Kelly
+  variant is safer.
+
+  6. Smoke-test layer
+
+  Zero tests in repo today. The S14/S16 drift bug — entry.py never refactored to use modules/features.py, then reporting precision at the wrong threshold —
+  sat undetected until the manual pipeline verification in S16. A small pytest suite asserting "entry.py and direction.py produce identical Phase 2
+  precision for QQQ" would have caught it immediately. Highest-leverage version is roughly five regression tests pinning current QQQ baselines so any
+  feature/threshold change shows its effect explicitly.
+
+  7. Short interest ratio (FINRA monthly)
+
+  New feature, not a structural change. Monthly short-interest data from FINRA captures squeeze setups (rapid SI buildup) that pure price/vol features miss.
+   Useful specifically for AMD/NVDA/SOFI/RIVN tier — high-beta individual stocks where short-squeeze moves are common an  the FULL/REDUCED bins. Lower-leverage than the first three because it doesn't generate new alpha, but it caps drawdown
+   when correlated signals cluster.
+
+  5. Kelly-style continuous sizing
+
+  Current sizing is binary (FULL or REDUCED). Logistic regression actually returns a continuous probability — 0.62 and
+  0.84 both clear the 0.55 threshold but have very different expected edge. Kelly fraction = (edge / variance) sized off
+   the predicted probability would extract more from the high-confidence tail (where NVDA's edge lives — see the S11
+  finding). Risk: Kelly is notoriously aggressive on noisy probabilities; a half-Kelly or fractional-Kelly variant is
+  safer.
+
+  6. Smoke-test layer
+
+  Zero tests in repo today. The S14/S16 drift bug — entry.py never refactored to use modules/features.py, then reporting
+   precision at the wrong threshold — sat undetected until the manual pipeline verification in S16. A small pytest suite
+   asserting "entry.py and direction.py produce identical Phase 2 precision for QQQ" would have caught it immediately.
+  Highest-leverage version is roughly five regression tests pinning current QQQ baselines so any feature/threshold
+  change shows its effect explicitly.
+
+
+  5. Kelly-style continuous sizing
+
+  Current sizing is binary (FULL or REDUCED). Logistic regression actually returns a continuous probability — 0.62 and 0.84 both clear the 0.55 threshold
+  but have very different expected edge. Kelly fraction = (edge / variance) sized off the predicted probability would extract more from the high-confidence
+  tail (where NVDA's edge lives — see the S11 finding). Risk: Kelly is notoriously aggressive on noisy probabilities; a half-Kelly or fractional-Kelly
+  variant is safer.
+
+  6. Smoke-test layer
+
+  Zero tests in repo today. The S14/S16 drift bug — entry.py never refactored to use modules/features.py, then reporting precision at the wrong threshold —
+  sat undetected until the manual pipeline verification in S16. A small pytest suite asserting "entry.py and direction.py produce identical Phase 2
+  precision for QQQ" would have caught it immediately. Highest-leverage version is roughly five regression tests pinning current QQQ baselines so any
+  feature/threshold change shows its effect explicitly.
+
+  7. Short interest ratio (FINRA monthly)
+
+  New feature, not a structural change. Monthly short-interest data from FINRA captures squeeze setups (rapid SI buildup) that pure price/vol features miss.
+   Useful specifically for AMD/NVDA/SOFI/RIVN tier — high-beta individual stocks where short-squeeze moves are common and currently invisible to the model.
+  Cost: monthly update cadence (not daily), and only meaningful on individual stocks not ETFs.
+
+  8. Earnings estimate revisions
+
+  The framework already has Days_to_earnings but doesn't know whether the Street is revising estimates up or down going into the print. Earnings revision
+  momentum is one of the more durable individual-stock alpha factors. Data source is the tricky part — yfinance doesn't expose this; needs a paid feed
+  (FactSet, Zacks, or scraping). Lowest-priority of the eight because the data acquisition is the bulk of the work.
+
+  ---
+  Leverage ranking by my read: 1 → 2 → 6 → 3 → 5 → 4 → 7 → 8. Exit-signal model gives you a whole new dimension of the framework; regime detection directly
+  addresses the framework's biggest known weakness (shocks); smoke tests prevent further drift bugs. The others are real but more incremental.
+
+What Phase 4 can't do for LEAPS: serve as a binary programmatic gate that automatically downgrades entry signals. The backtest showed this destroys avg
+  return because it filters out 15d-wobble-then-recover days that are big 6mo winners. The mechanical gate failed.
+
+  What Phase 4 can still do for LEAPS: serve as information feeding into decisions a LEAPS-focused trader still makes within their 60-180 day holding
+  period.
+
+  Concrete use cases that survive the gate rejection:
+
+  1. Entry timing within multi-day STRONG ENTRY windows. When STRONG ENTRY fires 3 days in a row, all else equal, prefer the day with lower Phase 4
+  probability. The 15d drawdown is real even if it recovers — entering on the day BEFORE a 4% drop means starting your 6-month hold from a worse cost basis.
+  2. Continuous sizing modulation. The gate's failure mode was binary thinking: "P4 fires → no STRONG ENTRY." But the same signal works fine as a continuous
+   knob: STRONG ENTRY + P4 prob 18% → full size, STRONG ENTRY + P4 prob 55% → 60% size. Backtest didn't test this; it might preserve edge while reducing
+  variance. Related to backlog #5 (Kelly-style sizing).
+  3. Scale-in timing. Building a position over weeks (rather than one shot), P4 fires → pause adds, wait. Doesn't affect the entry decision, affects pace of
+   capital deployment.
+  4. Premium-cost context. If P4 fires AND IV/HV is already elevated, the options market is pricing in something Phase 4 also sees — premium will likely pop
+   further. Defer the entry until either Phase 4 cools or IV resets. The IV/HV gate already does part of this; P4 sharpens the read.
+  5. Held-position context. You're in a LEAPS position. P4 fires on day 30 of your hold. Doesn't mean exit — but maybe don't ADD to the position, maybe set
+  a tighter mental stop, maybe consider a short-dated put hedge for the next 15d. The 15d horizon now matches the decision you're making.
+
+  One genuine number from the rejected backtest worth keeping: gated STRONG ENTRY had higher win rate (67.2% vs 64.2% on QQQ) but lower avg return. A trader
+   who values consistency over magnitude — for psychological reasons, drawdown tolerance, or fixed-fraction sizing — might genuinely prefer the gated set.
+  The backtest verdict ("reject") was specific to my acceptance criterion (avg return). Different criteria give different answers.
+
+  The right shape for P4 in a LEAPS workflow is Option A — display-only, user reads the signal, factors it into the decisions above. That's already shipped
+  in entry.py. The gate validation didn't kill Phase 4's role; it just confirmed the role is informational, not programmatic.

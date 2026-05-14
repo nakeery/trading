@@ -12,8 +12,7 @@ import os
 import datetime
 import requests
 
-# MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY", "")
-MASSIVE_API_KEY = "T7TSg1ASBMXeGvCea9XRfUyJ9Mmm2Gzd"
+MASSIVE_API_KEY = os.environ.get("MASSIVE_API_KEY", "")
 MASSIVE_URL     = "https://api.massive.com"
 
 # IV columns split by downstream usage:

@@ -29,8 +29,9 @@ from modules.massive import IV_COLS, IV_META_COLS, IV_FEATURE_COLS
 from modules.features import (
     HV_WINDOW, IV_RANK_WINDOW,
     P2_FORWARD_DAYS, P2B_FORWARD_DAYS, P3_FORWARD_DAYS,
-    P2_VOL_MULTIPLE, P3_VOL_MULTIPLE,
-    compute_hv_features, compute_vix_features,
+    P2_VOL_MULTIPLE, P3_VOL_MULTIPLE, P4_VOL_MULTIPLE,
+    compute_hv_features, compute_vix_features, add_trend_break_features,
+    compute_p4_drawdown_threshold, add_p4_drawdown_target,
     add_earnings_proximity, normalize_features, compute_vol_thresholds,
 )
 
@@ -53,6 +54,9 @@ P2_CALIBRATE        = False  # Decision 1 (S11) reverted as default after NVDA r
 P2_THRESHOLD        = 0.55   # Phase 2 (15d) cutoff. Set from P2_CALIBRATE in __main__: 0.50 calibrated / 0.55 raw.
 P2B_THRESHOLD       = 0.55  # Phase 2B (63d) raw cutoff — calibration deferred to Decision 2
 P3_THRESHOLD        = 0.60  # IV expansion cutoff (best precision from Phase 3)
+P4_FORWARD_DAYS     = 15    # Phase 4 exit window — symmetric with P2 entry; 15d production default (S18)
+P4_THRESHOLD        = 0.55  # Phase 4 drawdown cutoff
+P4_GATE             = False # Default OFF — pass --p4-gate to enable. Pending backtest validation.
 RANDOM_STATE        = 42
 
 IV_FEATURES = False  # set by --iv-features CLI arg; when True, Phase 3 uses IV_FEATURE_COLS as features
@@ -127,6 +131,7 @@ def build_features(df, benchmarks):
 
     df = add_earnings_proximity(df, TICKER)
     df = add_catalyst_proximity(df, TICKER, MODULE_DIR, for_direction=True)
+    df = add_trend_break_features(df)  # must precede normalize_features (drops MA cols)
     df = normalize_features(df)
 
     return df
@@ -250,7 +255,9 @@ def print_combined_signal(df_full, direction_prob, dir_prob_63, expansion_prob,
                           iv_rank, iv_pct, hv_20,
                           dir_base_rate, dir_base_rate_63, exp_base_rate,
                           dir_contributors, dir_contributors_63, exp_contributors,
-                          iv_info=None):
+                          iv_info=None,
+                          exit_prob=None, exit_base_rate=None, exit_contributors=None,
+                          exit_drawdown_threshold=None):
     df_clean      = df_full.drop(columns=IV_COLS, errors="ignore").dropna()
     latest_date   = df_clean.index[-1].strftime("%Y-%m-%d")
     days_to_earn  = int(df_clean.iloc[-1].get("Days_to_earnings", 45))
@@ -300,15 +307,34 @@ def print_combined_signal(df_full, direction_prob, dir_prob_63, expansion_prob,
             sizing      = "N/A"
             sizing_note = "No directional edge — wait for Phase 2 signal before sizing."
 
-    # ── IV/HV gate: downgrade STRONG ENTRY if options-market premium is too rich ──
+    # ── Gates: P4 exit gate first (multi-tier), then IV/HV gate (STRONG ENTRY only) ──
     signal_pre_gate = signal
-    gate_msg = None
+    gate_msgs = []
+
+    # P4 exit gate (Option B, S18): one-tier downgrade when Phase 4 forecasts drawdown.
+    # STRONG ENTRY → CAUTION, CAUTION → STAY OUT, SHORT-TERM ONLY → STAY OUT, LEAPS ONLY unchanged.
+    if P4_GATE and exit_prob is not None and exit_prob >= P4_THRESHOLD:
+        if signal == "STRONG ENTRY":
+            signal, sizing = "CAUTION", "REDUCED"
+            sizing_note = (f"Phase 4 forecasts {exit_prob:.0%} {P4_FORWARD_DAYS}d drawdown probability — "
+                           f"downgraded from STRONG ENTRY.")
+            gate_msgs.append(f"P4 gate: prob {exit_prob:.0%} >= {P4_THRESHOLD}")
+        elif signal in ("CAUTION", "SHORT-TERM ONLY"):
+            prev_signal = signal
+            signal, sizing = "STAY OUT", "N/A"
+            sizing_note = (f"Phase 4 forecasts {exit_prob:.0%} {P4_FORWARD_DAYS}d drawdown probability — "
+                           f"downgraded from {prev_signal}.")
+            gate_msgs.append(f"P4 gate: prob {exit_prob:.0%} >= {P4_THRESHOLD}")
+
+    # IV/HV gate (existing): downgrade STRONG ENTRY if options-market premium is too rich
     if iv_info is not None and signal == "STRONG ENTRY" and iv_info["ratio"] >= IV_HV_GATE_RICH:
         signal      = "CAUTION"
         sizing      = "REDUCED"
         sizing_note = (f"IV/HV ratio {iv_info['ratio']:.2f} ({iv_info['label']}) — "
                        f"premium pricing the vol-expansion thesis already; downgraded from STRONG ENTRY.")
-        gate_msg    = f"IV/HV gate triggered: ratio {iv_info['ratio']:.2f} >= {IV_HV_GATE_RICH}"
+        gate_msgs.append(f"IV/HV gate: ratio {iv_info['ratio']:.2f} >= {IV_HV_GATE_RICH}")
+
+    gate_msg = "; ".join(gate_msgs) if gate_msgs else None
 
     def fmt_contributors(contributors):
         parts = []
@@ -339,6 +365,17 @@ def print_combined_signal(df_full, direction_prob, dir_prob_63, expansion_prob,
     print(f"  Expansion Prob:     {expansion_prob:.1%}  (base rate: {exp_base_rate:.1%})")
     print(f"  Signal:             {'EXPANSION ✓' if exp_signal else 'CONTRACTION ✗'}")
     print(f"  Drivers:            {fmt_contributors(exp_contributors)}")
+
+    # Phase 4 — exit risk (display-only; does not gate SIGNAL — S18)
+    if exit_prob is not None:
+        exit_signal = exit_prob >= P4_THRESHOLD
+        print(f"\n  EXIT RISK (Phase 4 — {P4_FORWARD_DAYS}d drawdown)  [threshold: {P4_THRESHOLD}]")
+        if exit_drawdown_threshold is not None:
+            print(f"  Drawdown Bar:       {exit_drawdown_threshold:.2%}")
+        print(f"  Drawdown Prob:      {exit_prob:.1%}  (base rate: {exit_base_rate:.1%})")
+        print(f"  Signal:             {'EXIT ⚠' if exit_signal else 'NO EXIT ✓'}")
+        if exit_contributors is not None:
+            print(f"  Drivers:            {fmt_contributors(exit_contributors)}")
 
     if iv_info is not None:
         print(f"\n  OPTIONS-MARKET CHECK (Massive snapshot)")
@@ -397,15 +434,25 @@ if __name__ == "__main__":
         help="Use real IV features (atm_iv_30d, iv_skew_25d, term_structure) for Phase 3. "
              "Default OFF — HV proxy, full history. Requires backfill_iv.py to have been run.",
     )
+    parser.add_argument(
+        "--p4-gate", action=argparse.BooleanOptionalAction, default=False,
+        dest="p4_gate",
+        help="Enable Phase 4 exit gate (Option B): one-tier-down downgrade when "
+             "Phase 4 forecasts drawdown. STRONG ENTRY → CAUTION, CAUTION → STAY OUT, "
+             "SHORT-TERM ONLY → STAY OUT, LEAPS ONLY unchanged. Default OFF until "
+             "backtest validation completes.",
+    )
     args = parser.parse_args()
     P2_CALIBRATE = args.calibrate
     IV_FEATURES  = args.iv_features
+    P4_GATE      = args.p4_gate
     P2_THRESHOLD = 0.50 if P2_CALIBRATE else 0.55
 
     mode_label = "CALIBRATED  (Decision 1 — isotonic, 5-fold CV)" if P2_CALIBRATE else "RAW  (Decision 1 disabled — class_weight=balanced)"
     print("═" * 64)
     print(f"  Phase 2 mode: {mode_label}")
-    print(f"  P2_THRESHOLD = {P2_THRESHOLD}  |  P2B_THRESHOLD = {P2B_THRESHOLD}  |  P3_THRESHOLD = {P3_THRESHOLD}")
+    print(f"  P2_THRESHOLD = {P2_THRESHOLD}  |  P2B_THRESHOLD = {P2B_THRESHOLD}  |  P3_THRESHOLD = {P3_THRESHOLD}  |  P4_THRESHOLD = {P4_THRESHOLD}")
+    print(f"  P4 gate: {'ON' if P4_GATE else 'OFF (display-only)'}")
     print("═" * 64)
     print()
 
@@ -457,15 +504,23 @@ if __name__ == "__main__":
     df_p3["iv_target"] = ((future_hv / df_p3["HV_20"] - 1) >= EXPANSION_THRESHOLD).astype(int)
     df_p3 = df_p3.iloc[:-P3_FORWARD_DAYS]
     clf3, scaler3, fcols3, tr3, te3, base3 = train(df_p3, "iv_target", use_iv_features=IV_FEATURES, decision_threshold=P3_THRESHOLD)
-    print(f"Phase 3  (IV timing)     — train precision: {tr3:.1%}  test precision: {te3:.1%}  base rate: {base3:.1%}\n")
+    print(f"Phase 3  (IV timing)     — train precision: {tr3:.1%}  test precision: {te3:.1%}  base rate: {base3:.1%}")
+
+    # Phase 4 — exit risk target (15d max drawdown >= vol-adjusted bar). Display-only.
+    p4_drawdown_threshold = compute_p4_drawdown_threshold(df_full, P4_FORWARD_DAYS)
+    df_p4 = add_p4_drawdown_target(df_full, P4_FORWARD_DAYS, p4_drawdown_threshold)
+    clf4, scaler4, fcols4, tr4, te4, base4 = train(df_p4, "exit_target", decision_threshold=P4_THRESHOLD)
+    print(f"Phase 4  (exit risk)     — train precision: {tr4:.1%}  test precision: {te4:.1%}  base rate: {base4:.1%}\n")
 
     # Current signals
     direction_prob    = get_current_prob(df_full, clf2,  scaler2,  fcols2)
     dir_prob_63       = get_current_prob(df_full, clf2b, scaler2b, fcols2b)
     expansion_prob    = get_current_prob(df_full, clf3,  scaler3,  fcols3)
+    exit_prob         = get_current_prob(df_full, clf4,  scaler4,  fcols4)
     dir_contributors    = get_top_contributors(df_full, clf2,  scaler2,  fcols2)
     dir_contributors_63 = get_top_contributors(df_full, clf2b, scaler2b, fcols2b)
     exp_contributors    = get_top_contributors(df_full, clf3,  scaler3,  fcols3)
+    exit_contributors   = get_top_contributors(df_full, clf4,  scaler4,  fcols4)
 
     latest = df_full[["HV_20", "IV_rank", "IV_pct"]].dropna().iloc[-1]
 
@@ -487,6 +542,10 @@ if __name__ == "__main__":
         dir_contributors_63,
         exp_contributors,
         iv_info=iv_info,
+        exit_prob=exit_prob,
+        exit_base_rate=base4,
+        exit_contributors=exit_contributors,
+        exit_drawdown_threshold=p4_drawdown_threshold,
     )
 
     print(f"[Phase 2: {'CALIBRATED' if P2_CALIBRATE else 'RAW'} — P2_THRESHOLD={P2_THRESHOLD} | Phase 3 IV: {'REAL' if IV_FEATURES else 'HV proxy'}]")
