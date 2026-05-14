@@ -346,13 +346,11 @@ Backlog (prioritized by leverage)
    tail (where NVDA edge lives — see S11). Risk: Kelly is aggressive on
    noisy probabilities; half-Kelly / fractional safer.
 
-6. Smoke-test layer (zero tests in repo; S14/S16 drift would have been caught)
-   Zero tests today. S14/S16 drift (entry.py un-refactored + reporting
-   precision at wrong threshold) went undetected until manual pipeline
-   verification. ~5 pytest regression tests pinning QQQ baselines + asserting
-   entry.py / direction.py identical precision would have caught it
-   immediately. Prevents future feature/threshold changes from silently
-   breaking things.
+6. ~~Smoke-test layer~~  SHIPPED 2026-05-14 (S19) as tests/test_smoke.py.
+   5 pytest tests: signal hierarchy (backtest CSV), STRONG ENTRY baseline
+   sanity (count/return/win-rate), vol thresholds range, signal logic unit
+   test via determine_signal() helper, S16 threshold-sensitivity guard.
+   Run: .\trade\Scripts\python.exe -m pytest tests/ -v  (~1-2s, no network).
 
 7. Short interest ratio (FINRA monthly) — squeeze-setup detection
    New feature, not structural change. Monthly FINRA SI captures squeeze
@@ -405,6 +403,9 @@ Operational Notes
   must be manually mirrored.
 - CLI flags: --calibrate (Phase 2 isotonic), --iv-features (Phase 3 real IV);
   both default OFF, available on direction/entry/backtest.
+- Smoke tests: .\trade\Scripts\python.exe -m pytest tests/ -v
+  Requires data/QQQ_indicators.csv + data/QQQ_backtest_results.csv.
+  pytest installed in venv (S19); not in requirements.txt.
 - iv_log.csv (S8 deprecated): preserved on disk as historical record but
   no new writes. IV history lives in indicators CSV.
 - Catalyst CSV: data/catalysts.csv must have no commas in description field
@@ -430,6 +431,30 @@ Tradier Config (modules/tradier.py + sizing.py)
 
 Recent Session Log
 ------------------
+
+S19 (2026-05-14) — Smoke-Test Layer Shipped
+1. Created tests/ directory: tests/__init__.py, tests/conftest.py,
+   tests/test_smoke.py. pytest installed into venv (not in requirements.txt).
+2. Extracted determine_signal(dir_win, dir_win_63, expansion) helper from
+   print_combined_signal() in entry.py — maps three binary phase signals
+   to five-tier SIGNAL label. Behaviour unchanged; now unit-testable.
+3. 5 smoke tests (all pass, ~1-2s, no network):
+   - test_signal_hierarchy_qqq: reads QQQ_backtest_results.csv, asserts
+     STRONG ENTRY > CAUTION > STAY OUT by avg 15d fwd_return.
+   - test_strong_entry_baseline_qqq: STRONG ENTRY count >= 300, avg >= 0.8%,
+     win rate >= 55%. Loose bounds survive daily train/test-split drift.
+   - test_vol_thresholds_range_qqq: compute_vol_thresholds() returns positive
+     values in expected ranges; t2b > t2 guards P2B_VOL_MULTIPLE not reverted.
+   - test_signal_logic: unit test of determine_signal() — all 8 input combos
+     map to correct label.
+   - test_entry_train_threshold_sensitivity (S16 regression guard): calls
+     entry.train() at decision_threshold=0.50 and 0.55; asserts prec_55 !=
+     prec_50 and prec_55 > prec_50. Uses stripped features (no VIX/benchmarks)
+     to avoid network calls — precision is sub-0.50 but threshold sensitivity
+     is intact. QQQ edge on stripped features is near-zero; test is about
+     threshold wiring, not absolute precision level.
+4. conftest.py fixtures: backtest_results + df_qqq are module-scoped (loaded
+   once per session); both pytest.skip if CSV not found (not an error).
 
 S18 (2026-05-13) — Phase 4 (Exit Signal) Shipped + Massive Env-Var Restored
 1. Massive API key regression resolved:

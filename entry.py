@@ -251,6 +251,17 @@ def read_iv_from_csv(df, hv_20):
     }
 
 
+def determine_signal(dir_win: bool, dir_win_63: bool, expansion: bool) -> str:
+    """Map Phase 2/2B/3 binary signals to the five-tier SIGNAL label."""
+    if dir_win and dir_win_63:
+        return "STRONG ENTRY" if expansion else "CAUTION"
+    if dir_win:
+        return "SHORT-TERM ONLY"
+    if dir_win_63:
+        return "LEAPS ONLY"
+    return "STAY OUT"
+
+
 def print_combined_signal(df_full, direction_prob, dir_prob_63, expansion_prob,
                           iv_rank, iv_pct, hv_20,
                           dir_base_rate, dir_base_rate_63, exp_base_rate,
@@ -271,18 +282,7 @@ def print_combined_signal(df_full, direction_prob, dir_prob_63, expansion_prob,
 
     iv_regime = "Low IV" if iv_rank < 0.33 else "High IV" if iv_rank > 0.67 else "Mid IV"
 
-    # Signal label matches backtest.py terminology
-    if dir_signal:
-        if dir_signal_63 and exp_signal:
-            signal = "STRONG ENTRY"
-        elif dir_signal_63 and not exp_signal:
-            signal = "CAUTION"
-        else:
-            signal = "SHORT-TERM ONLY"
-    elif dir_signal_63:
-        signal = "LEAPS ONLY"
-    else:
-        signal = "STAY OUT"
+    signal = determine_signal(dir_signal, dir_signal_63, exp_signal)
 
     # Sizing: Phase 3 is primary sizing input; Phase 2B adds a REDUCED override
     if dir_signal:

@@ -42,6 +42,14 @@ Install dependencies:
 
 ```bash
 pip install -r requirements.txt
+pip install pytest  # not in requirements.txt — dev-only
+```
+
+Run smoke tests:
+
+```powershell
+.\trade\Scripts\python.exe -m pytest tests/ -v
+# 5 tests, ~1-2s. Requires data/QQQ_indicators.csv + data/QQQ_backtest_results.csv.
 ```
 
 ### Prompt counts per script (for piped input via Claude Code)
@@ -87,6 +95,7 @@ cmd /c "(echo TICKER && echo.) | python -X utf8 script.py" 2>&1
 | `modules/massive.py` | Massive.com API client + `get_chain_summary()` + `get_historical_iv_snapshot()`; exports `IV_COLS`, `IV_FEATURE_COLS`, `IV_META_COLS` | Imported by `indicators.py` (harvest), `backfill_iv.py` (history), and 5 ML scripts (exclude from features) |
 | `modules/bs_invert.py` | Black-Scholes implied-vol solver (Newton-Raphson + bisection fallback) — used by `backfill_iv.py` | Imported by `modules/massive.py` |
 | `modules/tradier.py` | Tradier API client + `get_atm_iv()` | Imported by `sizing.py` only |
+| `tests/test_smoke.py` | 5 pytest regression guards (signal hierarchy, STRONG ENTRY baseline, vol thresholds, signal logic, S16 threshold-sensitivity guard) | Run manually; requires `data/QQQ_*.csv` |
 
 All CSVs and PNGs are written to the `data/` subdirectory (must exist — create manually if missing).
 
@@ -121,6 +130,7 @@ All CSVs and PNGs are written to the `data/` subdirectory (must exist — create
 
 ## Key Design Decisions
 
+- **`determine_signal(dir_win, dir_win_63, expansion)` in `entry.py`** — module-level helper extracted from `print_combined_signal()` (S19). Maps the three binary phase signals to the five-tier label. Used by `print_combined_signal()` and directly importable for unit testing (`tests/test_smoke.py:test_signal_logic`).
 - **Logistic regression only** — intentional for interpretability; black-box models avoided
 - **Time-based train/test split** (not random) — avoids lookahead bias in time series
 - **Price-level features normalized** to ratios/pct_change — ticker-agnostic and scale-invariant
@@ -284,7 +294,7 @@ See `memory/context.md` "Geopolitical Risk Limitation" for proposed mitigations 
 
 ## Tech Stack
 
-`yfinance`, `pandas`, `numpy`, `ta`, `matplotlib`, `scikit-learn` (LogisticRegression, StandardScaler, precision_score, CalibratedClassifierCV, brier_score_loss), `lxml` (earnings dates), `requests` (Tradier API via `modules/tradier.py` + Massive API via `modules/massive.py`)
+`yfinance`, `pandas`, `numpy`, `ta`, `matplotlib`, `scikit-learn` (LogisticRegression, StandardScaler, precision_score, CalibratedClassifierCV, brier_score_loss), `lxml` (earnings dates), `requests` (Tradier API via `modules/tradier.py` + Massive API via `modules/massive.py`), `pytest` (smoke tests — dev only, not in requirements.txt)
 
 ## Ticker Suitability Notes
 
