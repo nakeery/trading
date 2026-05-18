@@ -1,13 +1,16 @@
 """
 Smoke tests for the options trading ML pipeline.
 
-5 regression guards:
+8 regression guards:
   1. Signal hierarchy (backtest CSV) — STRONG ENTRY > CAUTION > STAY OUT by avg return
   2. STRONG ENTRY baseline sanity (backtest CSV) — count/return/win-rate loose bounds
   3. Vol thresholds range (QQQ indicators CSV) — positive values in expected ranges
   4. Signal logic unit test — determine_signal() covers all 5 label cases
   5. Threshold sensitivity (S16 regression guard) — entry.train() precision changes
      when decision_threshold changes, confirming it is actually applied
+  6. Econ calendar module loads — import + ECON_FEATURE_COLS shape
+  7. Days_to_* bounds — all econ proximity columns in [0, 90], integer
+  8. Days_to_specific_event — hardcoded FOMC date → Days_to_FOMC matches expected
 """
 
 
@@ -128,3 +131,98 @@ def test_entry_train_threshold_sensitivity(df_qqq):
         f"QQQ Phase 2 precision at threshold 0.55 is implausibly outside [0.35, 0.90]: "
         f"{prec_55:.4f}"
     )
+
+
+# ─── Test 6: Econ calendar module loads ───────────────────────────────────────
+
+def test_econ_calendar_loads():
+    """Import the module, sanity-check ECON_FEATURE_COLS and ALL_SERIES."""
+    from modules import econ_calendar
+    assert hasattr(econ_calendar, "add_macro_event_proximity"), "missing add_macro_event_proximity"
+    assert hasattr(econ_calendar, "ECON_FEATURE_COLS"), "missing ECON_FEATURE_COLS"
+    assert hasattr(econ_calendar, "ALL_SERIES"), "missing ALL_SERIES"
+    # ECON_FEATURE_COLS = per-series + aggregate
+    assert len(econ_calendar.ECON_FEATURE_COLS) == len(econ_calendar.ALL_SERIES) + 1
+    assert econ_calendar.ECON_FEATURE_COLS[-1] == "Days_to_macro"
+    for name, _, _ in econ_calendar.ALL_SERIES:
+        assert f"Days_to_{name}" in econ_calendar.ECON_FEATURE_COLS
+
+
+# ─── Test 7: Days_to_* bounds ─────────────────────────────────────────────────
+
+def test_days_to_next_bounds(tmp_path):
+    """
+    Build a synthetic econ_calendar.csv with all 9 series; verify Days_to_*
+    columns are integer, in [0, SENTINEL_DAYS], for a row range spanning 2026.
+    No network — uses tmp_path fixture.
+    """
+    import pandas as pd
+    from modules.econ_calendar import (
+        add_macro_event_proximity, ECON_FEATURE_COLS, ALL_SERIES, SENTINEL_DAYS
+    )
+
+    # Synthetic calendar: one date per series in mid-June 2026.
+    rows = []
+    for i, (name, release_id, display) in enumerate(ALL_SERIES):
+        tier = 1 if i < 4 else 2
+        rows.append({
+            "series":       name,
+            "date":         f"2026-06-{15 + i:02d}",
+            "release_id":   release_id,
+            "release_name": display,
+            "tier":         tier,
+        })
+    cal_path = tmp_path / "econ_calendar.csv"
+    pd.DataFrame(rows).to_csv(cal_path, index=False)
+
+    # Synthetic input DataFrame: 30 daily rows spanning early-to-mid June 2026
+    idx = pd.date_range("2026-06-01", periods=30, freq="D")
+    df = pd.DataFrame({"dummy": range(30)}, index=idx)
+    df = add_macro_event_proximity(df, data_dir=str(tmp_path))
+
+    for col in ECON_FEATURE_COLS:
+        assert col in df.columns, f"missing column {col}"
+        vals = df[col]
+        assert vals.min() >= 0, f"{col} has negative values: min={vals.min()}"
+        assert vals.max() <= SENTINEL_DAYS, f"{col} exceeds {SENTINEL_DAYS}: max={vals.max()}"
+        # All ints (numpy ints OK)
+        assert pd.api.types.is_integer_dtype(vals) or (vals % 1 == 0).all(), (
+            f"{col} contains non-integer values"
+        )
+
+
+# ─── Test 8: Days_to_specific_event ───────────────────────────────────────────
+
+def test_days_to_specific_event(tmp_path):
+    """
+    Hardcoded FOMC date 2026-06-18; row at 2026-06-11 → Days_to_FOMC == 7.
+    Validates the days-to-next-event arithmetic end-to-end.
+    """
+    import pandas as pd
+    from modules.econ_calendar import add_macro_event_proximity, SENTINEL_DAYS
+
+    rows = [{
+        "series":       "FOMC",
+        "date":         "2026-06-18",
+        "release_id":   326,
+        "release_name": "FOMC Press Release",
+        "tier":         1,
+    }]
+    cal_path = tmp_path / "econ_calendar.csv"
+    pd.DataFrame(rows).to_csv(cal_path, index=False)
+
+    idx = pd.DatetimeIndex([
+        pd.Timestamp("2026-06-11"),   # 7d before
+        pd.Timestamp("2026-06-18"),   # day-of (0d)
+        pd.Timestamp("2026-06-19"),   # 1d after — no future events → sentinel
+    ])
+    df = pd.DataFrame({"dummy": [0, 1, 2]}, index=idx)
+    df = add_macro_event_proximity(df, data_dir=str(tmp_path))
+
+    assert int(df.loc["2026-06-11", "Days_to_FOMC"]) == 7
+    assert int(df.loc["2026-06-18", "Days_to_FOMC"]) == 0
+    assert int(df.loc["2026-06-19", "Days_to_FOMC"]) == SENTINEL_DAYS
+    # Days_to_macro takes min across all series — only FOMC has data so == Days_to_FOMC for this row
+    assert int(df.loc["2026-06-11", "Days_to_macro"]) == 7
+    # Series with no data fall back to sentinel
+    assert int(df.loc["2026-06-11", "Days_to_CPI"]) == SENTINEL_DAYS

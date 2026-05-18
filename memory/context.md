@@ -252,6 +252,91 @@ Current backfill state:
 
 ────────────────────────────────────────────────────────────────────────
 
+Econ Calendar Integration
+-------------------------
+
+New module 2026-05-18 (modules/econ_calendar.py) — forward-looking macro
+release proximity features. Addresses the Geopolitical/Exogenous Shock
+Limitation noted below: lets models position around scheduled FOMC/CPI/NFP/
+PCE releases that pure price-history features can't see coming.
+
+Data source: FRED API (https://api.stlouisfed.org/fred). Free key required;
+read from $env:FRED_API_KEY. Endpoint release/dates with
+include_release_dates_with_no_data=true returns the forward calendar.
+
+Schema (modules/econ_calendar.csv):
+  series,date,release_id,release_name,tier
+
+Tracked series:
+  Tier 1: FOMC, CPI, NFP, PCE
+  Tier 2: PPI, GDP, Retail, JOLTS, Claims
+
+Feature columns added by add_macro_event_proximity(df, data_dir, for_direction):
+  Days_to_FOMC, Days_to_CPI, Days_to_NFP, Days_to_PCE,
+  Days_to_PPI,  Days_to_GDP, Days_to_Retail, Days_to_JOLTS, Days_to_Claims,
+  Days_to_macro  (aggregate min across all series)
+
+All values are integer, bounded [0, 90]. Sentinel 90 fills missing CSV /
+no future event found. for_direction kwarg reserved for future use
+(signature symmetry with add_catalyst_proximity); ignored in v1.
+
+CLI: gated by --econ-features flag in entry/direction/volatility/exit/
+backtest (default OFF — REJECTED by S20 A/B validation, see below).
+calibrate_multipliers.py has a module-level ECON_FEATURES = False constant
+(no argparse) so vol-multiplier calibration matches the production feature
+set by default.
+
+A/B validation REJECTED (2026-05-18) — same pattern as S11 calibration:
+                       Baseline           --econ-features      Δ
+  QQQ STRONG ENTRY 15d  570 / 1.8% / 64%   515 / 1.7% / 64%    -0.1pp avg
+  QQQ STRONG ENTRY 6mo  +9.5% / 76.7%      +9.4% / 77.1%       ~flat
+  QQQ LEAPS ONLY 6mo    +7.4% / 69.4%      +6.4% / 68.4%       -1.0pp ◄ now below ALL DAYS
+  NVDA STRONG ENTRY 15d 355 / 2.9% / 59%   273 / -0.1% / 54%   -3.0pp ◄ destroyed
+  NVDA STRONG ENTRY 6mo +33.4% / 71%       +13.6% / 60%        -19.8pp ◄ catastrophic
+  NVDA hierarchy        STRONG > CAUTION   STRONG is WORST     BROKEN
+Root cause: adding 10 feature cols (~33% inflation on ~30-base set) compresses
+the high-confidence tail where individual-stock edge concentrates. Index ETFs
+(QQQ) absorb this marginally; individual stocks (NVDA) catastrophically lose
+discrimination. Identical to S11 isotonic calibration regression.
+Feature retained as opt-in flag. Future experiments may revisit with smaller
+feature subset (e.g. Tier 1 only: 4 cols + aggregate = 5) or richer transforms
+(actual values, surprise data) — but not before backtest re-validates.
+
+FOMC release_id=101 was unusable — FRED returns every weekday as a "press
+release" date (3896 total entries). Switched to a hardcoded FOMC_MEETING_DATES
+constant in econ_calendar.py with 48 dates (2022-2027) curated from
+federalreserve.gov/monetarypolicy/fomccalendars.htm. Annual maintenance
+(update each November when Fed publishes next 2 years' calendar).
+
+Refresh cadence: weekly. Run:
+  python -m modules.econ_calendar --refresh
+
+Verify release IDs (one-time, before first refresh):
+  python -m modules.econ_calendar --list-releases
+
+Failure modes (graceful — mirror catalyst pattern):
+  FRED_API_KEY unset + --refresh   → RuntimeError, no partial write
+  FRED_API_KEY unset + pipeline    → no-op (CSV read only; no key needed)
+  CSV missing                      → fill all Days_to_* with 90, warn
+  CSV staleness (< 30d forward)    → per-series warning, no fail
+
+Scope decisions (v1):
+- Proximity features only. Historical values (CPI YoY, NFP delta) and
+  surprise data (actual vs consensus) deferred — values introduce
+  as-of dating complexity; surprise data needs paid feed.
+- No per-ticker neutralization (no equivalent to EVENT_DRIVEN_TICKERS
+  for macro). The CRSP biotech case doesn't generalize — macro events
+  affect all tickers similarly.
+
+Smoke tests (tests/test_smoke.py) extended from 5 to 8:
+  test_econ_calendar_loads         module import + ECON_FEATURE_COLS shape
+  test_days_to_next_bounds         synthetic CSV via tmp_path; all cols
+                                   integer-valued, bounded [0, 90]
+  test_days_to_specific_event      FOMC 2026-06-18; row 2026-06-11 →
+                                   Days_to_FOMC == 7
+
+────────────────────────────────────────────────────────────────────────
+
 Geopolitical / Exogenous Shock Limitation
 -----------------------------------------
 
@@ -288,9 +373,10 @@ Active TODO
   edge vs HV proxy per ticker
 - Re-run AMD and NVDA backtests with P2B_VOL_MULTIPLE=0.55 (current tables
   are pre-S17; co-validate new multiple before treating 0.55 as permanent default)
-- Rotate MASSIVE_API_KEY at Massive.com — the prior key was committed to git
-  during the hardcode regression and must be considered compromised. Env-var
-  pattern restored 2026-05-13; old key still works until rotated.
+- ~~A/B backtest validation for --econ-features~~ COMPLETED 2026-05-18 (S20):
+  REJECTED. QQQ marginal pass (STRONG ENTRY 1.8% → 1.7%); NVDA catastrophic
+  (STRONG ENTRY 2.9% → -0.1%, hierarchy inverted). Same S11 pattern. Flag
+  retained opt-in; default OFF. See Econ Calendar Integration section above.
 - Phase 4 / exit.py follow-ups:
   - Co-validate on AMD + SOFI before treating 15d as universal default
     for exit.py output. AMD's vol scale (4.98% WIN_THRESHOLD vs QQQ
@@ -379,9 +465,6 @@ Known Issues
 ------------
 - modules/tradier.py: TRADIER_TOKEN reads $env:TRADIER_TOKEN if set, else
   hardcoded fallback. Set the env var to keep token out of git.
-- Old MASSIVE_API_KEY (used during S10-S17 hardcode regression) must be
-  rotated at Massive.com — it lived in git. Env-var pattern restored
-  2026-05-13; rotation still pending.
 
 ────────────────────────────────────────────────────────────────────────
 
@@ -432,6 +515,67 @@ Tradier Config (modules/tradier.py + sizing.py)
 Recent Session Log
 ------------------
 
+S20 (2026-05-18) — Econ Calendar Module Shipped + A/B REJECTED
+1. New module: modules/econ_calendar.py (~250 lines).
+   - FRED API client. Reads FRED_API_KEY env var; refresh fails clearly if unset.
+   - TIER1_SERIES = [(FOMC, 326, ...), (CPI, 10, ...), (NFP, 50, ...), (PCE, 21, ...)]
+     TIER2_SERIES = [(PPI, 46, ...), (GDP, 53, ...), (Retail, 117, ...),
+                     (JOLTS, 192, ...), (Claims, 32, ...)]
+     Release IDs are best-guess from FRED docs — verify via --list-releases
+     on first run before treating as canonical.
+   - add_macro_event_proximity(df, data_dir="modules", for_direction=False)
+     reads modules/econ_calendar.csv, computes Days_to_{name} for each series
+     plus Days_to_macro aggregate (min across all). Sentinel SENTINEL_DAYS=90
+     for missing CSV / no future event. Values bounded [0, 90], integer.
+     for_direction kwarg reserved for future use (signature symmetry with
+     add_catalyst_proximity); ignored in v1.
+   - CLI: `python -m modules.econ_calendar --refresh` (weekly cadence) and
+     `--list-releases` (one-time ID verification). Atomic write (tmp → rename).
+2. Wired 6 consumer files with --econ-features flag (default OFF):
+   entry.py, direction.py, volatility.py, exit.py, backtest.py,
+   calibrate_multipliers.py (latter via module-level constant, no argparse).
+   Insertion point in every script: immediately after add_catalyst_proximity,
+   before normalize_features (same conceptual tier).
+3. Smoke tests extended 5 → 8 (tests/test_smoke.py):
+   - test_econ_calendar_loads: import + ECON_FEATURE_COLS shape sanity
+   - test_days_to_next_bounds: synthetic CSV via tmp_path; all 10 Days_to_*
+     cols integer-valued, bounded [0, 90]
+   - test_days_to_specific_event: FOMC 2026-06-18; row 2026-06-11 →
+     Days_to_FOMC == 7. End-to-end arithmetic check, no network.
+   All 8 tests pass in ~1.2s. No-CSV path tested via tmp_path fixture.
+4. CLI design (default-OFF opt-in flag) chosen per --iv-features /
+   --calibrate / --p4-gate precedent. The framework has burned itself
+   defaulting things ON before backtest validation (S11 calibration
+   regression on NVDA, S18 P4 gate REJECT).
+5. Documentation: CLAUDE.md updated (workflow / module table / CLI flags
+   section / new Econ Calendar Config section). context.md updated with
+   Econ Calendar Integration section + active TODO entry for A/B
+   validation.
+6. FOMC release_id surprise: FRED release_id=101 ("FOMC Press Release")
+   publishes every weekday, not meeting dates. Switched to hardcoded
+   FOMC_MEETING_DATES constant (48 dates 2022-2027 from federalreserve.gov).
+   refresh() special-cases FOMC to read from this list instead of FRED.
+   Annual maintenance (Fed publishes next 2y calendar each November).
+   Also discovered: FRED's release/dates default sort is ASC, so for high-
+   volume releases (FOMC has 3896 total dates), first 1000 by default
+   are old. Fixed with sort_order=desc parameter.
+7. Other 8 series verified via release_id lookup. Corrections from
+   best-guess: PCE 21 → 54, Retail 117 → 436, Claims 32 → 180, FOMC 326 → 101.
+   CPI, NFP, PPI, GDP, JOLTS were right.
+8. A/B validation: QQQ marginal pass (STRONG ENTRY 1.8% → 1.7%, count
+   570 → 515; LEAPS ONLY 6mo regressed from 7.4% to 6.4% — now below ALL
+   DAYS baseline 7.0%, losing rationale). NVDA catastrophic: STRONG ENTRY
+   15d 2.9% → -0.1%, 6mo 33.4% → 13.6%, hierarchy fully inverted (STRONG
+   ENTRY becomes the WORST signal). Same failure mode as S11 isotonic
+   calibration — adding ~33% feature inflation compresses high-confidence
+   tail where individual-stock edge lives. Flag stays opt-in, default OFF.
+9. Process note: validates the framework's default-OFF-then-validate
+   discipline. The QQQ result alone (1.7%) looked acceptable; only
+   cross-ticker NVDA test revealed the structural problem. This is the
+   third time this pattern has fired (S11 calibrate, S18 p4-gate, S20
+   econ-features) — strong evidence that cross-ticker validation is
+   load-bearing, not optional.
+
 S19 (2026-05-14) — Smoke-Test Layer Shipped
 1. Created tests/ directory: tests/__init__.py, tests/conftest.py,
    tests/test_smoke.py. pytest installed into venv (not in requirements.txt).
@@ -459,8 +603,8 @@ S19 (2026-05-14) — Smoke-Test Layer Shipped
 S18 (2026-05-13) — Phase 4 (Exit Signal) Shipped + Massive Env-Var Restored
 1. Massive API key regression resolved:
    - modules/massive.py:15-16: restored env-var-only pattern; deleted
-     hardcoded fallback. Compromised key (was in git) must still be rotated
-     at Massive.com — flagged in Active TODO.
+     hardcoded fallback. Compromised key (was in git) was subsequently
+     rotated at Massive.com on 2026-05-15.
    - CLAUDE.md + context.md cleaned: removed "HARDCODED" warnings, pruned
      stale Known Issues (diag files / N_ESTIMATORS / mdates / add_vix
      wrappers — all resolved in S17 but list never updated).

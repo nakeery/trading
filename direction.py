@@ -28,6 +28,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import classification_report, confusion_matrix, ConfusionMatrixDisplay, brier_score_loss
 from modules.benchmarks import detect_benchmarks, detect_macro_features, add_macro_features, add_catalyst_proximity
+from modules.econ_calendar import add_macro_event_proximity
 from modules.massive import IV_COLS
 from modules.features import (
     HV_WINDOW, IV_RANK_WINDOW,
@@ -53,6 +54,7 @@ WIN_THRESHOLD_63 = 0.10  # Default (AMD). Set by compute_vol_thresholds() in __m
 TEST_SIZE      = 0.20   # Fraction of data held out as test set (time-based)
 DECISION_THRESHOLD = 0.55   # Probability cutoff for predicting Win (lower = more wins predicted)
 RANDOM_STATE       = 42
+ECON_FEATURES      = False  # set by --econ-features CLI arg; when True, Days_to_FOMC/CPI/... added
 
 
 # ─────────────────────────────────────────
@@ -318,9 +320,17 @@ if __name__ == "__main__":
         "--calibrate", action=argparse.BooleanOptionalAction, default=False,
         help="Use isotonic-calibrated Phase 2 (Decision 1, S11). Default OFF (NVDA regression: STRONG ENTRY 4.4% → -0.4%). Pass --calibrate to enable.",
     )
+    parser.add_argument(
+        "--econ-features", action=argparse.BooleanOptionalAction, default=False,
+        dest="econ_features",
+        help="Include macro-release proximity features (Days_to_FOMC, Days_to_CPI, ...) "
+             "from modules/econ_calendar.csv. Default OFF. "
+             "Requires `python -m modules.econ_calendar --refresh` to have been run.",
+    )
     args = parser.parse_args()
-    P2_CALIBRATE = args.calibrate
-    P2_THRESHOLD = 0.50 if P2_CALIBRATE else 0.55
+    P2_CALIBRATE  = args.calibrate
+    ECON_FEATURES = args.econ_features
+    P2_THRESHOLD  = 0.50 if P2_CALIBRATE else 0.55
 
     mode_label = "CALIBRATED  (Decision 1 — isotonic, 5-fold CV)" if P2_CALIBRATE else "RAW  (Decision 1 disabled — class_weight=balanced)"
     print("═" * 64)
@@ -363,6 +373,8 @@ if __name__ == "__main__":
         df = add_macro_features(df, macro, START_DATE, END_DATE)
     df = add_earnings_proximity(df, TICKER)
     df = add_catalyst_proximity(df, TICKER, MODULE_DIR, for_direction=True)
+    if ECON_FEATURES:
+        df = add_macro_event_proximity(df, MODULE_DIR)
     df = normalize_features(df)
 
     # Phase 2 — 15-day direction model (mode set via CLI flag — see banner)

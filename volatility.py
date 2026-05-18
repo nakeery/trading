@@ -28,6 +28,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import classification_report, brier_score_loss
 from modules.benchmarks import detect_macro_features, add_macro_features, add_catalyst_proximity
+from modules.econ_calendar import add_macro_event_proximity
 from modules.massive import IV_COLS, IV_META_COLS, IV_FEATURE_COLS
 from modules.features import (
     HV_WINDOW, IV_RANK_WINDOW, P3_FORWARD_DAYS, P3_VOL_MULTIPLE,
@@ -51,7 +52,8 @@ TEST_SIZE           = 0.20
 DECISION_THRESHOLD  = 0.50
 RANDOM_STATE        = 42
 
-IV_FEATURES = False  # set by --iv-features CLI arg; when True, IV_FEATURE_COLS used as features
+IV_FEATURES   = False  # set by --iv-features CLI arg; when True, IV_FEATURE_COLS used as features
+ECON_FEATURES = False  # set by --econ-features CLI arg; when True, Days_to_FOMC/CPI/... added
 
 
 # ─────────────────────────────────────────
@@ -358,8 +360,16 @@ if __name__ == "__main__":
              "backfilled indicators CSV. Default OFF — uses HV proxy (full history). "
              "Requires backfill_iv.py to have been run first.",
     )
+    parser.add_argument(
+        "--econ-features", action=argparse.BooleanOptionalAction, default=False,
+        dest="econ_features",
+        help="Include macro-release proximity features (Days_to_FOMC, Days_to_CPI, ...) "
+             "from modules/econ_calendar.csv. Default OFF. "
+             "Requires `python -m modules.econ_calendar --refresh` to have been run.",
+    )
     args = parser.parse_args()
-    IV_FEATURES = args.iv_features
+    IV_FEATURES   = args.iv_features
+    ECON_FEATURES = args.econ_features
 
     iv_mode = ("REAL IV FEATURES  (imputed missing → full history)"
                if IV_FEATURES else "HV PROXY  (full history)")
@@ -391,6 +401,8 @@ if __name__ == "__main__":
         df = add_macro_features(df, macro, START_DATE, END_DATE)
     df = add_earnings_proximity(df, TICKER)
     df = add_catalyst_proximity(df, TICKER, MODULE_DIR)
+    if ECON_FEATURES:
+        df = add_macro_event_proximity(df, MODULE_DIR)
     df = normalize_features(df)
     if IV_FEATURES:
         df = impute_iv_features(df)

@@ -36,6 +36,7 @@ from sklearn.metrics import classification_report, precision_score
 from modules.benchmarks import (
     detect_benchmarks, detect_macro_features, add_macro_features, add_catalyst_proximity,
 )
+from modules.econ_calendar import add_macro_event_proximity
 from modules.massive import IV_COLS
 from modules.features import (
     HV_WINDOW, IV_RANK_WINDOW,
@@ -57,6 +58,7 @@ MODULE_DIR     = "modules"
 TEST_SIZE          = 0.20
 DECISION_THRESHOLD = 0.55
 RANDOM_STATE       = 42
+ECON_FEATURES      = False  # set by --econ-features CLI arg; when True, Days_to_FOMC/CPI/... added
 
 
 # ─────────────────────────────────────────
@@ -245,7 +247,15 @@ def print_summary(results):
 # ─────────────────────────────────────────
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Phase 4 exit signal — drawdown forecast across 3 forward windows.")
+    parser.add_argument(
+        "--econ-features", action=argparse.BooleanOptionalAction, default=False,
+        dest="econ_features",
+        help="Include macro-release proximity features (Days_to_FOMC, Days_to_CPI, ...) "
+             "from modules/econ_calendar.csv. Default OFF. "
+             "Requires `python -m modules.econ_calendar --refresh` to have been run.",
+    )
     args = parser.parse_args()
+    ECON_FEATURES = args.econ_features
 
     print("═" * 64)
     print(f"  Phase 4 — Exit Signal (Drawdown Forecast)")
@@ -288,6 +298,8 @@ if __name__ == "__main__":
         df = add_macro_features(df, macro, START_DATE, END_DATE)
     df = add_earnings_proximity(df, TICKER)
     df = add_catalyst_proximity(df, TICKER, MODULE_DIR, for_direction=True)
+    if ECON_FEATURES:
+        df = add_macro_event_proximity(df, MODULE_DIR)
     df = normalize_features(df)
 
     # Save feature dataset (pre-target-truncation) — single CSV shared across windows.

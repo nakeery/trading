@@ -22,6 +22,14 @@ add it to `$PROFILE` for persistence across PowerShell sessions. If the env var 
 Massive client raises `RuntimeError` on the first API call; IV columns are written as NaN and
 `entry.py` warns to re-run.
 
+Weekly maintenance:
+
+```bash
+# Refresh forward economic release dates (FOMC, CPI, NFP, etc.) from FRED.
+# Required only if running with --econ-features (default OFF).
+python -m modules.econ_calendar --refresh
+```
+
 As-needed analysis:
 
 ```bash
@@ -49,7 +57,7 @@ Run smoke tests:
 
 ```powershell
 .\trade\Scripts\python.exe -m pytest tests/ -v
-# 5 tests, ~1-2s. Requires data/QQQ_indicators.csv + data/QQQ_backtest_results.csv.
+# 8 tests, ~1-2s. Requires data/QQQ_indicators.csv + data/QQQ_backtest_results.csv.
 ```
 
 ### Prompt counts per script (for piped input via Claude Code)
@@ -93,9 +101,10 @@ cmd /c "(echo TICKER && echo.) | python -X utf8 script.py" 2>&1
 | `modules/features.py` | Shared feature engineering (HV, VIX, earnings, normalize, vol thresholds, IV imputation, P4 drawdown threshold + target, trend-break features) + constants | Imported by direction/volatility/exit/entry/backtest |
 | `modules/benchmarks.py` | Sector benchmarks, macro features, catalyst proximity | Imported by direction/entry/backtest/volatility |
 | `modules/massive.py` | Massive.com API client + `get_chain_summary()` + `get_historical_iv_snapshot()`; exports `IV_COLS`, `IV_FEATURE_COLS`, `IV_META_COLS` | Imported by `indicators.py` (harvest), `backfill_iv.py` (history), and 5 ML scripts (exclude from features) |
+| `modules/econ_calendar.py` | FRED API client + `add_macro_event_proximity()` — adds `Days_to_FOMC/CPI/NFP/PCE/PPI/GDP/Retail/JOLTS/Claims/macro` proximity features. Standalone CLI: `python -m modules.econ_calendar --refresh` (weekly) | Imported by entry/direction/volatility/exit/backtest/calibrate_multipliers; gated by `--econ-features` flag (default OFF) |
 | `modules/bs_invert.py` | Black-Scholes implied-vol solver (Newton-Raphson + bisection fallback) — used by `backfill_iv.py` | Imported by `modules/massive.py` |
 | `modules/tradier.py` | Tradier API client + `get_atm_iv()` | Imported by `sizing.py` only |
-| `tests/test_smoke.py` | 5 pytest regression guards (signal hierarchy, STRONG ENTRY baseline, vol thresholds, signal logic, S16 threshold-sensitivity guard) | Run manually; requires `data/QQQ_*.csv` |
+| `tests/test_smoke.py` | 8 pytest regression guards (signal hierarchy, STRONG ENTRY baseline, vol thresholds, signal logic, S16 threshold-sensitivity, econ_calendar loads, Days_to_* bounds, days-to-specific-event) | Run manually; requires `data/QQQ_*.csv` |
 
 All CSVs and PNGs are written to the `data/` subdirectory (must exist — create manually if missing).
 
@@ -198,7 +207,7 @@ is excluded from production. Drawdown threshold = `P4_VOL_MULTIPLE × median_HV 
 Threshold sweep auto-marks optimal using `max(precision - base_rate) × log(signals)` — rewards edge
 above base rate and signal volume simultaneously.
 
-CLI flags (default OFF on all three; available on direction/entry/backtest):
+CLI flags (default OFF; available on direction/entry/volatility/exit/backtest):
 - `--calibrate` — isotonic Phase 2 (Decision 1, S11). Reverted to default OFF after NVDA regression
   (STRONG ENTRY 4.4% → -0.4%). Calibrated mode uses P2_THRESHOLD=0.50 instead of 0.55.
 - `--iv-features` — Phase 3 uses real Massive IV (`atm_iv_30d`, `iv_skew_25d`, `term_structure`)
@@ -210,6 +219,15 @@ CLI flags (default OFF on all three; available on direction/entry/backtest):
   sample-size floor. 15d gate filters 6mo winners that had 15d wobbles. Retained as opt-in flag for
   future experimentation. backtest.py always reports gated/ungated A/B (no flag) so re-validation
   is automatic if upstream changes alter behavior.
+- `--econ-features` — adds 10 macro-release proximity columns (`Days_to_FOMC`, `Days_to_CPI`,
+  `Days_to_NFP`, `Days_to_PCE`, `Days_to_PPI`, `Days_to_GDP`, `Days_to_Retail`, `Days_to_JOLTS`,
+  `Days_to_Claims`, `Days_to_macro`) from `modules/econ_calendar.csv`. Requires FRED API key
+  (`$env:FRED_API_KEY`) and a prior `python -m modules.econ_calendar --refresh`. Default OFF.
+  **REJECTED by S20 backtest validation**: QQQ STRONG ENTRY 1.8% → 1.7% (marginal); NVDA STRONG
+  ENTRY 15d 2.9% → -0.1% (-3.0pp), 6mo 33.4% → 13.6% (-19.8pp), hierarchy inverted. Same
+  failure mode as S11 isotonic calibration — ~33% feature inflation compresses individual-stock
+  high-confidence tail. Retained as opt-in flag for future experiments (Tier 1-only subset,
+  surprise-data features, etc.).
 
 ## Sizing Config (`sizing.py`)
 
@@ -251,6 +269,28 @@ CLI flags (default OFF on all three; available on direction/entry/backtest):
 - Near-ATM delta filter `0.30 ≤ delta ≤ 0.70` for ATM IV — rejects deep-ITM time-premium artifacts
 - Two-call corroboration required (≥ 2 ATM calls must invert before trusting)
 - `FAST_FAIL_MISSES = 5` — early termination when consecutive aggregates calls return empty
+
+## Econ Calendar Config (`modules/econ_calendar.py`)
+
+- `FRED_API_KEY` reads `$env:FRED_API_KEY`; refresh calls fail with `RuntimeError` if unset.
+  Free signup at https://fredaccount.stlouisfed.org/apikeys. Add to `$PROFILE` for persistence.
+- `FRED_URL = https://api.stlouisfed.org/fred` — endpoint `release/dates` with
+  `include_release_dates_with_no_data=true` returns forward release dates.
+- Cache: `modules/econ_calendar.csv` (~50–500 rows: 5y history + ~12mo forward × 9 series).
+  Schema: `series,date,release_id,release_name,tier`.
+- Tier 1 series (always tracked): FOMC, CPI, NFP, PCE.
+- Tier 2 series: PPI, GDP, Retail, JOLTS, Claims.
+- Refresh cadence: weekly. Run `python -m modules.econ_calendar --refresh`.
+- `add_macro_event_proximity(df, data_dir="modules", for_direction=False)` adds 10 columns:
+  per-series `Days_to_{name}` (sentinel-90 fallback) + aggregate `Days_to_macro` (min across all).
+  Values capped at `SENTINEL_DAYS=90`. Integer. Gated by `--econ-features` CLI flag in every
+  consumer; default OFF until validated.
+- Failure modes (all graceful, mirror catalyst pattern):
+  - `FRED_API_KEY` unset + `--refresh` → clean `RuntimeError`
+  - CSV missing → fill all `Days_to_*` with 90, print one-line warning
+  - CSV present but `< 30` forward days for a series → staleness warning per series
+- Use `python -m modules.econ_calendar --list-releases` to enumerate FRED release IDs (run once
+  to verify TIER1_SERIES / TIER2_SERIES constants match current FRED IDs).
 
 ## Geopolitical / Exogenous Shock Limitation
 

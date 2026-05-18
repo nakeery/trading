@@ -28,6 +28,7 @@ from sklearn.calibration import CalibratedClassifierCV
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from modules.benchmarks import detect_benchmarks, detect_macro_features, add_catalyst_proximity
+from modules.econ_calendar import add_macro_event_proximity
 from modules.massive import IV_COLS, IV_META_COLS, IV_FEATURE_COLS
 from modules.features import (
     HV_WINDOW, IV_RANK_WINDOW,
@@ -63,7 +64,8 @@ P4_FORWARD_DAYS     = 5    # Phase 4 exit window (15d production default — S18
 P4_THRESHOLD        = 0.55  # Phase 4 drawdown cutoff
 RANDOM_STATE        = 42
 
-IV_FEATURES = False  # set by --iv-features CLI arg; when True, Phase 3 uses IV_FEATURE_COLS as features
+IV_FEATURES   = False  # set by --iv-features CLI arg; when True, Phase 3 uses IV_FEATURE_COLS as features
+ECON_FEATURES = False  # set by --econ-features CLI arg; when True, Days_to_FOMC/CPI/... added
 
 # Walk-forward parameters
 # MIN_TRAIN_DAYS = 504   # ~2 years minimum training window
@@ -168,6 +170,8 @@ def build_features(df, benchmarks):
 
     df = add_earnings_proximity(df, TICKER)
     df = add_catalyst_proximity(df, TICKER, MODULE_DIR, for_direction=True)
+    if ECON_FEATURES:
+        df = add_macro_event_proximity(df, MODULE_DIR)
     df = add_trend_break_features(df)  # must precede normalize_features (drops MA cols)
     df = normalize_features(df)
 
@@ -617,10 +621,18 @@ if __name__ == "__main__":
         help="Use real IV features (atm_iv_30d, iv_skew_25d, term_structure) for Phase 3. "
              "Default OFF — HV proxy, full history. Requires backfill_iv.py to have been run.",
     )
+    parser.add_argument(
+        "--econ-features", action=argparse.BooleanOptionalAction, default=False,
+        dest="econ_features",
+        help="Include macro-release proximity features (Days_to_FOMC, Days_to_CPI, ...) "
+             "from modules/econ_calendar.csv. Default OFF. "
+             "Requires `python -m modules.econ_calendar --refresh` to have been run.",
+    )
     args = parser.parse_args()
-    P2_CALIBRATE = args.calibrate
-    IV_FEATURES  = args.iv_features
-    P2_THRESHOLD = 0.50 if P2_CALIBRATE else 0.55
+    P2_CALIBRATE  = args.calibrate
+    IV_FEATURES   = args.iv_features
+    ECON_FEATURES = args.econ_features
+    P2_THRESHOLD  = 0.50 if P2_CALIBRATE else 0.55
 
     mode_label = "CALIBRATED  (Decision 1 — isotonic, 5-fold CV)" if P2_CALIBRATE else "RAW  (Decision 1 disabled — class_weight=balanced)"
     print("═" * 64)

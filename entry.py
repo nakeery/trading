@@ -25,6 +25,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import precision_score
 from sklearn.preprocessing import StandardScaler
 from modules.benchmarks import detect_benchmarks, detect_macro_features, add_macro_features, add_catalyst_proximity
+from modules.econ_calendar import add_macro_event_proximity
 from modules.massive import IV_COLS, IV_META_COLS, IV_FEATURE_COLS
 from modules.features import (
     HV_WINDOW, IV_RANK_WINDOW,
@@ -59,7 +60,8 @@ P4_THRESHOLD        = 0.55  # Phase 4 drawdown cutoff
 P4_GATE             = False # Default OFF — pass --p4-gate to enable. Pending backtest validation.
 RANDOM_STATE        = 42
 
-IV_FEATURES = False  # set by --iv-features CLI arg; when True, Phase 3 uses IV_FEATURE_COLS as features
+IV_FEATURES   = False  # set by --iv-features CLI arg; when True, Phase 3 uses IV_FEATURE_COLS as features
+ECON_FEATURES = False  # set by --econ-features CLI arg; when True, Days_to_FOMC/CPI/... added
 
 # IV/HV gate thresholds — ATM IV (30 DTE) divided by realized HV-20.
 # IV_HV_GATE_RICH triggers a STRONG ENTRY -> CAUTION downgrade when premium is
@@ -131,6 +133,8 @@ def build_features(df, benchmarks):
 
     df = add_earnings_proximity(df, TICKER)
     df = add_catalyst_proximity(df, TICKER, MODULE_DIR, for_direction=True)
+    if ECON_FEATURES:
+        df = add_macro_event_proximity(df, MODULE_DIR)
     df = add_trend_break_features(df)  # must precede normalize_features (drops MA cols)
     df = normalize_features(df)
 
@@ -444,10 +448,18 @@ if __name__ == "__main__":
              "SHORT-TERM ONLY → STAY OUT, LEAPS ONLY unchanged. Default OFF until "
              "backtest validation completes.",
     )
+    parser.add_argument(
+        "--econ-features", action=argparse.BooleanOptionalAction, default=False,
+        dest="econ_features",
+        help="Include macro-release proximity features (Days_to_FOMC, Days_to_CPI, ...) "
+             "from modules/econ_calendar.csv. Default OFF. "
+             "Requires `python -m modules.econ_calendar --refresh` to have been run.",
+    )
     args = parser.parse_args()
-    P2_CALIBRATE = args.calibrate
-    IV_FEATURES  = args.iv_features
-    P4_GATE      = args.p4_gate
+    P2_CALIBRATE  = args.calibrate
+    IV_FEATURES   = args.iv_features
+    P4_GATE       = args.p4_gate
+    ECON_FEATURES = args.econ_features
     P2_THRESHOLD = 0.50 if P2_CALIBRATE else 0.55
 
     mode_label = "CALIBRATED  (Decision 1 — isotonic, 5-fold CV)" if P2_CALIBRATE else "RAW  (Decision 1 disabled — class_weight=balanced)"

@@ -33,6 +33,7 @@ from modules.benchmarks import (
     detect_benchmarks, detect_macro_features, add_macro_features,
     add_catalyst_proximity,
 )
+from modules.econ_calendar import add_macro_event_proximity
 from modules.massive import IV_COLS, IV_META_COLS, IV_FEATURE_COLS  # noqa: F401
 # Note: --iv-features mode is not supported in calibrate_multipliers.py.
 # The sweep always uses the full IV_COLS exclusion (HV-proxy, full history)
@@ -52,6 +53,10 @@ TEST_SIZE       = 0.20
 P2_DECISION     = 0.55
 P3_DECISION     = 0.60
 RANDOM_STATE    = 42
+# Default OFF: multiplier calibration should match the production feature set
+# (--econ-features defaults OFF in entry/backtest). Flip to True when recalibrating
+# vol multipliers WITH macro proximity included.
+ECON_FEATURES   = False
 
 # Sweep ranges
 P2_MULT_GRID = np.round(np.arange(0.20, 1.81, 0.05), 3)
@@ -201,6 +206,8 @@ def build_p2_features(ticker):
         df = add_macro_features(df, macro, start, end)
     df = add_earnings_block(df, ticker)
     df = add_catalyst_proximity(df, ticker, MODULE_DIR, for_direction=True)
+    if ECON_FEATURES:
+        df = add_macro_event_proximity(df, MODULE_DIR)
     df = normalize_features(df)
     return df
 
@@ -218,6 +225,8 @@ def build_p3_features(ticker):
         df = add_macro_features(df, macro, start, end)
     df = add_earnings_block(df, ticker)
     df = add_catalyst_proximity(df, ticker, MODULE_DIR, for_direction=False)
+    if ECON_FEATURES:
+        df = add_macro_event_proximity(df, MODULE_DIR)
     df = normalize_features(df)
     return df
 
