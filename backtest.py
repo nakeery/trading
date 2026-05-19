@@ -30,6 +30,7 @@ from sklearn.preprocessing import StandardScaler
 from modules.benchmarks import detect_benchmarks, detect_macro_features, add_catalyst_proximity
 from modules.econ_calendar import add_macro_event_proximity
 from modules.massive import IV_COLS, IV_META_COLS, IV_FEATURE_COLS
+from modules.regime import classify_regime, apply_regime_gate
 from modules.features import (
     HV_WINDOW, IV_RANK_WINDOW,
     P2_FORWARD_DAYS, P2B_FORWARD_DAYS, P3_FORWARD_DAYS,
@@ -231,6 +232,10 @@ def run_backtest(df_full):
     results = []
     window_num = 0
 
+    # Regime classification is data-only (VIX/VIX3M ratio), no model — precompute once
+    # across the full df.  Gated against ungated signal independently of P4 gate.
+    regime_series = classify_regime(df_full)
+
     train_end = MIN_TRAIN_DAYS
     while train_end < n - P2_FORWARD_DAYS:
         test_start = train_end
@@ -323,6 +328,11 @@ def run_backtest(df_full):
             else:
                 signal_gated = signal
 
+            # VIX regime gate (S21): independent A/B vs ungated signal.  Mirror of entry.py's
+            # post-hoc gate — STRONG ENTRY → CAUTION, CAUTION → STAY OUT in stress regime.
+            regime = regime_series.loc[date]
+            signal_regime_gated, _, _ = apply_regime_gate(signal, "", regime)
+
             fwd_return = close.iloc[i + P2_FORWARD_DAYS] / close.iloc[i] - 1
             fwd_126 = i + 126
             fwd_return_126d = (
@@ -331,16 +341,18 @@ def run_backtest(df_full):
             )
 
             results.append({
-                "date":          date,
-                "signal":        signal,
-                "signal_gated":  signal_gated,
-                "dir_prob":      dir_prob,
-                "dir_prob_63":   dir_prob_63,
-                "exp_prob":      exp_prob,
-                "exit_prob":     exit_prob,
-                "fwd_return":    fwd_return,
-                "fwd_return_126d": fwd_return_126d,
-                "window":        window_num,
+                "date":                 date,
+                "signal":               signal,
+                "signal_gated":         signal_gated,
+                "signal_regime_gated":  signal_regime_gated,
+                "regime":               regime,
+                "dir_prob":             dir_prob,
+                "dir_prob_63":          dir_prob_63,
+                "exp_prob":             exp_prob,
+                "exit_prob":            exit_prob,
+                "fwd_return":           fwd_return,
+                "fwd_return_126d":      fwd_return_126d,
+                "window":               window_num,
             })
 
         train_end += STEP_DAYS
@@ -477,6 +489,77 @@ def summarize_p4_gate_ab(results):
         print(f"    ✓ ACCEPT — gated avg {g_avg:.2%} > ungated {u_avg:.2%}  (Δ {g_avg - u_avg:+.2%})")
     else:
         print(f"    ✗ REJECT — gated avg {g_avg:.2%} not strictly above ungated {u_avg:.2%}  (Δ {g_avg - u_avg:+.2%})")
+    print(f"{'═'*80}\n")
+
+
+def summarize_regime_gate_ab(results):
+    """A/B comparison of ungated vs VIX-regime-gated signals.
+
+    Same A/B layout as summarize_p4_gate_ab.  Accept criteria (all must pass):
+      1. STRONG ENTRY gated avg >= ungated − 0.2pp     (no compression on best signal)
+      2. CAUTION gated avg      >= ungated + 0.5pp     (load-bearing improvement —
+         stress-driven CAUTIONs moved to STAY OUT, residual CAUTION bucket cleaner)
+      3. Hierarchy STRONG > CAUTION > STAY OUT intact on signal_regime_gated
+      4. STRONG ENTRY gated count >= 300                (sample-size floor)
+    """
+    # Stress-regime frequency for the run (useful diagnostic)
+    if "regime" in results.columns:
+        stress_pct = (results["regime"] == "stress").mean()
+        print(f"\n  Stress-regime frequency over backtest window: {stress_pct:.1%}")
+
+    print(f"\n{'═'*80}")
+    print(f"  VIX REGIME GATE — A/B COMPARISON (15d forward returns)")
+    print(f"{'═'*80}")
+    print(f"  {'Signal':<18} {'Count U':>8} {'Count G':>8} {'Avg U':>8} {'Avg G':>8} {'Δ Avg':>8} {'Win U':>7} {'Win G':>7}")
+    print(f"  {'─'*78}")
+    bucket_stats = {}
+    for sig in ["STRONG ENTRY", "CAUTION", "SHORT-TERM ONLY", "LEAPS ONLY", "STAY OUT"]:
+        u = results[results["signal"] == sig]["fwd_return"].dropna()
+        g = results[results["signal_regime_gated"] == sig]["fwd_return"].dropna()
+        if len(u) == 0 and len(g) == 0:
+            continue
+        u_avg = u.mean() if len(u) > 0 else 0
+        g_avg = g.mean() if len(g) > 0 else 0
+        u_win = (u > 0).mean() if len(u) > 0 else 0
+        g_win = (g > 0).mean() if len(g) > 0 else 0
+        bucket_stats[sig] = {"u_avg": u_avg, "g_avg": g_avg, "g_count": len(g)}
+        delta = g_avg - u_avg
+        print(f"  {sig:<18} {len(u):>8} {len(g):>8} {u_avg:>7.1%} {g_avg:>7.1%} "
+              f"{delta:>+7.2%} {u_win:>7.1%} {g_win:>7.1%}")
+
+    print(f"  {'─'*78}")
+    print(f"  ACCEPT criteria:")
+
+    strong = bucket_stats.get("STRONG ENTRY", {"u_avg": 0, "g_avg": 0, "g_count": 0})
+    caution = bucket_stats.get("CAUTION", {"u_avg": 0, "g_avg": 0, "g_count": 0})
+
+    c1_pass = strong["g_avg"] >= strong["u_avg"] - 0.002  # within −0.2pp
+    c2_pass = caution["g_avg"] >= caution["u_avg"] + 0.005  # +0.5pp improvement
+    c4_pass = strong["g_count"] >= 300
+
+    # Hierarchy check
+    gated_avgs = {k: v["g_avg"] for k, v in bucket_stats.items()}
+    h_strong  = gated_avgs.get("STRONG ENTRY", 0)
+    h_caution = gated_avgs.get("CAUTION", 0)
+    h_stayout = gated_avgs.get("STAY OUT", 0)
+    c3_pass = (h_strong > h_caution) and (h_caution > h_stayout)
+
+    print(f"    [{'✓' if c1_pass else '✗'}] STRONG ENTRY no compression:  "
+          f"gated {strong['g_avg']:.2%} vs ungated {strong['u_avg']:.2%} "
+          f"(Δ {strong['g_avg'] - strong['u_avg']:+.2%}, need ≥ −0.2pp)")
+    print(f"    [{'✓' if c2_pass else '✗'}] CAUTION improvement:          "
+          f"gated {caution['g_avg']:.2%} vs ungated {caution['u_avg']:.2%} "
+          f"(Δ {caution['g_avg'] - caution['u_avg']:+.2%}, need ≥ +0.5pp)")
+    print(f"    [{'✓' if c3_pass else '✗'}] Hierarchy intact:             "
+          f"STRONG {h_strong:.2%} > CAUTION {h_caution:.2%} > STAY OUT {h_stayout:.2%}")
+    print(f"    [{'✓' if c4_pass else '✗'}] STRONG ENTRY sample floor:    "
+          f"gated count {strong['g_count']} (need ≥ 300)")
+
+    all_pass = c1_pass and c2_pass and c3_pass and c4_pass
+    if all_pass:
+        print(f"  ✓ ACCEPT — all four criteria pass")
+    else:
+        print(f"  ✗ REJECT — one or more criteria failed (see above)")
     print(f"{'═'*80}\n")
 
 
@@ -724,6 +807,10 @@ if __name__ == "__main__":
 
         # A/B comparison + accept/reject verdict on STRONG ENTRY
         summarize_p4_gate_ab(results)
+
+        # VIX regime gate — STRONG ENTRY → CAUTION, CAUTION → STAY OUT in stress regime
+        summarize(results, signal_col="signal_regime_gated", label="GATED (VIX regime)")
+        summarize_regime_gate_ab(results)
 
         plot_results(df_stats, order, colors, results)
 

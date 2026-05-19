@@ -25,8 +25,12 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import precision_score
 from sklearn.preprocessing import StandardScaler
 from modules.benchmarks import detect_benchmarks, detect_macro_features, add_macro_features, add_catalyst_proximity
-from modules.econ_calendar import add_macro_event_proximity
+from modules.econ_calendar import add_macro_event_proximity, next_event_per_series, ALL_SERIES
 from modules.massive import IV_COLS, IV_META_COLS, IV_FEATURE_COLS
+from modules.regime import (
+    REGIME_VIX_STRESS, REGIME_TERM_STRESS,
+    classify_regime, is_stress_regime, apply_regime_gate,
+)
 from modules.features import (
     HV_WINDOW, IV_RANK_WINDOW,
     P2_FORWARD_DAYS, P2B_FORWARD_DAYS, P3_FORWARD_DAYS,
@@ -62,6 +66,7 @@ RANDOM_STATE        = 42
 
 IV_FEATURES   = False  # set by --iv-features CLI arg; when True, Phase 3 uses IV_FEATURE_COLS as features
 ECON_FEATURES = False  # set by --econ-features CLI arg; when True, Days_to_FOMC/CPI/... added
+REGIME_GATE   = False  # set by --regime-gate CLI arg; when True, VIX stress regime downgrades SIGNAL one tier
 
 # IV/HV gate thresholds — ATM IV (30 DTE) divided by realized HV-20.
 # IV_HV_GATE_RICH triggers a STRONG ENTRY -> CAUTION downgrade when premium is
@@ -340,6 +345,25 @@ def print_combined_signal(df_full, direction_prob, dir_prob_63, expansion_prob,
                        f"premium pricing the vol-expansion thesis already; downgraded from STRONG ENTRY.")
         gate_msgs.append(f"IV/HV gate: ratio {iv_info['ratio']:.2f} >= {IV_HV_GATE_RICH}")
 
+    # VIX regime gate: in stress regime, downgrade SIGNAL one tier (STRONG ENTRY → CAUTION,
+    # CAUTION → STAY OUT).  Runs after IV/HV so an already-downgraded STRONG→CAUTION can
+    # be further downgraded CAUTION→STAY OUT if VIX stress also fires.  Default OFF.
+    if REGIME_GATE:
+        latest_row = df_full.iloc[-1]
+        regime = classify_regime(df_full).iloc[-1]
+        if regime == "stress":
+            new_signal, new_sizing, gmsg = apply_regime_gate(signal, sizing, regime)
+            if new_signal != signal:
+                prev_signal = signal
+                signal, sizing = new_signal, new_sizing
+                vix_val  = latest_row.get("VIX")
+                term_val = latest_row.get("VIX_VIX3M_ratio")
+                vix_str  = f"VIX={vix_val:.1f}" if pd.notna(vix_val) else "VIX=NaN"
+                term_str = f"VIX/VIX3M={term_val:.2f}" if pd.notna(term_val) else "VIX/VIX3M=NaN"
+                sizing_note = (f"VIX regime stress ({vix_str}, {term_str}) — "
+                               f"downgraded from {prev_signal}.")
+                gate_msgs.append(gmsg)
+
     gate_msg = "; ".join(gate_msgs) if gate_msgs else None
 
     def fmt_contributors(contributors):
@@ -360,6 +384,18 @@ def print_combined_signal(df_full, direction_prob, dir_prob_63, expansion_prob,
     print(f"  Drivers:            {fmt_contributors(dir_contributors)}")
     print(f"  Days to Earnings:   {days_to_earn}d")
     print(f"  Days to Catalyst:   {days_to_cat}")
+    # Macro release proximity — display-only (no model wiring; --econ-features
+    # remains opt-in / rejected at S20).  Reads CSV via modules/econ_calendar
+    # helper, falls back to 'N/A' if CSV missing or no future event for a series.
+    econ_events = next_event_per_series(data_dir=MODULE_DIR)
+    for series_name, _, _ in ALL_SERIES:
+        next_date, days = econ_events.get(series_name, (None, None))
+        label = f"Days to {series_name}:"
+        if next_date is None or days is None or days >= 90:
+            print(f"  {label:<20}N/A")
+        else:
+            date_str = next_date.strftime("%Y-%m-%d")
+            print(f"  {label:<20}{days:>2}d   ({date_str})")
     print(f"\n  DIRECTION — 63d thesis        [threshold: {P2B_THRESHOLD}]")
     print(f"  Win Probability:    {dir_prob_63:.1%}  (base rate: {dir_base_rate_63:.1%})")
     print(f"  Signal:             {'WIN ✓' if dir_signal_63 else 'NO SIGNAL ✗'}")
@@ -407,10 +443,20 @@ def print_combined_signal(df_full, direction_prob, dir_prob_63, expansion_prob,
             stress_tells.append(f"term structure {iv_info['term']:.2f} (backwardation)")
         if iv_info["ratio"] >= IV_HV_GATE_RICH:
             stress_tells.append(f"IV/HV {iv_info['ratio']:.2f} (very rich)")
+    # VIX regime stress tells — display whenever in stress regime, regardless of IV state or
+    # whether REGIME_GATE is ON.  Useful diagnostic before opting in.
+    latest_row_disp = df_full.iloc[-1]
+    if is_stress_regime(latest_row_disp):
+        vix_val  = latest_row_disp.get("VIX")
+        term_val = latest_row_disp.get("VIX_VIX3M_ratio")
+        if pd.notna(vix_val) and vix_val >= REGIME_VIX_STRESS:
+            stress_tells.append(f"VIX {vix_val:.1f} (>= {REGIME_VIX_STRESS} stress band)")
+        if pd.notna(term_val) and term_val >= REGIME_TERM_STRESS:
+            stress_tells.append(f"VIX/VIX3M {term_val:.2f} (term inversion)")
     if stress_tells:
-        print(f"\n  WARNING: Phase 3 CONTRACTION under market stress")
+        print(f"\n  WARNING: market stress signals present")
         print(f"  Tells:              {', '.join(stress_tells)}")
-        print(f"  Options market may be pricing near-term risk not visible in price history.")
+        print(f"  Options/VIX markets may be pricing near-term risk not visible in price history.")
         print(f"  Treat contraction sizing with extra conservatism.")
 
     print(f"\n  {'─'*w}")
@@ -455,11 +501,19 @@ if __name__ == "__main__":
              "from modules/econ_calendar.csv. Default OFF. "
              "Requires `python -m modules.econ_calendar --refresh` to have been run.",
     )
+    parser.add_argument(
+        "--regime-gate", action=argparse.BooleanOptionalAction, default=False,
+        dest="regime_gate",
+        help="Enable VIX regime gate: in stress regime (VIX >= 25 or VIX/VIX3M >= 1.00), "
+             "STRONG ENTRY → CAUTION and CAUTION → STAY OUT. Default OFF until "
+             "backtest validation completes.",
+    )
     args = parser.parse_args()
     P2_CALIBRATE  = args.calibrate
     IV_FEATURES   = args.iv_features
     P4_GATE       = args.p4_gate
     ECON_FEATURES = args.econ_features
+    REGIME_GATE   = args.regime_gate
     P2_THRESHOLD = 0.50 if P2_CALIBRATE else 0.55
 
     mode_label = "CALIBRATED  (Decision 1 — isotonic, 5-fold CV)" if P2_CALIBRATE else "RAW  (Decision 1 disabled — class_weight=balanced)"
@@ -467,6 +521,7 @@ if __name__ == "__main__":
     print(f"  Phase 2 mode: {mode_label}")
     print(f"  P2_THRESHOLD = {P2_THRESHOLD}  |  P2B_THRESHOLD = {P2B_THRESHOLD}  |  P3_THRESHOLD = {P3_THRESHOLD}  |  P4_THRESHOLD = {P4_THRESHOLD}")
     print(f"  P4 gate: {'ON' if P4_GATE else 'OFF (display-only)'}")
+    print(f"  Regime gate: {'ON' if REGIME_GATE else 'OFF (display-only)'}")
     print("═" * 64)
     print()
 

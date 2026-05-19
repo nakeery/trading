@@ -187,6 +187,65 @@ def _load_cache(data_dir):
     return df
 
 
+def next_event_per_series(as_of=None, data_dir="modules"):
+    """
+    Return {series_name: (date | None, days_to | SENTINEL_DAYS)} for every
+    series in ALL_SERIES.  `as_of` defaults to today (normalized).
+
+    Display-only helper for entry.py — no side effects, no printing.  Missing
+    CSV: returns (None, SENTINEL_DAYS) for every series; caller decides whether
+    to render 'N/A' or skip.
+    """
+    if as_of is None:
+        as_of = pd.Timestamp.today().normalize()
+    else:
+        as_of = pd.Timestamp(as_of).normalize()
+
+    cal = _load_cache(data_dir)
+    if cal is None:
+        return {name: (None, SENTINEL_DAYS) for name, _, _ in ALL_SERIES}
+
+    out = {}
+    for series_name, _, _ in ALL_SERIES:
+        future = cal[(cal["series"] == series_name)
+                     & (cal["date"] >= as_of)].sort_values("date")
+        if future.empty:
+            out[series_name] = (None, SENTINEL_DAYS)
+        else:
+            next_date = future["date"].iloc[0].normalize()
+            days = min(int((next_date - as_of).days), SENTINEL_DAYS)
+            out[series_name] = (next_date, days)
+    return out
+
+
+def upcoming_events(within_days=7, as_of=None, data_dir="modules"):
+    """
+    Return DataFrame of all upcoming events in the next `within_days` days,
+    sorted ascending by date.  Columns: date, weekday, days_to, tier, series,
+    release_name.  Empty DataFrame if no events or CSV missing.
+    """
+    if as_of is None:
+        as_of = pd.Timestamp.today().normalize()
+    else:
+        as_of = pd.Timestamp(as_of).normalize()
+
+    cal = _load_cache(data_dir)
+    if cal is None:
+        return pd.DataFrame(columns=["date", "weekday", "days_to", "tier",
+                                     "series", "release_name"])
+
+    cutoff = as_of + pd.Timedelta(days=within_days)
+    window = cal[(cal["date"] >= as_of) & (cal["date"] <= cutoff)].copy()
+    if window.empty:
+        return pd.DataFrame(columns=["date", "weekday", "days_to", "tier",
+                                     "series", "release_name"])
+
+    window = window.sort_values("date").reset_index(drop=True)
+    window["weekday"] = window["date"].dt.strftime("%a")
+    window["days_to"] = (window["date"] - as_of).dt.days.astype(int)
+    return window[["date", "weekday", "days_to", "tier", "series", "release_name"]]
+
+
 def _check_staleness(cal, today):
     """Print one-line warning for any series with < 30 forward days."""
     cutoff = today + pd.Timedelta(days=30)
@@ -258,6 +317,9 @@ if __name__ == "__main__":
                         help="Fetch fresh release dates from FRED and update the cache CSV.")
     parser.add_argument("--list-releases", action="store_true",
                         help="List all FRED releases (use to verify release_ids in constants).")
+    parser.add_argument("--upcoming", nargs="?", const=7, type=int, metavar="N",
+                        help="Print upcoming economic events in the next N days "
+                             "(default 7).  Sorted chronologically by date.")
     parser.add_argument("--data-dir", default="modules",
                         help="Cache directory (default: modules).")
     args = parser.parse_args()
@@ -266,6 +328,18 @@ if __name__ == "__main__":
         list_releases()
     elif args.refresh:
         refresh(data_dir=args.data_dir)
+    elif args.upcoming is not None:
+        df = upcoming_events(within_days=args.upcoming, data_dir=args.data_dir)
+        if df.empty:
+            print(f"No upcoming events in the next {args.upcoming} days.")
+        else:
+            print(f"\nUpcoming economic events (next {args.upcoming} days):")
+            for _, r in df.iterrows():
+                tier = f"T{r['tier']}"
+                date_str = r["date"].strftime("%Y-%m-%d")
+                print(f"  {date_str}  {r['weekday']:<3}  {r['days_to']:>2}d   "
+                      f"{tier}  {r['series']:<6}  {r['release_name']}")
+            print()
     else:
         parser.print_help()
         sys.exit(1)

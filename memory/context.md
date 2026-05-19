@@ -169,6 +169,17 @@ Cross-ticker validation required
   co-validate on QQQ + NVDA minimum before adopting as production default.
   Index/stock edge profiles differ structurally.
 
+Stress regime is a contrarian BUY signal, not a sell signal (S21)
+  Counter-intuitive finding from the regime-gate rejection: direction-model
+  STRONG ENTRYs that fire in high-VIX regimes have FORWARD RETURNS ABOVE
+  AVERAGE across QQQ + NVDA + AMD (NVDA stress-STRONG-ENTRYs +42% 6mo vs
+  all-STRONG 33%). The framework's price-action lens already encodes
+  mean-reversion behavior — direction models firing bullishly in high VIX
+  are catching post-shock recovery rallies. Any gate that downgrades signals
+  based on raw VIX state removes the highest-return entries. Implication:
+  don't add VIX-state gates to direction signals; if anything, AMPLIFY them
+  in stress (continuous sizing experiment).
+
 Per-window threshold calibration (backtest.py)
   compute_vol_thresholds(df_train) called inside run_backtest() loop after
   each df_train slice — eliminates lookahead contamination from future vol
@@ -314,6 +325,17 @@ Refresh cadence: weekly. Run:
 Verify release IDs (one-time, before first refresh):
   python -m modules.econ_calendar --list-releases
 
+Daily-use display CLI (S22):
+  python -m modules.econ_calendar --upcoming        # next 7 days
+  python -m modules.econ_calendar --upcoming 14     # next 14 days
+
+Display helpers used by entry.py (S22, both in modules/econ_calendar.py):
+  next_event_per_series(as_of=None, data_dir="modules")
+    → {series_name: (date | None, days_to | SENTINEL_DAYS)} for all 9 series
+  upcoming_events(within_days=7, as_of=None, data_dir="modules")
+    → DataFrame sorted by date with columns date / weekday / days_to / tier /
+      series / release_name; empty df if no events or CSV missing
+
 Failure modes (graceful — mirror catalyst pattern):
   FRED_API_KEY unset + --refresh   → RuntimeError, no partial write
   FRED_API_KEY unset + pipeline    → no-op (CSV read only; no key needed)
@@ -360,6 +382,14 @@ During known crises: trust contraction signals less; weight options-market-impli
 tail risk higher than Phase 3 output; don't size like the SHORT-TERM ONLY
 backtest avg (those windows don't include "Iran-war-2026" type events).
 
+S21 result: a VIX-state regime gate (binary one-tier-down on stress) does NOT
+mitigate this limitation — it actively hurts edge.  Direction-model STRONG ENTRYs
+in stress regime are above-average buys, not below-average (mean-reversion edge
+that the price-action lens already encodes).  The limitation remains: the framework
+is reactive, not predictive, of shocks.  Mitigation is HUMAN — don't size like the
+backtest avg during known crises; use IV/HV gap + skew + term structure as
+options-market-implied tail risk read.
+
 ────────────────────────────────────────────────────────────────────────
 
 Outstanding Work
@@ -377,6 +407,13 @@ Active TODO
   REJECTED. QQQ marginal pass (STRONG ENTRY 1.8% → 1.7%); NVDA catastrophic
   (STRONG ENTRY 2.9% → -0.1%, hierarchy inverted). Same S11 pattern. Flag
   retained opt-in; default OFF. See Econ Calendar Integration section above.
+- ~~Regime detection layer~~ SHIPPED + REJECTED 2026-05-18 (S21) as modules/regime.py
+  + --regime-gate flag. Rule-based VIX bands, one-tier-down on stress. Cross-ticker
+  REJECT (QQQ + NVDA + AMD all 4/4 criteria fail). Core finding: stress regime is
+  a CONTRARIAN BUY signal, not a sell signal — gate removes highest-return entries
+  (NVDA stress-regime STRONG ENTRYs +42% 6mo avg). Flag retained opt-in; default OFF.
+  See S21 session log for details. Surgical CAUTION-only variant deferred to future
+  experiment.
 - Phase 4 / exit.py follow-ups:
   - Co-validate on AMD + SOFI before treating 15d as universal default
     for exit.py output. AMD's vol scale (4.98% WIN_THRESHOLD vs QQQ
@@ -403,13 +440,18 @@ Backlog (prioritized by leverage)
    with Phase 2 entry window. Not yet integrated into entry.py SIGNAL output.
 
 2. Regime detection layer (HMM / change-point / VIX regime tagging)
-   Phase 2 averages over a single distribution but the world has multiple
-   regimes (calm trend / calm chop / vol expansion / crisis). Regime tag
-   from HMM on VIX+term structure, change-point detector, or rule-based VIX
-   bands, used as gating filter or feature, lets signals behave differently
-   per regime. Most direct mitigation of the geopolitical-shock limitation:
-   can't predict the shock but can know you're in a stress regime and
-   downweight contraction signals.
+   ~~PARTIAL SHIPPED 2026-05-18 (S21)~~ — rule-based VIX bands gate REJECTED across
+   QQQ + NVDA + AMD.  Stress regime turns out to be a contrarian BUY signal in this
+   framework's price-action lens (direction models firing bullishly in high-VIX are
+   catching mean-reversion bottoms).  The original hypothesis ("downweight signals
+   in stress regimes") was inverted by the data.
+   Remaining variants worth trying:
+   - Surgical CAUTION-only gate (only CONTRACTION-flavored signal is downgraded;
+     STRONG ENTRY untouched) — matches the original "downweight contraction signals"
+     wording more literally.
+   - Regime as confidence multiplier (raise P2_THRESHOLD in stress) rather than
+     binary downgrade.
+   - HMM / change-point may surface latent regimes not captured by VIX-band rules.
 
 3. Net-of-cost backtest returns (gross numbers eat ~0.3-0.8pp on 6-12mo options)
    All backtest numbers are gross. Bid-ask + commissions eat ~0.3-0.8pp per
@@ -514,6 +556,116 @@ Tradier Config (modules/tradier.py + sizing.py)
 
 Recent Session Log
 ------------------
+
+S22 (2026-05-18) — Econ Calendar Display Surfaces (no model wiring)
+1. Motivated by the S21 analysis: "information that fails as a model feature can
+   still be valuable as human-decision context."  Econ proximity was rejected as
+   a feature (S20) but the user wants the same data as a daily visual under
+   entry.py and as a standalone CLI shortcut.  No backtest / model changes.
+2. Two new public helpers in modules/econ_calendar.py (after _load_cache, before
+   _check_staleness):
+   - `next_event_per_series(as_of=None, data_dir="modules")` returns
+     `{series_name: (date | None, days_to | SENTINEL_DAYS)}` for every series in
+     ALL_SERIES.  Used by entry.py.  Missing CSV: all 9 entries fall back to
+     `(None, SENTINEL_DAYS)`.
+   - `upcoming_events(within_days=7, as_of=None, data_dir="modules")` returns a
+     DataFrame of upcoming events sorted by date, with columns date / weekday /
+     days_to / tier / series / release_name.  Used by the CLI.
+3. New CLI flag: `python -m modules.econ_calendar --upcoming [N]` (default 7).
+   `nargs="?", const=7, type=int` so bare `--upcoming` = 7 days, `--upcoming 14`
+   overrides. Prints chronological table with weekday + tier marker.  Verified
+   today (2026-05-18) shows Claims (3d) in 7-day window; Claims + GDP + PCE in
+   14-day window.
+4. entry.py display: 9 new lines under the existing "Days to Catalyst" line in
+   `print_combined_signal`, format `Days to {series}:   {days}d   ({YYYY-MM-DD})`.
+   Always rendered (no flag) — pure display, no model wiring.  Falls back to
+   "N/A" if a series has no future event or CSV missing.
+5. Smoke tests extended 11 → 13 (tests/test_smoke.py):
+   - test_next_event_per_series_shape — synthetic CSV with FOMC + CPI; verifies
+     shape (9 entries), known events return correct (date, days), missing series
+     fall back to (None, SENTINEL_DAYS), missing-CSV path returns all-None.
+   - test_upcoming_events_window_filter — three events at +3d/+10d/+25d; verifies
+     within_days correctly bounds the result, sort order, column population,
+     missing-CSV returns empty DataFrame.
+6. NOT changed: add_macro_event_proximity, the `--econ-features` flag/constant in
+   any consumer, or any model behavior.  S20 rejection still stands; display path
+   is independent.
+7. Visual verification (QQQ, 2026-05-18) — 9 lines render correctly under the
+   DIRECTION block of `entry.py` output, aligned with existing earnings/catalyst
+   format.  No `--econ-features` flag required for the display path.
+
+S21 (2026-05-18) — VIX Regime Gate Shipped + A/B REJECTED (4th rejection of the pattern)
+1. New module: modules/regime.py (~95 lines). Rule-based VIX bands; no fitting,
+   no model risk. Public surface:
+   - REGIME_VIX_NORMAL=18.0, REGIME_VIX_STRESS=25.0, REGIME_TERM_STRESS=1.05
+   - classify_regime(df) → Series of {'calm','normal','stress'} aligned to df.index
+   - is_stress_regime(row) → scalar bool, used by entry.py display
+   - apply_regime_gate(signal, sizing, regime) → one-tier-down on stress
+     (STRONG ENTRY → CAUTION, CAUTION → STAY OUT, others unchanged)
+2. Threshold calibration discovered a bug-adjacent issue: REGIME_TERM_STRESS=1.00
+   initially fired on 38.2% of QQQ rows because modules/features.py:148-149 fills
+   VIX_VIX3M_ratio NaN with sentinel 1.0 (VIX3M history only starts Dec 2007 — so
+   2001-2007 had the sentinel triggering stress).  Bumped threshold to 1.05 (matches
+   framework's existing "term > 1.05 = stress" convention in entry.py 5-band display).
+   Post-fix stress frequency: QQQ 19.2%, NVDA 19.3%, AMD 19.8% (consistent — VIX is
+   market-wide).
+3. Wired into:
+   - entry.py: --regime-gate flag (default OFF), gate applied AFTER IV/HV gate
+     (composes one-tier-down: STRONG→CAUTION→STAY OUT possible if both fire),
+     stress-tells display extended to fire on VIX/term whenever is_stress_regime
+     returns True regardless of REGIME_GATE state (useful pre-opt-in diagnostic).
+   - backtest.py: always-on A/B (matches P4 pattern, no flag needed).  New columns
+     in results: 'regime' + 'signal_regime_gated'.  New summarize_regime_gate_ab()
+     with explicit ACCEPT criteria (4 boxes, all must pass).
+   - NOT wired into direction.py / volatility.py / exit.py / calibrate_multipliers.py
+     — gate-only by design, never a training feature.
+4. Smoke tests extended 8 → 11:
+   - test_classify_regime_thresholds: synthetic VIX+term rows → expected labels
+   - test_apply_regime_gate_logic: 5 signals × 3 regimes = 15 combos
+   - test_classify_regime_handles_nan: missing VIX → 'normal' fallback, no exception
+5. Cross-ticker A/B (post-1.05 threshold fix):
+                          QQQ                NVDA               AMD
+   Stress freq           19.2%              19.3%              19.8%
+   STRONG ENTRY 15d
+     ungated             1.77%              2.83%              3.36%
+     gated               0.75%              2.26%              1.97%
+     Δ                   -1.03pp            -0.57pp            -1.39pp
+     gated count         314                231 (< 300)        277 (< 300)
+   STRONG ENTRY 6mo
+     ungated             9.5%               33.3%              33.9%
+     gated               6.7%               28.6%              30.9%
+     Δ                   -2.8pp             -4.7pp             -3.0pp
+   Hierarchy intact?     NO                 NO                 NO
+                         (gated CAUTION    (gated STAY OUT    (gated CAUTION
+                          > gated STRONG)   > gated STRONG)    > gated STRONG)
+   ACCEPT verdict        ✗ REJECT (4/4)     ✗ REJECT (4/4)     ✗ REJECT (4/4)
+6. CORE FINDING: STRESS REGIME IS A CONTRARIAN BUY SIGNAL, NOT A SELL SIGNAL.
+   Per-ticker, the STRONG ENTRYs that got downgraded in stress had FORWARD RETURNS
+   ABOVE AVERAGE:
+     QQQ:  261 downgrades, avg 15d +3.0%   (vs all-STRONG 1.8%)
+     NVDA: 124 downgrades, avg 15d +3.9%, 6mo +42.0% (vs all-STRONG 33.3%)
+     AMD:  107 downgrades, avg 15d +6.95%, 6mo +41.7% (vs all-STRONG 33.9%)
+   Mechanism: direction models firing bullishly in high-VIX environments are often
+   catching mean-reversion bottoms (post-shock recovery rallies).  Downgrading those
+   signals removes the highest-return entries.  This is the opposite of the original
+   hypothesis ("can't predict the shock but can know we're in stress regime") —
+   the framework's price-action lens already encodes contrarian behavior; the VIX
+   regime tag doesn't add information about which way prices are going next, only
+   that vol is elevated.
+7. Code retained as opt-in (--regime-gate flag, default OFF) per the S11/S18/S20
+   precedent.  Future variants worth testing (deferred to user direction):
+   - Surgical: only CAUTION → STAY OUT (matches context.md backlog wording
+     "downweight CONTRACTION signals" — CAUTION is the contraction-flavored signal;
+     STRONG ENTRY's expansion read in stress may be the contrarian buy).  Test
+     before declaring the entire regime concept dead.
+   - Regime as multiplier on confidence rather than binary gate (e.g. require higher
+     P2_THRESHOLD in stress vs calm).
+   - Pre-event positioning: gate triggers on imminent macro releases (Days_to_FOMC
+     ≤ 1, etc.) rather than VIX state.  Different signal entirely.
+8. Process: 4th time the default-OFF-then-validate discipline catches a regression
+   (S11 calibrate, S18 p4-gate, S20 econ-features, S21 regime-gate).  Pattern is
+   now load-bearing — any new feature/gate should ship behind a flag and require
+   cross-ticker (QQQ + NVDA minimum) ACCEPT before becoming default.
 
 S20 (2026-05-18) — Econ Calendar Module Shipped + A/B REJECTED
 1. New module: modules/econ_calendar.py (~250 lines).

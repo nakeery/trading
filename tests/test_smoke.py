@@ -1,7 +1,7 @@
 """
 Smoke tests for the options trading ML pipeline.
 
-8 regression guards:
+13 regression guards:
   1. Signal hierarchy (backtest CSV) — STRONG ENTRY > CAUTION > STAY OUT by avg return
   2. STRONG ENTRY baseline sanity (backtest CSV) — count/return/win-rate loose bounds
   3. Vol thresholds range (QQQ indicators CSV) — positive values in expected ranges
@@ -11,6 +11,11 @@ Smoke tests for the options trading ML pipeline.
   6. Econ calendar module loads — import + ECON_FEATURE_COLS shape
   7. Days_to_* bounds — all econ proximity columns in [0, 90], integer
   8. Days_to_specific_event — hardcoded FOMC date → Days_to_FOMC matches expected
+  9. Regime classification thresholds — VIX/term values map to correct regime label
+ 10. Regime gate logic — 5 signals × 3 regimes, one-tier-down on stress
+ 11. Regime classification NaN handling — missing VIX → 'normal' fallback
+ 12. next_event_per_series shape — returned dict has all 9 series, future dates correct
+ 13. upcoming_events window filter — within_days arg correctly bounds the result set
 """
 
 
@@ -226,3 +231,212 @@ def test_days_to_specific_event(tmp_path):
     assert int(df.loc["2026-06-11", "Days_to_macro"]) == 7
     # Series with no data fall back to sentinel
     assert int(df.loc["2026-06-11", "Days_to_CPI"]) == SENTINEL_DAYS
+
+
+# ─── Test 9: Regime classification thresholds ────────────────────────────────
+
+def test_classify_regime_thresholds():
+    """
+    Synthetic VIX + term-structure rows; verify the three regime bands fire
+    where the constants say they should.  No network — pure logic test.
+    """
+    import pandas as pd
+    from modules.regime import classify_regime
+
+    # Row 0: VIX 12, term 0.90  → calm (low VIX, low term)
+    # Row 1: VIX 20, term 0.95  → normal (between bands, no stress trigger)
+    # Row 2: VIX 26, term 0.95  → stress (VIX level alone fires)
+    # Row 3: VIX 19, term 1.05  → stress (term inversion alone fires, even at normal VIX)
+    df = pd.DataFrame({
+        "VIX":             [12.0, 20.0, 26.0, 19.0],
+        "VIX_VIX3M_ratio": [0.90, 0.95, 0.95, 1.05],
+    })
+    labels = classify_regime(df).tolist()
+    assert labels == ["calm", "normal", "stress", "stress"], (
+        f"classify_regime returned {labels}; expected ['calm','normal','stress','stress']"
+    )
+
+
+# ─── Test 10: Regime gate logic ──────────────────────────────────────────────
+
+def test_apply_regime_gate_logic():
+    """
+    5 signals × 3 regimes = 15 combinations.  Stress regime: STRONG ENTRY → CAUTION,
+    CAUTION → STAY OUT, others unchanged.  Non-stress regimes: no change.
+    """
+    from modules.regime import apply_regime_gate, REGIME_NAMES
+
+    signals = ["STRONG ENTRY", "CAUTION", "SHORT-TERM ONLY", "LEAPS ONLY", "STAY OUT"]
+    sizings = ["FULL", "REDUCED", "REDUCED", "LEAPS", "N/A"]
+
+    expected_stress = {
+        "STRONG ENTRY":    ("CAUTION",  "REDUCED"),
+        "CAUTION":         ("STAY OUT", "N/A"),
+        "SHORT-TERM ONLY": ("SHORT-TERM ONLY", "REDUCED"),
+        "LEAPS ONLY":      ("LEAPS ONLY",      "LEAPS"),
+        "STAY OUT":        ("STAY OUT",        "N/A"),
+    }
+
+    for regime in REGIME_NAMES:
+        for sig, siz in zip(signals, sizings):
+            new_sig, new_siz, msg = apply_regime_gate(sig, siz, regime)
+            if regime == "stress":
+                exp_sig, exp_siz = expected_stress[sig]
+                assert new_sig == exp_sig, (
+                    f"stress + {sig}: got {new_sig!r}, expected {exp_sig!r}"
+                )
+                assert new_siz == exp_siz, (
+                    f"stress + {sig}: sizing {new_siz!r}, expected {exp_siz!r}"
+                )
+                if sig in ("STRONG ENTRY", "CAUTION"):
+                    assert msg is not None, f"stress + {sig} should produce a gate_msg"
+                else:
+                    assert msg is None, f"stress + {sig} should be no-op (msg={msg!r})"
+            else:
+                assert new_sig == sig and new_siz == siz and msg is None, (
+                    f"{regime} + {sig}: gate fired when it shouldn't have "
+                    f"(got {new_sig!r}/{new_siz!r}, msg={msg!r})"
+                )
+
+
+# ─── Test 11: Regime classification NaN handling ─────────────────────────────
+
+def test_classify_regime_handles_nan():
+    """
+    Rows missing VIX or VIX_VIX3M_ratio must NOT raise and must fall back to
+    'normal' (neutral) — required for the older pre-VIX9D/VIX3M history (pre-2007).
+    """
+    import pandas as pd
+    import numpy as np
+    from modules.regime import classify_regime
+
+    df = pd.DataFrame({
+        "VIX":             [np.nan, 26.0, np.nan, 12.0],
+        "VIX_VIX3M_ratio": [0.90,    np.nan, np.nan, 0.95],
+    })
+    labels = classify_regime(df).tolist()
+    # Row 0: VIX NaN, term 0.90        → no stress trigger, no calm-eligibility (VIX missing) → normal
+    # Row 1: VIX 26,  term NaN         → stress fires on VIX alone
+    # Row 2: VIX NaN, term NaN         → no stress, no calm → normal (neutral fallback)
+    # Row 3: VIX 12,  term 0.95        → calm (full data path)
+    assert labels == ["normal", "stress", "normal", "calm"], (
+        f"NaN handling broken: got {labels}; expected ['normal','stress','normal','calm']"
+    )
+
+    # Missing-columns path: pass a df with neither VIX nor VIX_VIX3M_ratio
+    df_empty = pd.DataFrame({"dummy": [1, 2, 3]})
+    labels_empty = classify_regime(df_empty).tolist()
+    assert labels_empty == ["normal", "normal", "normal"], (
+        f"Missing-columns path: got {labels_empty}; expected all 'normal'"
+    )
+
+
+# ─── Test 12: next_event_per_series shape ────────────────────────────────────
+
+def test_next_event_per_series_shape(tmp_path):
+    """
+    Synthetic CSV with FOMC, CPI dates; assert dict has 9 keys (one per
+    ALL_SERIES), FOMC/CPI return correct (date, days), other 7 series fall
+    back to (None, SENTINEL_DAYS).  No network.
+    """
+    import pandas as pd
+    from modules.econ_calendar import (
+        next_event_per_series, ALL_SERIES, SENTINEL_DAYS
+    )
+
+    # Two future events at known offsets from a fixed as_of date.
+    as_of = pd.Timestamp("2026-06-01")
+    rows = [
+        {"series": "FOMC", "date": "2026-06-08", "release_id": 101,
+         "release_name": "FOMC Press Release", "tier": 1},
+        {"series": "CPI",  "date": "2026-06-15", "release_id": 10,
+         "release_name": "Consumer Price Index", "tier": 1},
+    ]
+    cal_path = tmp_path / "econ_calendar.csv"
+    pd.DataFrame(rows).to_csv(cal_path, index=False)
+
+    result = next_event_per_series(as_of=as_of, data_dir=str(tmp_path))
+
+    # Shape: exactly one entry per series in ALL_SERIES.
+    assert len(result) == len(ALL_SERIES), (
+        f"expected {len(ALL_SERIES)} entries, got {len(result)}"
+    )
+    for name, _, _ in ALL_SERIES:
+        assert name in result, f"missing series {name}"
+
+    # Known events return correct (date, days).
+    fomc_date, fomc_days = result["FOMC"]
+    assert fomc_days == 7, f"FOMC expected 7d, got {fomc_days}"
+    assert fomc_date == pd.Timestamp("2026-06-08")
+
+    cpi_date, cpi_days = result["CPI"]
+    assert cpi_days == 14, f"CPI expected 14d, got {cpi_days}"
+    assert cpi_date == pd.Timestamp("2026-06-15")
+
+    # Series with no rows in synthetic CSV → (None, SENTINEL_DAYS).
+    for missing_name in ("NFP", "PCE", "PPI", "GDP", "Retail", "JOLTS", "Claims"):
+        d, days = result[missing_name]
+        assert d is None and days == SENTINEL_DAYS, (
+            f"{missing_name} expected (None, {SENTINEL_DAYS}); got ({d!r}, {days})"
+        )
+
+    # Missing-CSV path: every series resolves to (None, SENTINEL_DAYS).
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    missing = next_event_per_series(as_of=as_of, data_dir=str(empty_dir))
+    assert len(missing) == len(ALL_SERIES)
+    for name, _, _ in ALL_SERIES:
+        d, days = missing[name]
+        assert d is None and days == SENTINEL_DAYS
+
+
+# ─── Test 13: upcoming_events window filter ──────────────────────────────────
+
+def test_upcoming_events_window_filter(tmp_path):
+    """
+    Three synthetic events at +3d, +10d, +25d.  Verify within_days correctly
+    bounds the result and the DataFrame columns are populated.
+    """
+    import pandas as pd
+    from modules.econ_calendar import upcoming_events
+
+    as_of = pd.Timestamp("2026-06-01")
+    rows = [
+        {"series": "Claims", "date": "2026-06-04", "release_id": 180,
+         "release_name": "Unemployment Insurance Weekly Claims Report", "tier": 2},
+        {"series": "CPI",    "date": "2026-06-11", "release_id": 10,
+         "release_name": "Consumer Price Index", "tier": 1},
+        {"series": "FOMC",   "date": "2026-06-26", "release_id": 101,
+         "release_name": "FOMC Press Release", "tier": 1},
+    ]
+    cal_path = tmp_path / "econ_calendar.csv"
+    pd.DataFrame(rows).to_csv(cal_path, index=False)
+
+    # 7-day window: only Claims (+3d) qualifies.
+    df_7 = upcoming_events(within_days=7, as_of=as_of, data_dir=str(tmp_path))
+    assert len(df_7) == 1, f"7d window expected 1 event, got {len(df_7)}"
+    assert df_7.iloc[0]["series"] == "Claims"
+    assert df_7.iloc[0]["days_to"] == 3
+
+    # 14-day window: Claims + CPI, chronological order.
+    df_14 = upcoming_events(within_days=14, as_of=as_of, data_dir=str(tmp_path))
+    assert len(df_14) == 2
+    assert df_14["series"].tolist() == ["Claims", "CPI"]
+    assert df_14["days_to"].tolist() == [3, 10]
+
+    # 30-day window: all three events.
+    df_30 = upcoming_events(within_days=30, as_of=as_of, data_dir=str(tmp_path))
+    assert len(df_30) == 3
+    assert df_30["series"].tolist() == ["Claims", "CPI", "FOMC"]
+    assert df_30["days_to"].tolist() == [3, 10, 25]
+
+    # Required columns present + populated.
+    for col in ("date", "weekday", "days_to", "tier", "series", "release_name"):
+        assert col in df_30.columns, f"missing column {col}"
+    assert df_30["weekday"].iloc[0] == "Thu"  # 2026-06-04 is a Thursday
+
+    # Missing-CSV path: empty DataFrame, no exception.
+    empty_dir = tmp_path / "empty"
+    empty_dir.mkdir()
+    df_missing = upcoming_events(within_days=7, as_of=as_of, data_dir=str(empty_dir))
+    assert df_missing.empty
