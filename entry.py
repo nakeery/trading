@@ -427,12 +427,26 @@ def print_combined_signal(df_full, direction_prob, dir_prob_63, expansion_prob,
         print(f"  IV/HV ratio:        {iv_info['ratio']:.2f}    "
               f"({iv_info['label']})")
         if iv_info.get("skew_25d") is not None:
-            print(f"  25Δ skew (P-C):     {iv_info['skew_25d']:+.3f}")
+            skew = iv_info["skew_25d"]
+            skew_label = (
+                "call-skewed"     if skew < -0.02
+                else "neutral"    if skew <  0.02
+                else "put-skewed" if skew <  0.05
+                else "heavy put skew"
+            )
+            print(f"  25Δ skew (P-C):     {skew:+.3f}  ({skew_label})")
         if iv_info.get("term") is not None:
             term_label = "noise" if iv_info["term"] > 0.98 and iv_info["term"] < 1.02 else "slight backwardation" if iv_info["term"] >= 1.02 and iv_info["term"] < 1.05 else "backwardation" if iv_info["term"] >= 1.05 else "slight contango" if iv_info["term"] <= 0.98 and iv_info["term"] >= 0.95 else "contango"
             print(f"  Term structure:     {iv_info['term']:.2f}  ({term_label})")
         if iv_info.get("pc_oi") is not None:
-            print(f"  Put/Call OI:        {iv_info['pc_oi']:.2f}")
+            pc = iv_info["pc_oi"]
+            pc_label = (
+                "heavy call interest" if pc < 0.70
+                else "call-leaning"    if pc < 1.00
+                else "put-leaning"     if pc < 1.30
+                else "heavy put interest"
+            )
+            print(f"  Put/Call OI:        {pc:.2f}  ({pc_label})")
     else:
         print(f"\n  OPTIONS-MARKET CHECK: skipped (IV not in indicators CSV)")
 

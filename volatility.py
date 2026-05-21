@@ -23,6 +23,7 @@ import numpy as np
 import pandas as pd
 import yfinance as yf
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from sklearn.calibration import CalibratedClassifierCV
@@ -307,18 +308,20 @@ def plot_results(df_full, clf, feature_cols):
     ax1 = axes[0]
     ax1.set_facecolor("#0d1117")
     plot_df = df_full[["HV_20", "IV_rank"]].dropna()
-    x = range(len(plot_df))
-    ax1.plot(x, plot_df["HV_20"].values, color="#58a6ff", lw=0.9, label="HV 20-day")
+    dates = plot_df.index
+    ax1.plot(dates, plot_df["HV_20"].values, color="#58a6ff", lw=0.9, label="HV 20-day")
+    # IV rank regime shading per row — use date2num for axvspan on datetime axis
+    date_nums = mdates.date2num(dates.to_pydatetime())
     for i in range(len(plot_df) - 1):
         rank  = plot_df["IV_rank"].iloc[i]
         color = "#3fb950" if rank < 0.33 else "#f85149" if rank > 0.67 else "#ffa657"
-        ax1.axvspan(i, i + 1, alpha=0.15, color=color)
-    tick_spacing = max(1, len(plot_df) // 8)
-    ax1.set_xticks(range(0, len(plot_df), tick_spacing))
-    ax1.set_xticklabels(
-        [plot_df.index[i].strftime("%b '%y") for i in range(0, len(plot_df), tick_spacing)],
-        rotation=30, ha="right", color="#8b949e", fontsize=7
-    )
+        ax1.axvspan(date_nums[i], date_nums[i + 1], alpha=0.15, color=color)
+    # Zoom-aware date axis — AutoDateLocator picks density, ConciseDateFormatter
+    # picks year/month/day format based on visible range. Both adapt on pan/zoom.
+    locator = mdates.AutoDateLocator(minticks=6, maxticks=14)
+    ax1.xaxis.set_major_locator(locator)
+    ax1.xaxis.set_major_formatter(mdates.ConciseDateFormatter(locator))
+    plt.setp(ax1.get_xticklabels(), rotation=30, ha="right", color="#8b949e", fontsize=7)
     ax1.set_title("HV Over Time  (green=low IV, amber=mid, red=high)", color="white", pad=10)
     ax1.set_ylabel("HV (annualized)", color="#e6edf3")
     ax1.tick_params(colors="#8b949e")

@@ -24,6 +24,7 @@ import pandas as pd
 import ta
 import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
+from matplotlib.ticker import MaxNLocator, FuncFormatter
 
 from modules.massive import IV_COLS, get_chain_summary
 
@@ -211,13 +212,25 @@ def plot_dashboard(df):
         if col in plot_df.columns:
             ax1.plot(x, plot_df[col].values, color=c, lw=0.8, label=f"MA{p}")
 
-    # Set x-axis ticks to dates
-    tick_spacing = max(1, len(plot_df) // 8)
-    ax1.set_xticks(range(0, len(plot_df), tick_spacing))
-    ax1.set_xticklabels(
-        [plot_df.index[i].strftime("%b '%y") for i in range(0, len(plot_df), tick_spacing)],
-        color="#8b949e", fontsize=7
-    )
+    # Zoom-aware date labels on integer x-axis (candles need integer positions
+    # to avoid weekend gaps). MaxNLocator picks ~12 integer ticks across the
+    # current view; FuncFormatter converts to dates with format adaptive to span.
+    def _idx_to_date(pos, _):
+        i = int(round(pos))
+        if not (0 <= i < len(plot_df)):
+            return ""
+        view_lo, view_hi = ax1.get_xlim()
+        span = view_hi - view_lo
+        if span > 500:       # > ~2 years visible
+            fmt = "%b '%y"
+        elif span > 60:      # ~3 months to 2 years
+            fmt = "%Y-%m-%d"
+        else:                # zoomed in tight
+            fmt = "%b %d"
+        return plot_df.index[i].strftime(fmt)
+
+    ax1.xaxis.set_major_locator(MaxNLocator(integer=True, nbins=12))
+    ax1.xaxis.set_major_formatter(FuncFormatter(_idx_to_date))
     ax1.set_xlim(-1, len(plot_df))
     ax1.set_ylabel("Price", **style)
     ax1.legend(fontsize=7, loc="upper left", facecolor="#161b22", labelcolor="white")
@@ -272,11 +285,8 @@ def plot_dashboard(df):
     ax5.legend(fontsize=7, loc="upper left", facecolor="#161b22", labelcolor="white")
     ax5.tick_params(colors="#8b949e")
     ax5.spines[:].set_color("#30363d")
-    ax5.set_xticks(range(0, len(plot_df), tick_spacing))
-    ax5.set_xticklabels(
-        [plot_df.index[i].strftime("%b '%y") for i in range(0, len(plot_df), tick_spacing)],
-        rotation=30, ha="right", color="#8b949e", fontsize=7
-    )
+    plt.setp(ax5.get_xticklabels(), rotation=30, ha="right",
+             color="#8b949e", fontsize=7)
 
     plt.savefig(os.path.join(DATA_DIR, f"{TICKER.lower()}_dashboard.png"), dpi=150,
                 bbox_inches="tight", facecolor="#0d1117")
