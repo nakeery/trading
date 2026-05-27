@@ -100,13 +100,19 @@ AMD (91 windows, 2000-2026, post-S13 — pre-S15 LEAPS reclassification)
   WIN_THRESHOLD 4.98% (vs QQQ 1.82%) — much harder bar.
   AMD IV backfill complete (459 rows) but Phase 3 --iv-features retrain not yet run.
 
-NVDA (53 windows, 2001-2026, RAW mode, post-S18 with P2B=0.55)
-  STRONG ENTRY 355 / 2.9% / 59.2% / 6mo 33.4% / 71.2%
+NVDA (53 windows, 2001-2026, RAW mode, post-S23 with P2B=0.55)
+  HV proxy:      STRONG ENTRY 355 / 2.8% / 59% / 6mo 33.3% / 71.2%
+  --iv-features: STRONG ENTRY 318 / 3.0% / 60% / 6mo 35.6% / 71.2%  ◄ S23 validation
   Pre-S17 baseline was 391 / 4.4% / 65.5% — drop reflects P2B threshold
-  tightening (0.41 → 0.55), not regression. Hierarchy intact; edge concentrated
-  in high-confidence tail (see S11 calibration test for the destructive
-  effect of any regularization that compresses the tail).
+  tightening (0.41 → 0.55), not regression. Hierarchy intact at 6mo (STRONG
+  > STAY OUT by +6.1pp HV / +8.5pp IV).
+  S23 finding: edge is NOT concentrated in high-confidence tail (contradicts
+  S11 explanation). NVDA STRONG ENTRY edge concentrates in MID-confidence
+  range (P2 prob 0.60-0.70 → +7%/+47% 15d/6mo; prob ≥ 0.75 → -0.7%/+11%).
+  Investigation traced 0.75+ inversion to model over-applying a "post-drop
+  recovery" pattern learned in early windows + 2009 GFC training data.
   CALIBRATED mode COLLAPSES STRONG ENTRY to -0.4% / 52% (S11 regression — drove default-revert).
+  Underlying mechanism for S11 is now uncertain (was attributed to tail compression).
 
 SPY: STRUCTURALLY UNSUITABLE — 0.1pp edge over base, hierarchy broken.
   Framework's price-action lens vs SPY's macro-driven moves don't match.
@@ -152,11 +158,26 @@ Cross-ticker findings:
 Cross-Cutting Lessons
 ---------------------
 
-Edge concentrates in high-confidence tail (individual stocks)
-  Index ETFs distribute edge uniformly across the probability range.
-  Individual stocks concentrate edge in the high-confidence tail. Any
-  regularization that compresses extremes (isotonic calibration, heavy L2)
-  destroys this tail edge — see S11 NVDA regression.
+Edge-in-tail theory — REVISED in S23, partially contradicted
+  Original belief (pre-S23): index ETFs distribute edge uniformly across
+  the probability range; individual stocks concentrate edge in the high-
+  confidence tail.
+  S23 measured this directly via probability_deciles.py:
+    QQQ: modest U-shape, tail (≥0.70) +2.9pp over base — mild edge-in-tail
+    NVDA: edge concentrates in MID-confidence (0.60-0.70: +7% 15d / +47%
+          6mo). The high-confidence tail INVERTS (0.75+: -0.7% 15d / +11%
+          6mo). Tail is catastrophically worse, not better.
+  Mechanism (probability_diagnostics.py): 0.75+ signals fire after -16%
+  20d drawdowns (vs +0.7% in mid bucket). Model learned an inflexible
+  "post-drop recovery" pattern from 2009 GFC training data and over-applies
+  it to subsequent dip setups (2002 dotcom, 2011 sideways, 2008 GFC bottom).
+  Not pure overfitting: 2011 cohort (19 signals) came from windows with
+  12 years of training data.
+  S11 attribution to "compressed extremes" no longer holds — there is no
+  high-confidence edge to compress on NVDA. Why isotonic calibration broke
+  NVDA is now an open question.
+  Cross-ticker: still need to test AMD/SOFI/LYFT once their backfills are
+  restored. NVDA's inversion may be ticker-specific or framework-wide.
 
 Calibration helps indices, hurts individual stocks
   Isotonic Phase 2 calibration: QQQ marginal pass (-0.3pt STRONG ENTRY),
@@ -253,13 +274,17 @@ IV_COLS structure:
                                                                 ← always excluded
   IV_COLS = IV_FEATURE_COLS + IV_META_COLS                       ← full list
 
-Current backfill state:
-  AMD   459 rows since 2024-05-13  ✓ complete to plan limit
-  SOFI  498 rows                   ✓ complete
-  LYFT  439 rows                   ✓ complete
-  QQQ   318 rows since 2024-05-15  ✓ complete (up from S13's 266)
-  AAPL  180 rows since 2025-07-24  ⚠ partial (interrupted run, restartable)
-  NVDA    2 rows                   ✗ NOT BACKFILLED (active TODO)
+Current backfill state (post-S23, 2026-05-27):
+  NVDA  452 rows since 2024-06-10  ✓ complete (NEW — S23)
+  AMD     2 rows                   ✗ HISTORY WIPED (was 459; re-backfill required)
+  SOFI    no atm_iv_30d col        ✗ HISTORY WIPED (was 498; re-backfill required)
+  LYFT    1 row                    ✗ HISTORY WIPED (was 439; re-backfill required)
+  QQQ     1 row                    ✗ HISTORY WIPED (was 318; re-backfill required)
+  AAPL    NO CSV                   ✗ MISSING (was 180 partial; needs indicators.py + backfill)
+  Probable cause: indicators.py harvest_iv_snapshot had a destructive merge
+  path when START_DATE was narrowed (rows in prior CSV outside the new
+  range were silently dropped on save). Fixed in S23. Pre-fix runs may
+  have wiped these backfills if user ever entered a recent START_DATE.
 
 ────────────────────────────────────────────────────────────────────────
 
@@ -396,13 +421,22 @@ Outstanding Work
 ----------------
 
 Active TODO
-- Run backfill_iv.py on NVDA (currently 2 IV rows; blocks --iv-features
-  validation on best-validated individual stock)
-- Complete AAPL backfill (180 rows from interrupted run)
-- After NVDA/AAPL backfill: retrain Phase 3 with --iv-features and compare
-  edge vs HV proxy per ticker
-- Re-run AMD and NVDA backtests with P2B_VOL_MULTIPLE=0.55 (current tables
-  are pre-S17; co-validate new multiple before treating 0.55 as permanent default)
+- ~~Run backfill_iv.py on NVDA~~  ✓ DONE in S23 (452 rows)
+- ~~After NVDA backfill: retrain Phase 3 with --iv-features~~  ✓ DONE in S23
+  (NVDA --iv-features VALIDATED: +2.3pp 6mo edge, hierarchy intact)
+- Re-backfill AMD/SOFI/LYFT/QQQ (history wiped pre-S23; indicators.py bug
+  now fixed so safe to redo). ~15-25 min per ticker.
+- Re-create AAPL indicators CSV + backfill (CSV missing entirely)
+- ~~Re-run NVDA backtest with P2B_VOL_MULTIPLE=0.55~~  ✓ DONE in S23
+  (full sweep validated P2B=0.55 as approximately optimal for NVDA)
+- Re-run AMD backtest with P2B=0.55 (current table is pre-S17, blocked on
+  AMD re-backfill if --iv-features wanted)
+- Promote --iv-features to default ON? 2/2 validated (QQQ +0.8pp Phase 3
+  precision; NVDA +2.3pp 6mo STRONG ENTRY edge). Needs at least one
+  cross-check on LYFT or AMD (once re-backfilled) before flipping default.
+- Cross-ticker probability-decile diagnostic on AMD/LYFT (once backfilled)
+  to test whether NVDA's mid-confidence sweet spot generalizes.
+- ~~A/B backtest validation for --econ-features~~ COMPLETED 2026-05-18 (S20):
 - ~~A/B backtest validation for --econ-features~~ COMPLETED 2026-05-18 (S20):
   REJECTED. QQQ marginal pass (STRONG ENTRY 1.8% → 1.7%); NVDA catastrophic
   (STRONG ENTRY 2.9% → -0.1%, hierarchy inverted). Same S11 pattern. Flag
@@ -492,6 +526,34 @@ Backlog (prioritized by leverage)
    the bulk of the work: yfinance doesn't expose this; needs paid feed
    (FactSet/Zacks) or scraping. Lowest priority for that reason.
 
+9. Trump-regime / tweet-policy feature — exogenous shock proxy
+   Hypothesis: the Trump administration (terms 2017-01-20 to 2021-01-20 and
+   2025-01-20 onward) has documented unique market effects — tariff
+   announcements, social-media-driven moves, executive-action volatility.
+   The framework currently can't see any of this (price/vol features are
+   reactive). Adding a feature could partially address the Geopolitical /
+   Exogenous Shock Limitation below.
+   Feature variants (cheapest → most expensive):
+     - Binary "Trump-regime active" flag — trivial; date lookup. Captures
+       regime effect without per-event signal. ~21% of NVDA history covered.
+     - Days-since-last-tariff-announcement — needs curated event list
+       (~50 dates 2017-2026). Manual maintenance like FOMC_MEETING_DATES.
+     - Tweet/post sentiment or topic tags — needs Twitter archive + Truth
+       Social data + NLP pipeline. Significant data-acquisition cost.
+     - Policy-uncertainty index (e.g. Baker-Bloom-Davis EPU) — existing
+       academic series, may already partially capture this; check FRED.
+   Framework discipline: this is a new feature → same A/B validation
+   bar as S11/S20/S21 (cross-ticker QQQ + NVDA minimum, default OFF
+   until validated). Risk profile is similar to --econ-features
+   (S20 REJECTED): adding date-proximity-style features can compress
+   the high-confidence tail. Suggested start: binary regime flag only
+   (1 column, lowest feature inflation), backtest on QQQ + NVDA.
+   If hierarchy holds, escalate to event-proximity. NLP-derived features
+   deferred until simpler variants prove out.
+   Reference: see Geopolitical / Exogenous Shock Limitation section
+   for the framework's current treatment of exogenous shocks (human
+   judgement layer, not model feature).
+
 Won't Fix / Structural Limits
 - Binary event direction (FDA decisions, trial readouts) — direction unknowable
   from price/volume features
@@ -507,6 +569,21 @@ Known Issues
 ------------
 - modules/tradier.py: TRADIER_TOKEN reads $env:TRADIER_TOKEN if set, else
   hardcoded fallback. Set the env var to keep token out of git.
+
+Recently Fixed (S23)
+- backtest.py run_backtest(): per-window threshold recalibration used the
+  imported P2/P2B/P3_VOL_MULTIPLE constants regardless of MULTIPLIER_SWEEP
+  iteration values. Latent since S13. Any prior sweep silently returned
+  identical results. Fix: thread multipliers as kwargs through run_backtest;
+  default to production constants. Single-config runs (sweep empty) were
+  unaffected.
+- indicators.py harvest_iv_snapshot(): merge only operated on the
+  intersection of df.index and prior.index. Rows in prior outside the
+  new df range were silently dropped, then df.to_csv() overwrote the
+  whole file. Triggered when user entered a narrowed START_DATE — wiped
+  pre-START_DATE IV history. Fix: preserve prior rows outside df range
+  via pd.concat before merge. Default behavior (START_DATE="1792-05-17")
+  unaffected.
 
 ────────────────────────────────────────────────────────────────────────
 
@@ -556,6 +633,130 @@ Tradier Config (modules/tradier.py + sizing.py)
 
 Recent Session Log
 ------------------
+
+S23 (2026-05-26 / 2026-05-27) — NVDA backfill, multiplier sweep bug, --iv-features
+                                validation, probability-decile diagnostic
+1. NVDA backfill completed: 452 IV rows since 2024-06-10 (~90% of plan limit).
+   Closes the long-standing active TODO from S12. Backfill ran ~25 min while
+   other work proceeded in parallel.
+2. CRITICAL BUG found + fixed: backtest.py run_backtest() per-window threshold
+   recalibration (line 267) always used the imported P2/P2B/P3_VOL_MULTIPLE
+   constants regardless of MULTIPLIER_SWEEP iteration values. Latent since
+   S13's per-window recalibration. Symptom: 5 consecutive identical sweep
+   results before catching it. Fix: thread p2_mult/p2b_mult/p3_mult kwargs
+   through run_backtest with production fallbacks. Sweep call site (line 773)
+   updated. Single-config runs were always correct (use imported constants).
+   S17's P2B=0.55 selection was unaffected (single-config validation).
+3. First VALID NVDA P2B multiplier sweep (13 values, P2B 0.25-1.45 step 0.10,
+   P2=0.41 + P3=0.20 fixed):
+     P2B   Count   15d Avg   6mo Avg
+     0.25  350     +3.0%     +34.4%
+     0.35  352     +3.5%     +34.5%
+     0.45  357     +3.4%     +34.7%  ◄ nominal best
+     0.55  355     +2.8%     +33.3%  ◄ production
+     0.65  337     +2.7%     +34.2%
+     0.85  307     +2.9%     +32.9%
+     0.95  278     +2.4%     +30.0%
+     1.45  216     +0.1%     +26.9%
+   Conclusion: production 0.55 is approximately optimal. Wide flat zone
+   0.25-0.85 on 6mo edge (32.9-34.7%). Nominal P2B=0.45 improvement
+   (+1.4pp 6mo) within ~1 SE on n=357. Past 0.95 degrades materially.
+   No change to production. MULTIPLIER_SWEEP reverted to [] with values
+   preserved as commented reference for future re-runs.
+4. NVDA --iv-features VALIDATED (closes context.md TODO):
+                          HV proxy    --iv-features    Δ
+     STRONG ENTRY 15d cnt   355         318            -10%
+     STRONG ENTRY 15d avg   +2.8%       +3.0%          +0.2pp
+     STRONG ENTRY 6mo avg   +33.3%      +35.6%         +2.3pp  ◄ real
+     STRONG ENTRY 6mo win   71.2%       71.2%          0pp
+     Hierarchy 6mo          STRONG > STAY OUT          intact (gap +8.5pp)
+   This is the FIRST feature-addition experiment to PASS the NVDA test
+   (S11 calibrate, S20 econ-features, S21 regime-gate all FAILED on NVDA).
+   With QQQ already at +0.8pp Phase 3 precision, this is the second
+   confirming ticker — close to the threshold for promoting --iv-features
+   to default ON, pending one more cross-ticker check.
+5. Bug + fix in indicators.py harvest_iv_snapshot:
+   - Pre-fix: merge operated on df.index.intersection(prior.index) only.
+     Rows in prior outside df range were silently dropped. Then df.to_csv
+     overwrote whole file. User running indicators.py with a narrowed
+     START_DATE would lose all pre-START_DATE IV history permanently.
+   - Fix (lines 322-329): preserve outside-range rows via concat before
+     merge, with a one-line "Preserving N prior rows outside current
+     range" notice. Default behavior (START_DATE="1792-05-17") unaffected.
+6. IV backfill data loss DISCOVERED. Pre-S23 context.md claimed:
+     AMD 459 / SOFI 498 / LYFT 439 / QQQ 318 / AAPL 180 partial / NVDA 2
+   Actual disk state in S23:
+     AMD 2 / SOFI no col / LYFT 1 / QQQ 1 / AAPL no CSV / NVDA 452
+   All prior backfills are gone except NVDA's (which we just ran). Probable
+   cause: the indicators.py bug above wiped history when user ran indicators
+   with a narrowed START_DATE at some point. Bug now fixed; re-backfills
+   are safe.
+7. probability_deciles.py — new analysis tool. Pure analysis on existing
+   backtest_results.csv. Buckets STRONG ENTRY signals by P2 (15d direction)
+   probability and reports count / 15d avg / 15d win / 6mo avg / 6mo win
+   per bucket. Surfaced a major finding:
+     NVDA STRONG ENTRY by P2 prob:
+       0.55-0.60   95   +2.7%   +45.1% 6mo
+       0.60-0.65   88   +7.1%   +46.7% 6mo  ◄ best mid
+       0.65-0.70   52   +5.5%   +45.2% 6mo
+       0.70-0.75   18   -8.9%   -4.2%  6mo  ◄ inverted
+       0.75+       65   -0.7%   +11.2% 6mo  ◄ inverted
+     Tail (≥0.70) vs base (<0.65): -7.2pp 15d, -38pp 6mo
+     QQQ: modest U-shape, tail +2.9pp 15d (conventional pattern, weak)
+   This CONTRADICTS the framework's edge-in-tail theory for individual
+   stocks. NVDA's edge concentrates in the MID-confidence range, not
+   the tail. The S11 calibration regression mechanism is now uncertain
+   (cannot be "compressed extremes" if no high-confidence edge exists).
+8. probability_diagnostics.py — second new analysis tool. Tests 4 hypotheses
+   on why NVDA's 0.75+ bucket inverts:
+     H1 (time clustering): REJECTED. 0.75+ in 2008/2018/2022 drawdown
+        years = 15% vs base 25%. Not clustered in known bad markets.
+     H2 (walk-forward window): CONFIRMED. 0.75+ mean window 15.2, only
+        6% from window ≥40. Base bucket mean 39.5, 70% from window ≥40.
+     H3 (multi-phase filter degradation): REJECTED INVERTED. P2B/P3
+        confidence is HIGHER at 0.75+ (P2B 0.877 vs 0.717; P3 0.800
+        vs 0.724). Filters are firing harder, not failing.
+     H4 (mean reversion): CONFIRMED but INVERTED from hypothesis.
+        0.75+ signals fire after 20d MEAN of -16.4% (post-drawdown).
+        Base fires after +0.7% (neutral). Model is catching dip setups.
+   Mechanism: the model learned a strong "post-drop recovery" pattern
+   from training data (likely dominated by 2009 GFC recovery) and over-
+   applies it confidently to subsequent dip setups. Breakdown by year:
+     2002: 31 of 65 0.75+ signals (48%) — small training set, overfit
+     2008: 10 signals — model just had 2008 in training
+     2011: 19 signals — ~12 years training data, NOT data-poor; learned
+           rule over-application after 2009 example
+   Conclusion: the model isn't "fundamentally broken" but carries strong
+   learned priors from rare events. Not pure early-window overfitting.
+9. MIN_TRAIN_DAYS=504 test — NULL RESULT, reverted. Hypothesis was that
+   raising the minimum training window from 1 to 2 years would cut the
+   0.75+ overfit signals. Reality: NVDA's first STRONG ENTRY was 2002-02-05
+   (~3 years into history, well past either cutoff). Dropping windows
+   1-2 dropped zero signals. Bucket counts essentially unchanged
+   (95/88/52/18/65 → 96/87/52/18/65). The 0.75+ signals come from windows
+   that exist at both 252 and 504 settings.
+   To actually eliminate them, would need either:
+     - MIN_TRAIN_DAYS ~3000 (drops 2002 cohort but not 2008+2011)
+     - Rolling fixed-window (limits learned-rule memory; complex change)
+     - Direct cap dir_prob < 0.70 (surgical fix at the symptom level)
+10. Sweep infrastructure improvements (kept post-revert):
+    - run_backtest(df_full, p2_mult=None, p2b_mult=None, p3_mult=None)
+      — accepts per-call multipliers with production fallbacks
+    - collect_signal_stats now collects 6mo (fwd_return_126d) stats
+    - sweep CSV write includes avg_return_126d and win_rate_126d cols
+11. New analysis scripts (no production behavior change):
+    - probability_deciles.py — bucket STRONG ENTRY by P2 prob
+    - probability_diagnostics.py — 4-hypothesis investigation
+   Both pure-analytical, no model retrain required. Run on existing
+   data/{ticker}_backtest_results.csv.
+12. Open questions for future sessions:
+    - Does NVDA's mid-confidence sweet spot replicate on AMD/LYFT?
+      (requires re-backfill first)
+    - Is the dir_prob < 0.70 cap worth implementing as a per-ticker rule?
+      Would cut 83 historical NVDA signals; mature-model impact ~zero
+      (current model rarely fires 0.75+).
+    - What's the real S11 mechanism if not "compressed extremes"?
+    - Should --iv-features be promoted to default ON given 2/2 validation?
 
 S22 (2026-05-18) — Econ Calendar Display Surfaces (no model wiring)
 1. Motivated by the S21 analysis: "information that fails as a model feature can

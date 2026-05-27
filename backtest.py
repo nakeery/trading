@@ -79,6 +79,22 @@ STEP_DAYS      = 126   # ~6 months between retrains
 # then prints a comparison table identifying the best by STRONG ENTRY avg return.
 # Features are built once and reused; only target labels and model fits vary per run.
 MULTIPLIER_SWEEP = []
+# NVDA P2B sweep — uncomment to re-run (production validated at P2B=0.55):
+# MULTIPLIER_SWEEP = [
+#     (0.41, 0.25, 0.20),
+#     (0.41, 0.35, 0.20),
+#     (0.41, 0.45, 0.20),
+#     (0.41, 0.55, 0.20),  # production
+#     (0.41, 0.65, 0.20),
+#     (0.41, 0.75, 0.20),
+#     (0.41, 0.85, 0.20),
+#     (0.41, 0.95, 0.20),
+#     (0.41, 1.05, 0.20),
+#     (0.41, 1.15, 0.20),
+#     (0.41, 1.25, 0.20),
+#     (0.41, 1.35, 0.20),
+#     (0.41, 1.45, 0.20),
+# ]
 
 
 # ─────────────────────────────────────────
@@ -225,8 +241,12 @@ def train_model(df_train, target_col, calibrate=False, use_iv_features=False):
 # ─────────────────────────────────────────
 # 5. WALK-FORWARD BACKTEST
 # ─────────────────────────────────────────
-def run_backtest(df_full):
+def run_backtest(df_full, p2_mult=None, p2b_mult=None, p3_mult=None):
     global WIN_THRESHOLD, WIN_THRESHOLD_63, EXPANSION_THRESHOLD
+    # Sweep mode passes per-iteration multipliers; default to production constants.
+    if p2_mult  is None: p2_mult  = P2_VOL_MULTIPLE
+    if p2b_mult is None: p2b_mult = P2B_VOL_MULTIPLE
+    if p3_mult  is None: p3_mult  = P3_VOL_MULTIPLE
     close = df_full["Close"]
     n     = len(df_full)
     results = []
@@ -250,7 +270,7 @@ def run_backtest(df_full):
         df_train = df_full.iloc[:train_end].copy()
         WIN_THRESHOLD, WIN_THRESHOLD_63, EXPANSION_THRESHOLD = compute_vol_thresholds(
             df_train, verbose=False,
-            p2_vol_multiple=P2_VOL_MULTIPLE, p2b_vol_multiple=P2B_VOL_MULTIPLE, p3_vol_multiple=P3_VOL_MULTIPLE,
+            p2_vol_multiple=p2_mult, p2b_vol_multiple=p2b_mult, p3_vol_multiple=p3_mult,
         )
 
         # Phase 2 — 15-day direction target (mode set via CLI flag — see banner)
@@ -616,14 +636,18 @@ def plot_results(df_stats, order, colors, results):
 
 
 def collect_signal_stats(results):
-    """Returns a dict of per-signal stats for sweep comparison."""
+    """Returns a dict of per-signal stats for sweep comparison (15d + 6mo)."""
     stats = {}
     for sig in ["STRONG ENTRY", "CAUTION", "SHORT-TERM ONLY", "LEAPS ONLY", "STAY OUT"]:
-        subset = results[results["signal"] == sig]["fwd_return"].dropna()
+        rows = results[results["signal"] == sig]
+        s15  = rows["fwd_return"].dropna()
+        s126 = rows["fwd_return_126d"].dropna()
         stats[sig] = {
-            "count":      len(subset),
-            "avg_return": subset.mean() if len(subset) > 0 else float("nan"),
-            "win_rate":   (subset > 0).mean() if len(subset) > 0 else float("nan"),
+            "count":           len(s15),
+            "avg_return":      s15.mean()  if len(s15)  > 0 else float("nan"),
+            "win_rate":        (s15 > 0).mean()  if len(s15)  > 0 else float("nan"),
+            "avg_return_126d": s126.mean() if len(s126) > 0 else float("nan"),
+            "win_rate_126d":   (s126 > 0).mean() if len(s126) > 0 else float("nan"),
         }
     return stats
 
@@ -770,7 +794,7 @@ if __name__ == "__main__":
                 df, verbose=True,
                 p2_vol_multiple=p2_mult, p2b_vol_multiple=p2b_mult, p3_vol_multiple=p3_mult,
             )
-            results = run_backtest(df_full)
+            results = run_backtest(df_full, p2_mult=p2_mult, p2b_mult=p2b_mult, p3_mult=p3_mult)
             stats   = collect_signal_stats(results)
             sweep_results.append({"p2": p2_mult, "p2b": p2b_mult, "p3": p3_mult,
                                   "stats": stats, "results": results})
@@ -785,13 +809,15 @@ if __name__ == "__main__":
         for r in sweep_results:
             for sig, s in r["stats"].items():
                 sweep_rows.append({
-                    "p2_mult":    r["p2"],
-                    "p2b_mult":   r["p2b"],
-                    "p3_mult":    r["p3"],
-                    "signal":     sig,
-                    "count":      s["count"],
-                    "avg_return": s["avg_return"],
-                    "win_rate":   s["win_rate"],
+                    "p2_mult":         r["p2"],
+                    "p2b_mult":        r["p2b"],
+                    "p3_mult":         r["p3"],
+                    "signal":          sig,
+                    "count":           s["count"],
+                    "avg_return":      s["avg_return"],
+                    "win_rate":        s["win_rate"],
+                    "avg_return_126d": s["avg_return_126d"],
+                    "win_rate_126d":   s["win_rate_126d"],
                 })
         out = os.path.join(DATA_DIR, f"{TICKER.lower()}_multiplier_backtest_sweep.csv")
         pd.DataFrame(sweep_rows).to_csv(out, index=False)

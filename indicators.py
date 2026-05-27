@@ -319,6 +319,13 @@ def harvest_iv_snapshot(df, ticker, csv_path):
     if os.path.exists(csv_path):
         try:
             prior = pd.read_csv(csv_path, index_col=0, parse_dates=True)
+            # Preserve prior rows that fall outside the current df range — guards against
+            # an accidental narrowed START_DATE wiping historical IV from the CSV.
+            outside = prior.index.difference(df.index)
+            if len(outside) > 0:
+                print(f"  Preserving {len(outside)} prior rows outside current range "
+                      f"({outside.min().date()} to {outside.max().date()})")
+                df = pd.concat([df, prior.reindex(columns=df.columns).loc[outside]]).sort_index()
             common = df.index.intersection(prior.index)
             for col in IV_COLS:
                 if col in prior.columns:
