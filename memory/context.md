@@ -58,9 +58,14 @@ Vol-adjusted thresholds (compute_vol_thresholds in modules/features.py):
   base rate on index ETFs (QQQ at 0.41 → ~70% win rate, nearly no losers to
   learn from). Validated on QQQ; needs NVDA co-validation before permanent default.
 
-Calibration: RAW is production default. Isotonic calibration tested in S11 —
-helped indices marginally, destroyed individual-stock edge (NVDA STRONG ENTRY
-4.4% → -0.4%). Available as --calibrate research toggle on direction/entry/backtest.
+Calibration: RAW is production default. Isotonic --calibrate research toggle on
+direction/entry/backtest. MECHANISM RESOLVED S25 via 2x2 disentangle: the effect is
+the isotonic MAP, not the 0.55→0.50 threshold drop (threshold-only ≈ 0 on 3 tickers).
+Calibration acts as a per-ticker SET-SHRINKER (STRONG ENTRY survivors at fixed 0.55:
+NVDA 27% / QQQ 21% / AMD 10%); the sign of the effect = quality of that survivor set.
+NVDA hurt (-16pp 6mo, hierarchy inverts), QQQ helped (+2.5pp), AMD helped (+18pp 6mo,
+n=37 fragile). "Helps indices / hurts stocks" (old S11 framing) REFUTED. No cheap
+a-priori predictor — must run the calibrated backtest. See S25 log + _calib_disentangle.py.
 
 IV features: HV proxy default. --iv-features uses real Massive-derived IV
 (atm_iv_30d, iv_skew_25d, term_structure) with HV-based imputation for pre-backfill
@@ -185,7 +190,9 @@ Edge-in-tail theory — REVISED in S23, partially contradicted
   12 years of training data.
   S11 attribution to "compressed extremes" no longer holds — there is no
   high-confidence edge to compress on NVDA. Why isotonic calibration broke
-  NVDA is now an open question.
+  NVDA: RESOLVED S25 — calibration culls STRONG ENTRY down to its high-confidence
+  survivors (355→94), which on NVDA is the poisoned tail (0.75+ +9% 6mo vs mid
+  0.60-0.70 +46%). See S25 log + "Calibration = per-ticker set-shrinker" below.
   Cross-ticker (S24): AMD tested — does NOT replicate NVDA's mid-confidence
   sweet spot. AMD is horizon-split: 15d edge RISES with confidence (0.75+ bucket
   +9.0%, opposite of NVDA's tail inversion), 6mo edge FALLS with confidence
@@ -193,11 +200,25 @@ Edge-in-tail theory — REVISED in S23, partially contradicted
   edge-in-tail; NVDA mid-confidence; AMD horizon-split) → edge distribution is
   ticker- AND horizon-specific. SOFI/LYFT still pending backfill.
 
-Calibration helps indices, hurts individual stocks
-  Isotonic Phase 2 calibration: QQQ marginal pass (-0.3pt STRONG ENTRY),
-  NVDA catastrophic fail (-4.8pt, hierarchy fully inverted, STRONG ENTRY
-  underperforming ALL DAYS). Production default is RAW; --calibrate retained
-  as research toggle.
+Calibration = per-ticker set-shrinker, NOT "index vs stock" (REVISED S25)
+  Old framing (S11): "calibration helps indices, hurts individual stocks."
+  REFUTED S25 — AMD (a stock) helped strongly. The S11 rule was a 2-point
+  artifact (QQQ help + NVDA hurt). 2x2 disentangle (RAW/CAL × thresh 0.55/0.50):
+  the effect is the ISOTONIC MAP, not the 0.55→0.50 threshold (threshold-only
+  ≈ 0 on all 3 tickers). Isotonic + 5-fold-CV squashes probs toward the base
+  rate, so a fixed 0.55 cut becomes a high-confidence SELECTOR that culls
+  STRONG ENTRY hard (survivors NVDA 27% / QQQ 21% / AMD 10%). Effect sign =
+  quality of the survivor set:
+    - NVDA/QQQ: survivors ≈ raw high-confidence tail (selector check confirms),
+      so sign = raw confidence→edge slope. NVDA inverted (mid 0.60-0.70 +46% 6mo,
+      tail 0.75+ +9%) → -16pp, hierarchy inverts. QQQ conventional (tail +14% best)
+      → +2.5pp, hierarchy holds. Near mirror images.
+    - AMD: 5-fold ENSEMBLE RE-RANKING decouples survivors from raw confidence
+      (C +52% 6mo vs raw-top-37 +28%; C beats every raw bucket) → the slope
+      predictor FAILS. n=37 fragile (dilutes to +34.6% at thresh 0.50).
+  Two channels (confidence-concentration + ensemble re-ranking); which dominates
+  is per-ticker. No cheap a-priori sign predictor — run the calibrated backtest.
+  Production stays RAW; --calibrate is a research toggle.
 
 Cross-ticker validation required
   QQQ alone is INSUFFICIENT validation for any framework change. Always
@@ -516,9 +537,15 @@ Backlog (prioritized by leverage)
 5. Kelly-style continuous sizing (vs current FULL/REDUCED bins)
    Sizing is binary today; LogReg returns continuous probabilities. 0.62 vs
    0.84 both clear 0.55 but have very different expected edge. Kelly =
-   (edge/variance) off predicted prob extracts more from high-confidence
-   tail (where NVDA edge lives — see S11). Risk: Kelly is aggressive on
-   noisy probabilities; half-Kelly / fractional safer.
+   (edge/variance) off predicted prob. S25 CORRECTION: the old rationale
+   ("extracts more from the high-confidence tail where NVDA edge lives") is
+   BACKWARDS for NVDA — edge is in the MID (0.60-0.70 = +46% 6mo); the tail
+   (0.75+ = +9%) is the worst part. Naive Kelly on NVDA would lever INTO the
+   bad tail and AWAY from the mid. Correct NVDA sizing is a HUMP peaking at
+   0.60-0.70, not monotonic; QQQ can take monotonic Kelly (conventional tail).
+   Sizing curve must be per-ticker, shaped off the decile profile
+   (probability_deciles.py). Risk: Kelly aggressive on noisy probs;
+   half-Kelly / fractional safer.
 
 6. ~~Smoke-test layer~~  SHIPPED 2026-05-14 (S19) as tests/test_smoke.py.
    5 pytest tests: signal hierarchy (backtest CSV), STRONG ENTRY baseline
@@ -659,6 +686,64 @@ Tradier Config (modules/tradier.py + sizing.py)
 
 Recent Session Log
 ------------------
+
+S25 (2026-05-29) — Calibration mechanism RESOLVED: 2x2 disentangle (threshold vs
+                   isotonic), cross-ticker NVDA/QQQ/AMD
+1. Motivation: open question #1 — WHY isotonic --calibrate breaks NVDA (S11: STRONG
+   ENTRY 4.4% → -0.4%) when the "compressed extremes" explanation was disproven S23
+   (NVDA has no high-confidence edge to compress). --calibrate confounds TWO things
+   (backtest.py:744): isotonic CalibratedClassifierCV(cv=5) AND P2_THRESHOLD 0.55→0.50.
+   Built _calib_disentangle.py — a 2x2 decomposing the regression:
+     A = RAW @0.55 (production)   D = RAW @0.50 (pure threshold)
+     C = CAL @0.55 (pure calib)   B = CAL @0.50 (documented regression)
+   A→D isolates threshold; A→C isolates the isotonic map+ensemble; A→B = combined.
+   Standalone harness sets backtest module globals + calls run_backtest directly;
+   NO production code touched, NO CSVs overwritten.
+2. THRESHOLD EXONERATED (3/3). Threshold-only (A→D) is negligible everywhere (NVDA
+   6mo -3.6pp, QQQ +0.05pp, AMD -0.17pp). The entire effect is the calibration (A→C).
+   "It's just the lower 0.50 threshold" → REJECTED.
+3. CALIBRATION = SET-SHRINKER. Isotonic + 5-fold-CV averaging squashes probs toward
+   the base rate, so a fixed 0.55 cut admits only the most-confident survivors:
+   STRONG ENTRY count NVDA 355→94 (27%), QQQ 574→123 (21%), AMD 383→37 (10%).
+   The effect's SIGN = quality of that survivor set.
+4. NVDA + QQQ: survivors ≈ raw high-confidence tail (selector check: NVDA raw top-94
+   +11% 6mo ≈ C's +17%; QQQ raw top-123 +14% ≈ C's +12%). So sign = raw confidence→edge
+   slope. Buckets independently reproduce S23:
+     NVDA 6mo: 0.55-60 +37% | 0.60-70 +46% ◄peak | 0.70-75 +3% | 0.75+ +9%
+     QQQ  6mo: 0.55-60 +10% | 0.60-70 +7% ◄worst | 0.70-75 +11% | 0.75+ +14% ◄peak
+   Near MIRROR IMAGES. NVDA inverted → calibration -16.1pp 6mo, hierarchy inverts
+   (STRONG +17% < SHORT +23% < STAY +27%). QQQ conventional → +2.5pp 6mo, holds.
+5. AMD BREAKS THE PREDICTOR (the valuable falsification). Pre-registered prediction
+   from S24 horizon-split (15d rises / 6mo falls with confidence): calibration should
+   HELP 15d, HURT 6mo. Result: 15d +4.0pp (help ✓), 6mo +18.4pp (help ✗ — predicted
+   hurt). Cause LOCALIZED: C's 37 survivors earn +52% 6mo but A's raw top-37 earn only
+   +28%, and C beats EVERY raw-confidence bucket (max +40%) → AMD's calibration
+   survivors are NOT the raw tail. The 5-fold-CV ENSEMBLE RE-RANKING decoupled
+   selection from raw confidence. Plausible driver: AMD 46yr/11644-row/91-window
+   heterogeneity + 90% cull. CAVEAT: n=37 small; interaction -17.5pp; at thresh 0.50
+   the +52% dilutes to +34.6% (n=174) — fragile, top-of-distribution effect.
+6. RESOLUTION of #1: the WHAT is understood — calibration reselects a small set via
+   TWO channels (confidence-concentration, dominant NVDA/QQQ; + ensemble re-ranking,
+   dominant AMD); effect = quality of the survivor set; threshold not involved. The
+   cheap a-priori PREDICTOR ("sign = raw confidence→edge slope") is UNRELIABLE (works
+   NVDA/QQQ, fails AMD) — must run the calibrated backtest per ticker. Both prior
+   explanations dead: "compressed extremes" (S11) and "it's the threshold".
+7. "Calibration helps indices, hurts individual stocks" (S11) REFUTED — AMD (stock)
+   helped strongly both horizons; was a 2-point artifact. Updated Cross-Cutting
+   Lessons + Model Details calibration line.
+8. Implications logged:
+   - Kelly (backlog #5): premise was BACKWARDS for NVDA (edge in mid 0.60-0.70, not
+     tail) — NVDA wants a HUMP-shaped sizing curve; QQQ monotonic ok. Per-ticker.
+   - dir_prob<0.70 cap: quantified — NVDA lift (removes ~87 tail @ ~+7%, keeps 257 @
+     +37-46%); QQQ loss (removes its +14% best bucket). Per-ticker.
+   - Calibration NOT uniformly bad — AMD STRONG +52% 6mo on n=37 high-conviction set
+     (research curiosity, not production).
+9. Process: AMD cross-check caught an over-clean rule before it was logged as settled
+   (NVDA+QQQ alone would have mislogged "sign = slope" as the mechanism). 6th time
+   cross-ticker validation was load-bearing (S11/S18/S20/S21/S24/S25).
+10. Artifact: _calib_disentangle.py (arg = ticker; default NVDA). Reusable "should I
+    calibrate this ticker?" diagnostic, sibling to probability_deciles.py. Production
+    RAW unchanged; --calibrate still default OFF.
 
 S24 (2026-05-28) — AMD re-backfill validation → Phase 2/2B IV-indicator LEAK found+fixed
                    → --iv-features promotion case REVERSED (no clean edge)
@@ -818,12 +903,17 @@ S23 (2026-05-26 / 2026-05-27) — NVDA backfill, multiplier sweep bug, --iv-feat
    data/{ticker}_backtest_results.csv.
 12. Open questions for future sessions:
     - Does NVDA's mid-confidence sweet spot replicate on AMD/LYFT?
-      (requires re-backfill first)
+      AMD answered S24 (NO — horizon-split). LYFT still pending re-backfill.
     - Is the dir_prob < 0.70 cap worth implementing as a per-ticker rule?
-      Would cut 83 historical NVDA signals; mature-model impact ~zero
-      (current model rarely fires 0.75+).
+      QUANTIFIED S25: NVDA cap removes ~87 tail signals (~+7% 6mo), keeps 257
+      (+37-46%) → real lift; QQQ cap removes its +14% best bucket → loss.
+      Confirms per-ticker. Mature-model live impact still ~zero (rarely fires 0.75+).
     - What's the real S11 mechanism if not "compressed extremes"?
+      RESOLVED S25: calibration is a per-ticker set-shrinker; effect = quality of
+      the (shrunken, possibly ensemble-re-ranked) survivor set; threshold exonerated.
+      No cheap a-priori sign predictor. See S25 log.
     - Should --iv-features be promoted to default ON given 2/2 validation?
+      RESOLVED S24: NO (leak artifact; clean A/B shows no edge).
 
 S22 (2026-05-18) — Econ Calendar Display Surfaces (no model wiring)
 1. Motivated by the S21 analysis: "information that fails as a model feature can
