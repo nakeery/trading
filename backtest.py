@@ -29,7 +29,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.preprocessing import StandardScaler
 from modules.benchmarks import detect_benchmarks, detect_macro_features, add_catalyst_proximity
 from modules.econ_calendar import add_macro_event_proximity
-from modules.massive import IV_COLS, IV_META_COLS, IV_FEATURE_COLS
+from modules.massive import IV_COLS, IV_META_COLS, IV_FEATURE_COLS, IV_INDICATOR_COLS
 from modules.regime import classify_regime, apply_regime_gate
 from modules.features import (
     HV_WINDOW, IV_RANK_WINDOW,
@@ -206,11 +206,13 @@ def build_features(df, benchmarks):
 # 4. TRAIN A SINGLE MODEL
 # ─────────────────────────────────────────
 def train_model(df_train, target_col, calibrate=False, use_iv_features=False):
-    # use_iv_features=True: include IV_FEATURE_COLS as features (Phase 3 only when --iv-features);
-    #   dropna() auto-limits training to the ~2yr backfilled window.
-    # default: exclude all IV_COLS so full price history is used.
+    # use_iv_features=True: include IV_FEATURE_COLS (+ iv_available/term_available indicators)
+    #   as features (Phase 3 only when --iv-features); dropna() auto-limits training to the
+    #   ~2yr backfilled window.
+    # default (Phase 2/2B/4): exclude all IV_COLS *and* the impute indicator cols, so the
+    #   full price history is used and --iv-features stays Phase-3-scoped (no Phase 2/2B leak).
     exclude = {"Open", "High", "Low", "Close", "Volume", target_col,
-               *(IV_META_COLS if use_iv_features else IV_COLS)}
+               *(IV_META_COLS if use_iv_features else IV_COLS + IV_INDICATOR_COLS)}
     feature_cols = [c for c in df_train.columns if c not in exclude]
 
     df_model = df_train[feature_cols + [target_col]].dropna()

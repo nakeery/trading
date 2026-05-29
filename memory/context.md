@@ -64,7 +64,11 @@ helped indices marginally, destroyed individual-stock edge (NVDA STRONG ENTRY
 
 IV features: HV proxy default. --iv-features uses real Massive-derived IV
 (atm_iv_30d, iv_skew_25d, term_structure) with HV-based imputation for pre-backfill
-rows. Validated on QQQ (75.0% expansion precision, +0.8pp over HV proxy).
+rows. NO clean backtest edge (S24): after fixing the Phase 2/2B indicator leak, the
+STRONG-ENTRY A/B is within noise on both real-IV tickers (AMD 6mo -2.0pp, NVDA +0.6pp).
+The S23 "NVDA +2.3pp" pass was a LEAK ARTIFACT. Real IV does improve Phase 3
+*classification* (QQQ +0.8pp precision; AMD +8pp test precision on the recent split) but
+that does not translate into STRONG-ENTRY return edge. Stays opt-in, default OFF.
 
 ────────────────────────────────────────────────────────────────────────
 
@@ -92,20 +96,26 @@ QQQ 6-month forward returns (post-S18):
 (Minor numerical drift from pre-S18 baseline expected — today-row addition
 in S16 shifts the train/test split by 1 each indicators.py run.)
 
-AMD (91 windows, 2000-2026, post-S13 — pre-S15 LEAPS reclassification)
-  STRONG ENTRY      377   3.9%   57.0%  13.0%   -8.3%   ← best (only signal worth trading)
-  CAUTION           728   1.9%   51.9%  12.8%  -10.0%   ≈ STAY OUT
-  SHORT-TERM ONLY   560  -1.4%   44.5%  13.3%  -13.3%   ← hard NO (63d confirmation load-bearing)
-  STAY OUT         4783   1.9%   52.1%  12.9%  -10.2%
-  WIN_THRESHOLD 4.98% (vs QQQ 1.82%) — much harder bar.
-  AMD IV backfill complete (459 rows) but Phase 3 --iv-features retrain not yet run.
+AMD (91 windows, 2000-2026, post-S24 — HV proxy production, P2B=0.55)
+  Signal           Count   15d    Win%    6mo    6mo Win
+  STRONG ENTRY      383    3.4%   58.7%   33.9%   74.8%   ← best both horizons
+  CAUTION           729    2.5%   52.3%   15.1%   58.0%
+  SHORT-TERM ONLY   683   -2.5%   41.3%    2.8%   42.3%   ← hard NO (63d confirmation load-bearing)
+  LEAPS ONLY        976    2.6%   55.6%   17.1%   55.8%   (> STAY OUT 6mo → real LEAPS edge)
+  STAY OUT         3691    2.0%   51.9%   16.3%   53.0%
+  WIN_THRESHOLD 4.98% (vs QQQ 1.82%) — much harder bar. STRONG AvgWin/AvgLoss 11.6%/-8.3%.
+  vs pre-S17 (377/3.9%/57.0%): 15d slightly lower from P2B tightening, win rate UP, 6mo strong.
+  AMD IV backfill RESTORED (462 rows). --iv-features clean A/B: no edge (15d 3.4→2.8%,
+  6mo 33.9→31.9%) — HV proxy is production. P4 + VIX gates both REJECT again.
 
-NVDA (53 windows, 2001-2026, RAW mode, post-S23 with P2B=0.55)
-  HV proxy:      STRONG ENTRY 355 / 2.8% / 59% / 6mo 33.3% / 71.2%
-  --iv-features: STRONG ENTRY 318 / 3.0% / 60% / 6mo 35.6% / 71.2%  ◄ S23 validation
+NVDA (53 windows, 2001-2026, RAW mode, post-S24 with P2B=0.55)
+  HV proxy:      STRONG ENTRY 355 / 2.8% / 58.9% / 6mo 33.3% / 71.2%  ← production
+  --iv-features: STRONG ENTRY 355 / 2.9% / 60.0% / 6mo 33.9% / 71.8%  (clean, post-leak-fix)
+  S24 CORRECTION: S23's "--iv-features 318 / 35.6% / +2.3pp" was a LEAK ARTIFACT (Phase
+  2/2B indicator leak — see S24 log). Post-fix STRONG count returns to 355 (= HV) and the
+  clean 6mo delta is +0.6pp (noise). --iv-features does NOT pass NVDA.
   Pre-S17 baseline was 391 / 4.4% / 65.5% — drop reflects P2B threshold
-  tightening (0.41 → 0.55), not regression. Hierarchy intact at 6mo (STRONG
-  > STAY OUT by +6.1pp HV / +8.5pp IV).
+  tightening (0.41 → 0.55), not regression. Hierarchy intact at 6mo.
   S23 finding: edge is NOT concentrated in high-confidence tail (contradicts
   S11 explanation). NVDA STRONG ENTRY edge concentrates in MID-confidence
   range (P2 prob 0.60-0.70 → +7%/+47% 15d/6mo; prob ≥ 0.75 → -0.7%/+11%).
@@ -176,8 +186,12 @@ Edge-in-tail theory — REVISED in S23, partially contradicted
   S11 attribution to "compressed extremes" no longer holds — there is no
   high-confidence edge to compress on NVDA. Why isotonic calibration broke
   NVDA is now an open question.
-  Cross-ticker: still need to test AMD/SOFI/LYFT once their backfills are
-  restored. NVDA's inversion may be ticker-specific or framework-wide.
+  Cross-ticker (S24): AMD tested — does NOT replicate NVDA's mid-confidence
+  sweet spot. AMD is horizon-split: 15d edge RISES with confidence (0.75+ bucket
+  +9.0%, opposite of NVDA's tail inversion), 6mo edge FALLS with confidence
+  (0.55-0.60 bucket +40.2%, tail +25.2%). Third distinct shape (QQQ mild
+  edge-in-tail; NVDA mid-confidence; AMD horizon-split) → edge distribution is
+  ticker- AND horizon-specific. SOFI/LYFT still pending backfill.
 
 Calibration helps indices, hurts individual stocks
   Isotonic Phase 2 calibration: QQQ marginal pass (-0.3pt STRONG ENTRY),
@@ -274,9 +288,9 @@ IV_COLS structure:
                                                                 ← always excluded
   IV_COLS = IV_FEATURE_COLS + IV_META_COLS                       ← full list
 
-Current backfill state (post-S23, 2026-05-27):
-  NVDA  452 rows since 2024-06-10  ✓ complete (NEW — S23)
-  AMD     2 rows                   ✗ HISTORY WIPED (was 459; re-backfill required)
+Current backfill state (post-S24, 2026-05-28):
+  AMD   462 rows since 2024-05-28  ✓ complete (RESTORED — S24)
+  NVDA  452 rows since 2024-06-10  ✓ complete (S23)
   SOFI    no atm_iv_30d col        ✗ HISTORY WIPED (was 498; re-backfill required)
   LYFT    1 row                    ✗ HISTORY WIPED (was 439; re-backfill required)
   QQQ     1 row                    ✗ HISTORY WIPED (was 318; re-backfill required)
@@ -422,20 +436,18 @@ Outstanding Work
 
 Active TODO
 - ~~Run backfill_iv.py on NVDA~~  ✓ DONE in S23 (452 rows)
-- ~~After NVDA backfill: retrain Phase 3 with --iv-features~~  ✓ DONE in S23
-  (NVDA --iv-features VALIDATED: +2.3pp 6mo edge, hierarchy intact)
-- Re-backfill AMD/SOFI/LYFT/QQQ (history wiped pre-S23; indicators.py bug
-  now fixed so safe to redo). ~15-25 min per ticker.
+- ~~After NVDA backfill: retrain Phase 3 with --iv-features~~  DONE S23, but the
+  "+2.3pp" was a LEAK ARTIFACT (corrected S24 — clean delta +0.6pp / noise).
+- Re-backfill SOFI/LYFT/QQQ (history wiped pre-S23; indicators.py bug fixed S23
+  so safe to redo). ~15-25 min per ticker. (AMD ✓ RESTORED S24, 462 rows.)
 - Re-create AAPL indicators CSV + backfill (CSV missing entirely)
-- ~~Re-run NVDA backtest with P2B_VOL_MULTIPLE=0.55~~  ✓ DONE in S23
-  (full sweep validated P2B=0.55 as approximately optimal for NVDA)
-- Re-run AMD backtest with P2B=0.55 (current table is pre-S17, blocked on
-  AMD re-backfill if --iv-features wanted)
-- Promote --iv-features to default ON? 2/2 validated (QQQ +0.8pp Phase 3
-  precision; NVDA +2.3pp 6mo STRONG ENTRY edge). Needs at least one
-  cross-check on LYFT or AMD (once re-backfilled) before flipping default.
-- Cross-ticker probability-decile diagnostic on AMD/LYFT (once backfilled)
-  to test whether NVDA's mid-confidence sweet spot generalizes.
+- ~~Re-run AMD backtest with P2B=0.55~~  ✓ DONE S24 (new HV baseline 383/3.4%/33.9%).
+- ~~Promote --iv-features to default ON?~~  RESOLVED S24: NO. After fixing the Phase 2/2B
+  leak, clean A/B shows no edge on either real-IV ticker (AMD 6mo -2.0pp, NVDA +0.6pp).
+  Keep opt-in, default OFF. The prior "2/2 validated" rested on the leak (NVDA) + a
+  Phase-3-precision metric that doesn't move returns (QQQ).
+- ~~Cross-ticker decile diagnostic on AMD~~  ✓ DONE S24: NVDA's mid-confidence sweet
+  spot does NOT generalize (AMD is horizon-split). LYFT still pending re-backfill.
 - ~~A/B backtest validation for --econ-features~~ COMPLETED 2026-05-18 (S20):
 - ~~A/B backtest validation for --econ-features~~ COMPLETED 2026-05-18 (S20):
   REJECTED. QQQ marginal pass (STRONG ENTRY 1.8% → 1.7%); NVDA catastrophic
@@ -570,6 +582,20 @@ Known Issues
 - modules/tradier.py: TRADIER_TOKEN reads $env:TRADIER_TOKEN if set, else
   hardcoded fallback. Set the env var to keep token out of git.
 
+Recently Fixed (S24)
+- Phase 2/2B IV-INDICATOR LEAK (latent since S13's impute_iv_features). impute_iv_features
+  adds binary cols iv_available/term_available; these are NOT in IV_COLS, so train_model's
+  Phase 2/2B exclude set (IV_META_COLS if use_iv_features else IV_COLS) did not drop them —
+  they leaked into Phase 2 AND Phase 2B feature sets whenever --iv-features was on. Effect:
+  --iv-features silently perturbed all three phases (not just Phase 3), confounding EVERY
+  --iv-features A/B (S13 QQQ, S23 NVDA). Detected via: LEAPS ONLY count changed between HV
+  and iv arms (976→884 on AMD) even though Phase 3 only modulates STRONG↔CAUTION. Fix: new
+  IV_INDICATOR_COLS constant (modules/massive.py); exclude = IV_META_COLS if use_iv_features
+  else IV_COLS + IV_INDICATOR_COLS (backtest.py:213, entry.py:161). Phase 3 keeps the
+  indicators; Phase 2/2B/4 drop them. HV-proxy mode unaffected (no-op — impute never runs).
+  13/13 smoke pass. Verified: post-fix LEAPS/SHORT/STAY counts identical HV vs iv (QQQ+NVDA
+  exact, AMD ±2 solver noise).
+
 Recently Fixed (S23)
 - backtest.py run_backtest(): per-window threshold recalibration used the
   imported P2/P2B/P3_VOL_MULTIPLE constants regardless of MULTIPLIER_SWEEP
@@ -633,6 +659,47 @@ Tradier Config (modules/tradier.py + sizing.py)
 
 Recent Session Log
 ------------------
+
+S24 (2026-05-28) — AMD re-backfill validation → Phase 2/2B IV-indicator LEAK found+fixed
+                   → --iv-features promotion case REVERSED (no clean edge)
+1. User restored AMD IV backfill: 462 rows (2024-05-28 to 2026-05-28), matches pre-loss 459.
+   Verified: atm_iv_30d/iv_skew_25d 462 nonnull, term_structure 423.
+2. Ran AMD --iv-features backtest A/B (planned 3rd cross-ticker promotion check). Pre-fix it
+   looked like a mild FAIL (STRONG 15d 3.4→2.8%, 6mo 33.9→32.2%, LEAPS 6mo dropped below STAY OUT).
+3. LEAK FOUND. Phase 3 only modulates STRONG↔CAUTION, so LEAPS/STAY counts MUST be invariant
+   between HV and iv arms if --iv-features is Phase-3-only. They weren't (AMD LEAPS 976→884).
+   Cause: impute_iv_features() adds iv_available/term_available; not in IV_COLS, so train_model's
+   Phase 2/2B exclude (IV_META_COLS if use_iv_features else IV_COLS) didn't drop them → leaked
+   into Phase 2 AND 2B. --iv-features was perturbing all 3 phases, confounding every prior A/B.
+4. FIX: IV_INDICATOR_COLS=[iv_available,term_available] in modules/massive.py; exclude →
+   IV_META_COLS if use_iv_features else IV_COLS+IV_INDICATOR_COLS (backtest.py:213, entry.py:161).
+   Phase 3 keeps indicators; Phase 2/2B/4 drop them. HV mode unaffected (no-op, impute never runs).
+   13/13 smoke pass. Verified: post-fix LEAPS/SHORT/STAY identical HV vs iv (QQQ+NVDA exact,
+   AMD ±2 solver noise; two HV runs also differ ±2).
+5. CLEAN cross-ticker A/B (same session, post-fix). STRONG ENTRY HV→--iv-features:
+     QQQ:  15d 1.7→1.8% (+0.1) | 6mo 9.6→9.6%  (0.0)  | cnt 574→587   [only 1 real IV row →
+                                                          imputed-only, NOT a real-IV test]
+     NVDA: 15d 2.8→2.9% (+0.1) | 6mo 33.3→33.9% (+0.6) | cnt 355→355   [452 real IV rows]
+     AMD:  15d 3.4→2.8% (-0.6) | 6mo 33.9→31.9% (-2.0) | cnt 383→370   [462 real IV rows]
+   VERDICT: on the two tickers with real IV (AMD, NVDA), --iv-features has NO clean edge
+   (all deltas within noise). Promotion to default ON → NO. Stays opt-in.
+6. S23 NVDA "+2.3pp / first feature to pass" was a LEAK ARTIFACT. Pre-fix selected a different
+   318-signal subset (vs HV 355) via the Phase 2/2B perturbation; post-fix count returns to 355
+   and clean 6mo delta is +0.6pp (noise). S13 QQQ "+0.8pp Phase 3 precision" is Phase-3-internal
+   (not leak-confounded) and stands, but is a classification metric — no STRONG-ENTRY return edge.
+7. Reconciliation: entry.py single recent split showed real IV lifting Phase 3 TEST PRECISION
+   +8pp on AMD (52.7→60.7%). Real IV sharpens Phase 3 classification but doesn't move STRONG
+   ENTRY returns (Phase 3 only sizes STRONG vs CAUTION; that re-sort ≠ P&L edge vs HV proxy).
+8. New AMD HV production baseline (post-S17, P2B=0.55, 91 windows) — see Current Backtest
+   Baselines (replaces stale pre-S17 table). Clean hierarchy, STRONG best both horizons.
+   P4 gate + VIX regime gate both REJECT again (P4 -0.40pp; VIX -1.38pp / cnt 276 < 300).
+9. AMD decile (probability_deciles.py, HV proxy): NVDA's mid-confidence sweet spot does NOT
+   generalize. AMD horizon-split: 15d edge RISES with confidence (0.75+ +9.0%, opposite of
+   NVDA tail inversion); 6mo edge FALLS (0.55-0.60 +40.2%, tail +25.2%). Third distinct shape.
+10. Process: the AMD backfill did its job — surfaced a leak latent since S13 that had silently
+    confounded EVERY --iv-features A/B. "LEAPS/STAY counts must be invariant under --iv-features"
+    is now a reusable diagnostic. 5th time the default-OFF-then-validate discipline paid off —
+    here it caught a contaminated PASS (S23 NVDA), not a fail.
 
 S23 (2026-05-26 / 2026-05-27) — NVDA backfill, multiplier sweep bug, --iv-features
                                 validation, probability-decile diagnostic

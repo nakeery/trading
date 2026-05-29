@@ -24,6 +24,11 @@ MASSIVE_URL     = "https://api.massive.com"
 IV_FEATURE_COLS = ["atm_iv_30d", "iv_skew_25d", "term_structure"]
 IV_META_COLS    = ["atm_strike", "atm_expiry", "atm_dte", "put_call_oi_ratio"]
 IV_COLS         = IV_FEATURE_COLS + IV_META_COLS
+#   IV_INDICATOR_COLS — binary missing-indicators added by features.impute_iv_features()
+#                     (present only under --iv-features). Treated like IV_FEATURE_COLS:
+#                     kept in Phase 3 feature sets, excluded from Phase 2/2B/4 so the flag
+#                     stays Phase-3-scoped (no leak into the direction/exit models).
+IV_INDICATOR_COLS = ["iv_available", "term_available"]
 
 FRONT_MONTH_MIN_DTE = 25    # back-month term-structure pivot — anything < 25d counts as "near"
 BACK_MONTH_MIN_DTE  = 55    # back-month tenor for term-structure denominator

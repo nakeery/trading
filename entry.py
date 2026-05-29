@@ -26,7 +26,7 @@ from sklearn.metrics import precision_score
 from sklearn.preprocessing import StandardScaler
 from modules.benchmarks import detect_benchmarks, detect_macro_features, add_macro_features, add_catalyst_proximity
 from modules.econ_calendar import add_macro_event_proximity, next_event_per_series, ALL_SERIES
-from modules.massive import IV_COLS, IV_META_COLS, IV_FEATURE_COLS
+from modules.massive import IV_COLS, IV_META_COLS, IV_FEATURE_COLS, IV_INDICATOR_COLS
 from modules.regime import (
     REGIME_VIX_STRESS, REGIME_TERM_STRESS,
     classify_regime, is_stress_regime, apply_regime_gate,
@@ -158,7 +158,7 @@ def train(df, target_col, calibrate=False, use_iv_features=False, decision_thres
     # production threshold for the phase (P2/P2B/P3) so the printed precision reflects the
     # signal that will actually fire.
     exclude = {"Open", "High", "Low", "Close", "Volume", target_col,
-               *(IV_META_COLS if use_iv_features else IV_COLS)}
+               *(IV_META_COLS if use_iv_features else IV_COLS + IV_INDICATOR_COLS)}
     feature_cols = [c for c in df.columns if c not in exclude]
 
     df_model = df[feature_cols + [target_col]].dropna()

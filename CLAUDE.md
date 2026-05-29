@@ -214,10 +214,12 @@ CLI flags (default OFF; available on direction/entry/volatility/exit/backtest):
   (STRONG ENTRY 4.4% → -0.4%). Calibrated mode uses P2_THRESHOLD=0.50 instead of 0.55.
 - `--iv-features` — Phase 3 uses real Massive IV (`atm_iv_30d`, `iv_skew_25d`, `term_structure`)
   with HV-based imputation for pre-backfill rows. Default uses HV proxy (full price history).
-  Validated on QQQ (75.0% expansion precision, +0.8pp over HV proxy) and **NVDA (S23: STRONG
-  ENTRY 6mo edge +2.3pp, hierarchy intact)** — first feature-addition experiment to pass the
-  NVDA test. Promotion to default ON pending one cross-check on LYFT/AMD (once those tickers'
-  IV backfills are restored).
+  **NO clean backtest edge (S24); stays default OFF.** After fixing the Phase 2/2B indicator leak
+  (see Recently Fixed), the STRONG-ENTRY A/B is within noise on both real-IV tickers (AMD 6mo
+  −2.0pp, NVDA +0.6pp). The S23 "NVDA +2.3pp / first to pass" result was a **leak artifact**.
+  Real IV does sharpen Phase 3 *classification* (QQQ +0.8pp precision; AMD +8pp test precision on
+  the recent split) but that does not translate into STRONG-ENTRY return edge (Phase 3 only
+  modulates STRONG↔CAUTION sizing). Retained as an opt-in research flag.
 - `--p4-gate` (entry.py only) — Phase 4 exit gate. One-tier-down downgrade: STRONG ENTRY → CAUTION,
   CAUTION / SHORT-TERM ONLY → STAY OUT, LEAPS ONLY unchanged. **REJECTED by S18 backtest validation**:
   QQQ STRONG ENTRY 1.8% → 1.5% (−0.24pp 15d), 9.4% → 7.6% (−1.8pp 6mo); NVDA gated count 294 < 300
@@ -318,11 +320,28 @@ See `memory/context.md` "Geopolitical Risk Limitation" for proposed mitigations 
   constant. Set the env var to keep the token out of git.
 - `data/iv_log.csv` (deprecated as of S10): file preserved on disk as historical record but no new rows
   are written. IV history now lives in `data/{ticker}_indicators.csv`.
-- **AMD / SOFI / LYFT / QQQ IV backfills lost (S23 discovery)** — context.md pre-S23 claimed
-  459 / 498 / 439 / 318 rows respectively; disk shows ~0-2. Probable cause was the
-  `indicators.py` narrowed-START_DATE bug (now fixed in S23). Re-backfill required to
-  restore cross-ticker `--iv-features` validation capacity. NVDA backfill (452 rows) is intact.
+- **SOFI / LYFT / QQQ IV backfills lost (S23 discovery)** — context.md pre-S23 claimed
+  498 / 439 / 318 rows respectively; disk shows ~0-1. Probable cause was the
+  `indicators.py` narrowed-START_DATE bug (now fixed in S23). Re-backfill required.
+  AMD (462 rows, RESTORED S24) and NVDA (452 rows, S23) are intact.
 - AAPL indicators CSV is missing entirely — needs `indicators.py` run then `backfill_iv.py`.
+
+## Recently Fixed (S24)
+
+- **Phase 2/2B IV-indicator leak** (latent since S13). `impute_iv_features()` adds binary
+  `iv_available`/`term_available` columns that were not in `IV_COLS`, so `train_model`'s Phase 2/2B
+  exclude set (`IV_META_COLS if use_iv_features else IV_COLS`) did not drop them — they leaked into
+  the Phase 2 and Phase 2B feature sets whenever `--iv-features` was on. Net effect: `--iv-features`
+  silently perturbed all three phases, not just Phase 3, **confounding every prior `--iv-features`
+  A/B** (S13 QQQ, S23 NVDA). Detected because LEAPS ONLY / STAY OUT counts changed between the HV and
+  `--iv-features` arms (AMD LEAPS 976→884) even though Phase 3 only modulates STRONG↔CAUTION. Fix: new
+  `IV_INDICATOR_COLS = ["iv_available", "term_available"]` constant in `modules/massive.py`; the
+  exclude is now `IV_META_COLS if use_iv_features else IV_COLS + IV_INDICATOR_COLS` (`backtest.py`,
+  `entry.py`). Phase 3 keeps the indicators; Phase 2/2B/4 drop them. HV-proxy mode is unaffected (a
+  no-op — impute never runs there, so the columns never exist). 13/13 smoke tests pass; post-fix
+  LEAPS/SHORT/STAY counts are identical between HV and `--iv-features` (QQQ + NVDA exact; AMD ±2
+  solver noise). **Consequence:** the S23 "NVDA `--iv-features` +2.3pp / first feature to pass"
+  result was a leak artifact; the clean cross-ticker A/B shows no `--iv-features` edge (see CLI flags).
 
 ## Recently Fixed (S23)
 
@@ -362,8 +381,8 @@ See `memory/context.md` "Geopolitical Risk Limitation" for proposed mitigations 
 ## Ticker Suitability Notes
 
 - **QQQ**: framework reference baseline; 53 windows (2001–2026); clean hierarchy. Post-S15 STRONG ENTRY 1.9% / 63.3% win at 15d, +10.6% / 77.3% at 6mo.
-- **AMD**: well-suited; 91 windows (2000–2026); STRONG ENTRY 3.9% / 57.0% win, AvgWin/AvgLoss 13.0% / -8.3% supports FULL sizing. **Only trade STRONG ENTRY** — CAUTION ≈ STAY OUT (Phase 3 HV proxy doesn't discriminate at AMD's vol scale), SHORT-TERM ONLY is a hard NO (-1.4% / 44.5% — 63d confirmation is load-bearing). AMD IV backfill complete; Phase 3 retrain with `--iv-features` not yet run.
-- **NVDA**: well-suited in RAW mode; 53 windows. Post-S23 with P2B=0.55: HV proxy 355 / 2.8% / 59% / 6mo 33.3%; **--iv-features 318 / 3.0% / 60% / 6mo 35.6%** (S23 validation — first feature-addition experiment to pass NVDA). Pre-S17 baseline was 391 / 4.4% / 65.5%; drop reflects P2B threshold tightening (0.41 → 0.55), not regression. ⚠️ CALIBRATED mode COLLAPSES STRONG ENTRY to -0.4% / 52% (S11 regression). **Edge does NOT live in high-confidence tail (S23 finding)** — probability-decile analysis shows edge concentrates in MID-confidence range (P2 prob 0.60-0.70: +5-7% 15d / +45-47% 6mo); the high-confidence tail (≥0.75) INVERTS to -0.7% / +11%. Mechanism: model over-applies a "post-drop recovery" pattern learned from 2009 GFC. The original S11 calibration explanation (compressed extremes) is no longer supported.
+- **AMD**: well-suited; 91 windows (2000–2026); post-S24 HV baseline STRONG ENTRY 383 / 3.4% / 58.7% win / 6mo 33.9% / 74.8% (best both horizons); STRONG AvgWin/AvgLoss 11.6% / -8.3% supports FULL sizing. **Only trade STRONG ENTRY** — CAUTION ≈ STAY OUT (Phase 3 HV proxy doesn't discriminate at AMD's vol scale), SHORT-TERM ONLY is a hard NO (-2.5% / 41.3% — 63d confirmation is load-bearing); LEAPS ONLY 6mo (17.1%) > STAY OUT (16.3%). IV backfill RESTORED S24 (462 rows); `--iv-features` clean A/B shows no edge (6mo 33.9→31.9%) — HV proxy is production.
+- **NVDA**: well-suited in RAW mode; 53 windows. Post-S24 with P2B=0.55: HV proxy 355 / 2.8% / 58.9% / 6mo 33.3% (production). ⚠️ **S24 correction**: S23's "`--iv-features` 318 / 35.6% / +2.3pp — first to pass NVDA" was a **leak artifact** (Phase 2/2B IV-indicator leak). Post-fix `--iv-features` is 355 / 2.9% / 6mo 33.9% (= HV, +0.6pp noise) — does NOT pass. Pre-S17 baseline was 391 / 4.4% / 65.5%; drop reflects P2B threshold tightening (0.41 → 0.55), not regression. ⚠️ CALIBRATED mode COLLAPSES STRONG ENTRY to -0.4% / 52% (S11 regression). **Edge does NOT live in high-confidence tail (S23 finding)** — probability-decile analysis shows edge concentrates in MID-confidence range (P2 prob 0.60-0.70: +5-7% 15d / +45-47% 6mo); the high-confidence tail (≥0.75) INVERTS to -0.7% / +11%. Mechanism: model over-applies a "post-drop recovery" pattern learned from 2009 GFC. The original S11 calibration explanation (compressed extremes) is no longer supported.
 - **SOFI**: marginal — short history (2021 IPO); rate features wired but need more rate-regime variation.
 - **AAPL**: backfill partial (180 IV rows since 2025-07-24); backtest not yet run.
 - **LYFT**: backfill complete (439 IV rows); backtest not yet run.
