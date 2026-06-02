@@ -39,7 +39,7 @@ from modules.tradier import (
 DATA_DIR             = "data"
 # INDICATORS_CSV       = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 MIN_DTE              = 180   # ~6 months
-MAX_DTE              = 365   # ~12 months
+MAX_DTE              = 365 * 2   # ~12 months
 DEFAULT_STRIKE_RANGE = 10    # strikes above and below ATM
 HV_WINDOW            = 20
 
@@ -199,7 +199,7 @@ def print_results(df, ticker, current_price, budget, hv, strike_range):
                   f"{cts_str}  {decay_str}{atm_marker}")
 
     print(f"\n  {'─'*74}")
-    print(f"  ^ = IV expensive vs HV (>120%)   v = IV cheap vs HV (<80%)")
+    print(f"  ^ = IV expensive vs HV (+20%)   v = IV cheap vs HV (-20%)")
     print(f"  over budget = contract cost exceeds your budget (increase budget to size this strike)")
     print(f"  Theta/day = per share per day.  Decay/d = total daily decay at sized position.")
     print(f"  Max loss assumes option expires worthless (full premium lost).")

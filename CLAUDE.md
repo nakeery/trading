@@ -244,7 +244,7 @@ CLI flags (default OFF; available on direction/entry/volatility/exit/backtest):
 - IV source: `smv_vol` (smoothed model vol — matches Tradier app display)
 - ATM anchor: nearest real ATM strike, not exact stock price
 - All strikes shown including "over budget" ones (not silently filtered)
-- IV/HV ratio shown via `^` (>120%, expensive) and `v` (<80%, cheap) markers — useful for assessing whether option premium is rich relative to realized vol
+- IV/HV ratio shown via `^` (+20%, expensive) and `v` (-20%, cheap) markers — useful for assessing whether option premium is rich relative to realized vol
 
 ## Massive Config (`modules/massive.py`)
 
