@@ -44,6 +44,9 @@ python exit.py
 
 # Walk-forward backtest (periodic validation)
 python backtest.py
+
+# Put/call OI + volume by expiry off the live Tradier chain (positioning vs flow; ad-hoc)
+python pc_oi.py
 ```
 
 Install dependencies:
@@ -71,6 +74,7 @@ Run smoke tests:
 | entry.py | 2 (ticker, benchmarks — blank = default) |
 | backtest.py | 2 (ticker, benchmarks) + trailing chart prompt |
 | sizing.py | interactive (ticker, budget, strikes) |
+| pc_oi.py | 2 (ticker, optional expiry filter — blank = all) |
 
 ### Running scripts via Claude Code on Windows
 
@@ -97,6 +101,7 @@ cmd /c "(echo TICKER && echo.) | python -X utf8 script.py" 2>&1
 | `entry.py` | Combines all models → SIGNAL + POSITION SIZING (reads IV from CSV — no live API) | Console only |
 | `backtest.py` | Walk-forward backtest + 6-month forward return table (53 windows QQQ; 91 AMD; 53 NVDA; 31y SPY; 17 CRSP) | `data/{ticker}_backtest.png`, `data/{ticker}_backtest_results.csv` |
 | `sizing.py` | Live options chain sizing via Tradier API | Console only |
+| `pc_oi.py` | Ad-hoc put/call OI + volume by future expiry off the live Tradier chain (positioning vs flow); optional date filter, LEAPS-tenor flag (S26) | Console only |
 | `backfill_iv.py` | Standalone 2-year historical IV backfill via BS-inversion (one-off per ticker) | Updates `data/{ticker}_indicators.csv` in place; checkpointed |
 | `probability_deciles.py` | Bucket STRONG ENTRY signals by Phase 2 probability; reports 15d + 6mo edge per bucket. Pure analysis on existing `data/{ticker}_backtest_results.csv` — no model retrain. (S23) | Console only |
 | `probability_diagnostics.py` | Investigate WHY a probability bucket under/over-performs. Runs 4-hypothesis tests (time clustering, walk-forward window, multi-phase filter, preceding 20d return). (S23) | Console only |
@@ -105,7 +110,7 @@ cmd /c "(echo TICKER && echo.) | python -X utf8 script.py" 2>&1
 | `modules/massive.py` | Massive.com API client + `get_chain_summary()` + `get_historical_iv_snapshot()`; exports `IV_COLS`, `IV_FEATURE_COLS`, `IV_META_COLS` | Imported by `indicators.py` (harvest), `backfill_iv.py` (history), and 5 ML scripts (exclude from features) |
 | `modules/econ_calendar.py` | FRED API client + `add_macro_event_proximity()` — adds `Days_to_FOMC/CPI/NFP/PCE/PPI/GDP/Retail/JOLTS/Claims/macro` proximity features. Standalone CLI: `python -m modules.econ_calendar --refresh` (weekly) | Imported by entry/direction/volatility/exit/backtest/calibrate_multipliers; gated by `--econ-features` flag (default OFF) |
 | `modules/bs_invert.py` | Black-Scholes implied-vol solver (Newton-Raphson + bisection fallback) — used by `backfill_iv.py` | Imported by `modules/massive.py` |
-| `modules/tradier.py` | Tradier API client + `get_atm_iv()` | Imported by `sizing.py` only |
+| `modules/tradier.py` | Tradier API client + `get_atm_iv()` | Imported by `sizing.py` and `pc_oi.py` |
 | `tests/test_smoke.py` | 8 pytest regression guards (signal hierarchy, STRONG ENTRY baseline, vol thresholds, signal logic, S16 threshold-sensitivity, econ_calendar loads, Days_to_* bounds, days-to-specific-event) | Run manually; requires `data/QQQ_*.csv` |
 
 All CSVs and PNGs are written to the `data/` subdirectory (must exist — create manually if missing).

@@ -676,7 +676,7 @@ yfinance, pandas, numpy, ta, matplotlib, scikit-learn (LogisticRegression,
 StandardScaler, precision_score, CalibratedClassifierCV, brier_score_loss),
 lxml (earnings dates), requests (Tradier + Massive APIs)
 
-Tradier Config (modules/tradier.py + sizing.py)
+Tradier Config (modules/tradier.py + sizing.py + pc_oi.py)
 - TRADIER_TOKEN: $env:TRADIER_TOKEN if set, else hardcoded fallback (S8)
 - MIN_DTE = 180, MAX_DTE = 365 (6-12 month expiries) — sizing.py default
 - DEFAULT_STRIKE_RANGE = 10 strikes above/below ATM
@@ -686,6 +686,49 @@ Tradier Config (modules/tradier.py + sizing.py)
 
 Recent Session Log
 ------------------
+
+S26 (2026-06-07) — New tool pc_oi.py (put/call OI + volume viewer); sizing.py IV legend reworded
+1. sizing.py IV cheap/expensive legend reworded for clarity (WORDING ONLY — thresholds
+   unchanged). `^` (>120%) -> `^` (+20%); `v` (<80%) -> `v` (-20%). Flag logic still fires at
+   IV > 1.20*HV (expensive) / IV < 0.80*HV (cheap) (sizing.py:181). CLAUDE.md "Sizing Config"
+   bullet updated to match. No logic/test impact.
+2. NEW STANDALONE TOOL: pc_oi.py — ad-hoc viewer of put/call OPEN-INTEREST + VOLUME by future
+   expiration date, off the live Tradier chain. NOT in the daily pipeline, NOT a model feature.
+   Motivation: the daily Massive harvest's put_call_oi_ratio (shown in entry.py OPTIONS-MARKET
+   CHECK) is a narrow, strike-bounded ~23-37 DTE + 55-90 DTE blend (massive.py get_chain_summary:
+   front strikes +-15%, back +-3%) that NEVER samples the 180-365 DTE LEAPS tenor the framework
+   actually trades. pc_oi.py reads every future expiry at full strikes, so positioning at the real
+   holding horizon is visible.
+   - Output: per-expiry table — Call OI | Put OI | P/C OI | Call Vol | Put Vol | P/C Vol |
+     Positioning — plus a TOTAL aggregate row. Symmetric OI-block / Vol-block layout.
+   - Ratios = put/call (>1 put-leaning, <1 call-leaning). Positioning label uses P/C OI, same 4
+     bands as entry.py (<0.70 heavy call | <1.00 call-leaning | <1.30 put-leaning | >=1.30 heavy
+     put). LEAPS rows (180-365 DTE) flagged with `*`.
+   - Interactive (matches sizing.py): 2 prompts (ticker, optional expiry filter; blank = all
+     expiries + TOTAL, a date = just that expiry; bad date prints the available expiries). One
+     Tradier chain call per expiry — date filter is the fast path. Built on modules/tradier.py
+     (get_current_price/get_expirations/get_chain); tradier.py now imported by sizing.py AND pc_oi.py.
+   - GUARD: pc_vol = (put_vol/call_vol) if call_vol > 0 else None -> "n/a". DENOMINATOR-ONLY
+     (zero put_vol with calls>0 is a valid 0.0 = all-call activity). Mirrors the existing OI guard.
+     Volume hits zero legitimately/often (illiquid far-dated, untraded session) unlike OI; the raw
+     Call/Put Vol columns still show counts when the ratio is n/a.
+   - VOLUME SEMANTICS (found during verification): Tradier rolls the LAST COMPLETED session's
+     volume outside RTH (run Sun 2026-06-07 returned Fri's volume, not 0). Labels say "latest
+     session", not "today". OI = prior-close (once/day); Volume = session flow.
+   - DATA AVAILABILITY: forward/live only. Future-expiry positioning is observable now (those
+     contracts trade today); arbitrary PAST as-of OI is NOT available (Massive/Tradier don't serve
+     historical OI — same wall as backfill's put_call_oi_ratio omission, massive.py:321).
+   - WHY pc_oi.py (Tradier) WON'T match entry.py's Massive put_call_oi_ratio: different basket —
+     strike scope (full chain vs +-15%/+-3%), expiry scope (all/single vs ~30+60 DTE blend that
+     skips LEAPS), vendor + snapshot timing (live vs stored daily stamp). Expected direction:
+     pc_oi.py reads MORE put-heavy (full-strike includes OTM put hedges Massive's window clips).
+     Not a bug.
+   - Verified live on QQQ (32 expiries): clean render, TOTAL aggregates, ratios match raw values,
+     guard intact. Example — 2026-12-18 (194 DTE LEAPS): P/C OI 1.93 (put-heavy positioning /
+     hedges) but P/C Vol 0.27 (call-heavy flow) — the positioning-vs-flow divergence the volume
+     columns expose.
+   - CLAUDE.md updated: architecture table, prompt-counts table, as-needed commands, tradier.py
+     import note.
 
 S25 (2026-05-29) — Calibration mechanism RESOLVED: 2x2 disentangle (threshold vs
                    isotonic), cross-ticker NVDA/QQQ/AMD
