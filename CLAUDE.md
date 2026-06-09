@@ -50,6 +50,9 @@ python pc_oi.py
 
 # Graphical economic calendar — popup month grid of tracked macro release dates (S27)
 python econ_calendar_view.py
+
+# Consolidated market-context surface — fear/positioning gauges + trailing percentiles (S29)
+python market_context.py            # add --graphical for a matplotlib panel + PNG
 ```
 
 Install dependencies:
@@ -63,7 +66,7 @@ Run smoke tests:
 
 ```powershell
 .\trade\Scripts\python.exe -m pytest tests/ -v
-# 8 tests, ~1-2s. Requires data/QQQ_indicators.csv + data/QQQ_backtest_results.csv.
+# 14 tests, ~2-3s. Requires data/QQQ_indicators.csv + data/QQQ_backtest_results.csv.
 ```
 
 ### Prompt counts per script (for piped input via Claude Code)
@@ -79,6 +82,7 @@ Run smoke tests:
 | sizing.py | interactive (ticker, budget, strikes) |
 | pc_oi.py | 2 (ticker, optional expiry filter — blank = all) |
 | econ_calendar_view.py | 0 (argparse flags only — no prompts) |
+| market_context.py | 1 (ticker) + argparse flags (--graphical / --save-only / --no-vix) |
 
 ### Running scripts via Claude Code on Windows
 
@@ -110,13 +114,15 @@ cmd /c "(echo TICKER && echo.) | python -X utf8 script.py" 2>&1
 | `probability_deciles.py` | Bucket STRONG ENTRY signals by Phase 2 probability; reports 15d + 6mo edge per bucket. Pure analysis on existing `data/{ticker}_backtest_results.csv` — no model retrain. (S23) | Console only |
 | `probability_diagnostics.py` | Investigate WHY a probability bucket under/over-performs. Runs 4-hypothesis tests (time clustering, walk-forward window, multi-phase filter, preceding 20d return). (S23) | Console only |
 | `econ_calendar_view.py` | Graphical economic-release calendar (matplotlib popup): month grid of tracked macro releases color-coded by tier, today highlighted; TTL refresh-if-stale + coverage footnotes + PNG export (S27) | `data/econ_calendar.png` + popup window |
+| `market_context.py` | Consolidated fear/positioning surface — IV/HV, 25Δ skew, term structure, P/C OI, HV/IV-rank, VIX complex + regime, each with trailing-1y percentile + net read; console always, optional `--graphical` panel (S29). Human-context (S22), not a feature/signal | Console + optional `data/{ticker}_market_context.png` |
 | `modules/features.py` | Shared feature engineering (HV, VIX, earnings, normalize, vol thresholds, IV imputation, P4 drawdown threshold + target, trend-break features) + constants | Imported by direction/volatility/exit/entry/backtest |
 | `modules/benchmarks.py` | Sector benchmarks, macro features, catalyst proximity | Imported by direction/entry/backtest/volatility |
 | `modules/massive.py` | Massive.com API client + `get_chain_summary()` + `get_historical_iv_snapshot()`; exports `IV_COLS`, `IV_FEATURE_COLS`, `IV_META_COLS` | Imported by `indicators.py` (harvest), `backfill_iv.py` (history), and 5 ML scripts (exclude from features) |
 | `modules/econ_calendar.py` | FRED client + `add_macro_event_proximity()` proximity features; display/GUI helpers `next_event_per_series`/`upcoming_events`/`events_in_range`/`coverage_end_per_series`/`refresh_if_stale` (S22/S27). Cache: `data/econ_calendar.csv`. CLI: `--refresh` (weekly) / `--upcoming` | Imported by entry/direction/volatility/exit/backtest/calibrate_multipliers (gated by `--econ-features`, default OFF) + `econ_calendar_view.py` |
+| `modules/sentiment.py` | Band-labelers (IV/HV, skew, term, P/C, IV-regime) + `gather_context()` — per-ticker fear/positioning gauges with trailing percentiles, reusing `compute_hv_features`/`add_vix`/`classify_regime` (S29) | Imported by `market_context.py` (and the future #5 sizing amplifier) |
 | `modules/bs_invert.py` | Black-Scholes implied-vol solver (Newton-Raphson + bisection fallback) — used by `backfill_iv.py` | Imported by `modules/massive.py` |
 | `modules/tradier.py` | Tradier API client + `get_atm_iv()` | Imported by `sizing.py` and `pc_oi.py` |
-| `tests/test_smoke.py` | 8 pytest regression guards (signal hierarchy, STRONG ENTRY baseline, vol thresholds, signal logic, S16 threshold-sensitivity, econ_calendar loads, Days_to_* bounds, days-to-specific-event) | Run manually; requires `data/QQQ_*.csv` |
+| `tests/test_smoke.py` | 14 pytest regression guards (signal hierarchy, STRONG ENTRY baseline, vol thresholds, signal logic, S16 threshold-sensitivity, econ_calendar loads, Days_to_* bounds, days-to-specific-event, regime thresholds/gate/NaN, next_event/upcoming shape, sentiment labelers) | Run manually; requires `data/QQQ_*.csv` |
 
 All CSVs and PNGs are written to the `data/` subdirectory (must exist — create manually if missing).
 

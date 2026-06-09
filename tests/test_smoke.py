@@ -1,7 +1,7 @@
 """
 Smoke tests for the options trading ML pipeline.
 
-13 regression guards:
+14 regression guards:
   1. Signal hierarchy (backtest CSV) — STRONG ENTRY > CAUTION > STAY OUT by avg return
   2. STRONG ENTRY baseline sanity (backtest CSV) — count/return/win-rate loose bounds
   3. Vol thresholds range (QQQ indicators CSV) — positive values in expected ranges
@@ -16,6 +16,7 @@ Smoke tests for the options trading ML pipeline.
  11. Regime classification NaN handling — missing VIX → 'normal' fallback
  12. next_event_per_series shape — returned dict has all 9 series, future dates correct
  13. upcoming_events window filter — within_days arg correctly bounds the result set
+ 14. sentiment labelers — IV/HV, skew, term, P/C, IV-regime bands + percentile_of behavior
 """
 
 
@@ -440,3 +441,52 @@ def test_upcoming_events_window_filter(tmp_path):
     empty_dir.mkdir()
     df_missing = upcoming_events(within_days=7, as_of=as_of, data_dir=str(empty_dir))
     assert df_missing.empty
+
+
+# ─── Test 14: sentiment labelers ──────────────────────────────────────────────
+def test_sentiment_labels():
+    """modules/sentiment.py band-labelers map values to the correct band, handle NaN, and
+    percentile_of degrades to None on thin history. These labelers are the single source of
+    truth shared by market_context.py and entry.py's OPTIONS-MARKET CHECK (S29)."""
+    import numpy as np
+    import pandas as pd
+    from modules.sentiment import (
+        iv_hv_label, iv_regime_label, skew_label, term_label, pc_label, percentile_of,
+    )
+
+    assert iv_hv_label(0.80) == "cheap"
+    assert iv_hv_label(1.00) == "fair"
+    assert iv_hv_label(1.30) == "rich"
+    assert iv_hv_label(1.50) == "very rich"
+
+    assert skew_label(-0.03) == "call-skewed"
+    assert skew_label(0.00)  == "neutral"
+    assert skew_label(0.03)  == "put-skewed"
+    assert skew_label(0.06)  == "heavy put skew"
+
+    assert term_label(0.94) == "contango"
+    assert term_label(0.96) == "slight contango"
+    assert term_label(1.00) == "noise"
+    assert term_label(1.03) == "slight backwardation"
+    assert term_label(1.06) == "backwardation"
+
+    assert pc_label(0.60) == "heavy call interest"
+    assert pc_label(0.90) == "call-leaning"
+    assert pc_label(1.10) == "put-leaning"
+    assert pc_label(1.40) == "heavy put interest"
+
+    assert iv_regime_label(0.20) == "Low IV"
+    assert iv_regime_label(0.50) == "Mid IV"
+    assert iv_regime_label(0.80) == "High IV"
+
+    # NaN → "n/a" for every labeler
+    for fn in (iv_hv_label, iv_regime_label, skew_label, term_label, pc_label):
+        assert fn(float("nan")) == "n/a"
+
+    # percentile_of: enough history → fraction strictly below the value
+    s = pd.Series(np.arange(100.0))                 # 0..99
+    assert abs(percentile_of(s, 90.0) - 0.90) < 1e-6
+    # thin history (< 63 obs) → None
+    assert percentile_of(pd.Series([1.0, 2.0, 3.0]), 2.0) is None
+    # NaN value → None
+    assert percentile_of(s, float("nan")) is None

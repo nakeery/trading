@@ -687,6 +687,42 @@ Tradier Config (modules/tradier.py + sizing.py + pc_oi.py)
 Recent Session Log
 ------------------
 
+S29 (2026-06-09) — Market-context surface: modules/sentiment.py + market_context.py (backlog #4)
+1. MOTIVATION: the framework computes a rich fear/positioning gauge set but only surfaces it buried
+   in entry.py's OPTIONS-MARKET CHECK (needs the full model pipeline + network). Per S22 ("info that
+   fails as a feature is still valuable as human context" — S20 econ / S21 regime were rejected as
+   features), built a standalone consolidated surface. Sets up backlog #5 (contrarian sizing
+   amplifier), which will import gather_context().
+2. NEW modules/sentiment.py (reusable core):
+   - Band-labelers centralized from entry.py inline logic + pc_oi.py: iv_hv_label, iv_regime_label,
+     skew_label, term_label, pc_label (single source of truth; entry/pc_oi can DRY-import later).
+   - percentile_of(series, value) — trailing-1y percentile (mirrors IV_pct); None if <63 real obs so
+     thin/wiped history degrades gracefully.
+   - gather_context(ticker, data_dir="data", with_vix=True) -> {ticker, as_of, regime, gauges[],
+     notes[], net}. Reuses compute_hv_features (HV/IV-rank/pct), add_vix (VIX complex), classify_regime
+     (regime). Reads the 4 harvested options cols directly (no entry.py import).
+3. NEW market_context.py (CLI): 1 prompt (ticker) + flags --graphical/--save-only/--no-vix/--data-dir/
+   --out. Console table ALWAYS (gauge | value | label | %ile, grouped OPTIONS/VOL/MARKET + net read +
+   notes); --graphical adds a matplotlib percentile-bar panel (RdYlGn_r: high pct = red = more
+   fear/vol), saves data/{ticker}_market_context.png, popup unless --save-only (Agg when --save-only,
+   mirrors econ_calendar_view.py).
+4. GRACEFUL DEGRADATION verified:
+   - AMD (462 IV rows): full options-gauge percentiles. Surfaced ATM IV at 98th %ile while IV/HV only
+     "fair" (HV also elevated, 75th) — a read raw values hide. NOTE: Put/Call OI shows "—" even on AMD:
+     historical OI was never backfilled (massive.py:321 omits it; only the daily harvest populates it)
+     so PCR has <63 rows — correct per-gauge degradation.
+   - QQQ (IV wiped pre-S23, ~2 rows): options gauges show value+label but "—" percentile + coverage
+     note; HV-20 (96th) + VIX (77th) percentiles still work (full history). QQQ currently put-skewed
+     (+0.064) + put-heavy OI (2.17) -> NET fear read + S21 contrarian-buy note.
+5. NET read carries the S21 bridge ("in this lens stress = contrarian BUY for STRONG ENTRY — size up,
+   don't fade"), the hook backlog #5 (amplifier) will consume.
+6. Bug found+fixed: graphical NET color keyed on `"fear" in net`, which matched "no elevated fear
+   tells" (the CALM message) -> calm shown red. Fixed to startswith("elevated").
+7. 13/13 smoke pass (no production script touched — two new files + one new module). Labels match
+   entry.py's OPTIONS-MARKET CHECK (same bands, now centralized). DRY follow-up (deferred): refactor
+   entry.py/pc_oi.py to import the labelers from modules/sentiment.py.
+8. CLAUDE.md updated (architecture + prompt-counts + as-needed + sentiment.py module row).
+
 S28 (2026-06-08) — PUT-entry feasibility PoC (--side put in backtest.py) -> NO-GO (directional)
 1. QUESTION: adjust the (long-only) framework to look for PUT option entries — directional
    (bearish alpha), hedging kept in mind. Approach: feasibility PoC BEFORE any build (framework
