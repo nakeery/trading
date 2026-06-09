@@ -188,7 +188,7 @@ def build_features(df, benchmarks):
     df = add_earnings_proximity(df, TICKER)
     df = add_catalyst_proximity(df, TICKER, MODULE_DIR, for_direction=True)
     if ECON_FEATURES:
-        df = add_macro_event_proximity(df, MODULE_DIR)
+        df = add_macro_event_proximity(df, DATA_DIR)
     df = add_trend_break_features(df)  # must precede normalize_features (drops MA cols)
     df = normalize_features(df)
 
@@ -243,7 +243,7 @@ def train_model(df_train, target_col, calibrate=False, use_iv_features=False):
 # ─────────────────────────────────────────
 # 5. WALK-FORWARD BACKTEST
 # ─────────────────────────────────────────
-def run_backtest(df_full, p2_mult=None, p2b_mult=None, p3_mult=None):
+def run_backtest(df_full, p2_mult=None, p2b_mult=None, p3_mult=None, side="call"):
     global WIN_THRESHOLD, WIN_THRESHOLD_63, EXPANSION_THRESHOLD
     # Sweep mode passes per-iteration multipliers; default to production constants.
     if p2_mult  is None: p2_mult  = P2_VOL_MULTIPLE
@@ -278,14 +278,18 @@ def run_backtest(df_full, p2_mult=None, p2b_mult=None, p3_mult=None):
         # Phase 2 — 15-day direction target (mode set via CLI flag — see banner)
         df_p2 = df_train.copy()
         fc2 = df_p2["Close"].shift(-P2_FORWARD_DAYS)
-        df_p2["_target"] = ((fc2 / df_p2["Close"] - 1) >= WIN_THRESHOLD).astype(int)
+        p2_ret = fc2 / df_p2["Close"] - 1
+        df_p2["_target"] = ((p2_ret <= -WIN_THRESHOLD) if side == "put"
+                            else (p2_ret >= WIN_THRESHOLD)).astype(int)
         df_p2 = df_p2.iloc[:-P2_FORWARD_DAYS]
         clf2, scaler2, fcols2 = train_model(df_p2, "_target", calibrate=P2_CALIBRATE)
 
         # Phase 2B — 63-day direction target
         df_p2b = df_train.copy()
         fc2b = df_p2b["Close"].shift(-P2B_FORWARD_DAYS)
-        df_p2b["_target"] = ((fc2b / df_p2b["Close"] - 1) >= WIN_THRESHOLD_63).astype(int)
+        p2b_ret = fc2b / df_p2b["Close"] - 1
+        df_p2b["_target"] = ((p2b_ret <= -WIN_THRESHOLD_63) if side == "put"
+                             else (p2b_ret >= WIN_THRESHOLD_63)).astype(int)
         df_p2b = df_p2b.iloc[:-P2B_FORWARD_DAYS]
         clf2b, scaler2b, fcols2b = train_model(df_p2b, "_target")
 
@@ -385,11 +389,12 @@ def run_backtest(df_full, p2_mult=None, p2b_mult=None, p3_mult=None):
 # ─────────────────────────────────────────
 # 6. SUMMARIZE RESULTS
 # ─────────────────────────────────────────
-def summarize(results, signal_col="signal", label="UNGATED"):
+def summarize(results, signal_col="signal", label="UNGATED", side="call"):
     order  = ["STRONG ENTRY", "CAUTION", "SHORT-TERM ONLY", "LEAPS ONLY", "STAY OUT", "ALL DAYS"]
     colors = {"STRONG ENTRY": "#3fb950", "CAUTION": "#ffa657",
               "SHORT-TERM ONLY": "#d2a8ff", "LEAPS ONLY": "#a5d6ff", "STAY OUT": "#f85149", "ALL DAYS": "#58a6ff"}
 
+    side_tag = f"[{label}]" if side == "call" else f"[PUT / {label}]"
     all_row = results.copy()
     all_row[signal_col] = "ALL DAYS"
     combined = pd.concat([results, all_row])
@@ -397,6 +402,8 @@ def summarize(results, signal_col="signal", label="UNGATED"):
     stats = []
     for sig in order:
         subset = combined[combined[signal_col] == sig]["fwd_return"].dropna()
+        if side == "put":
+            subset = -subset          # put gross P&L = -underlying return
         if len(subset) == 0:
             continue
         stats.append({
@@ -413,7 +420,7 @@ def summarize(results, signal_col="signal", label="UNGATED"):
     df_stats = pd.DataFrame(stats).set_index("Signal")
 
     print(f"\n{'─'*80}")
-    print(f"  WALK-FORWARD BACKTEST RESULTS — {TICKER}  [{label}]  "
+    print(f"  WALK-FORWARD BACKTEST RESULTS — {TICKER}  {side_tag}  "
           f"({results.index[0].date()} to {results.index[-1].date()})")
     print(f"{'─'*80}")
     print(f"  {'Signal':<16} {'Count':>6} {'Avg Ret':>9} {'Median':>8} "
@@ -436,6 +443,8 @@ def summarize(results, signal_col="signal", label="UNGATED"):
     stats_126 = []
     for sig in order:
         subset = combined_126[combined_126[signal_col] == sig]["fwd_return_126d"].dropna()
+        if side == "put":
+            subset = -subset
         if len(subset) == 0:
             continue
         stats_126.append({
@@ -451,7 +460,7 @@ def summarize(results, signal_col="signal", label="UNGATED"):
 
     n_nan = results["fwd_return_126d"].isna().sum()
     print(f"{'─'*80}")
-    print(f"  6-MONTH FORWARD RETURNS — {TICKER}  [{label}]  "
+    print(f"  6-MONTH FORWARD RETURNS — {TICKER}  {side_tag}  "
           f"(excl. last 126 trading days; {n_nan} rows NaN)")
     print(f"{'─'*80}")
     print(f"  {'Signal':<16} {'Count':>6} {'Avg Ret':>9} {'Median':>8} "
@@ -637,13 +646,15 @@ def plot_results(df_stats, order, colors, results):
 # compute_vol_thresholds imported from modules.features
 
 
-def collect_signal_stats(results):
+def collect_signal_stats(results, side="call"):
     """Returns a dict of per-signal stats for sweep comparison (15d + 6mo)."""
     stats = {}
     for sig in ["STRONG ENTRY", "CAUTION", "SHORT-TERM ONLY", "LEAPS ONLY", "STAY OUT"]:
         rows = results[results["signal"] == sig]
         s15  = rows["fwd_return"].dropna()
         s126 = rows["fwd_return_126d"].dropna()
+        if side == "put":
+            s15, s126 = -s15, -s126
         stats[sig] = {
             "count":           len(s15),
             "avg_return":      s15.mean()  if len(s15)  > 0 else float("nan"),
@@ -734,19 +745,29 @@ if __name__ == "__main__":
         "--econ-features", action=argparse.BooleanOptionalAction, default=False,
         dest="econ_features",
         help="Include macro-release proximity features (Days_to_FOMC, Days_to_CPI, ...) "
-             "from modules/econ_calendar.csv. Default OFF. "
+             "from data/econ_calendar.csv. Default OFF. "
              "Requires `python -m modules.econ_calendar --refresh` to have been run.",
+    )
+    parser.add_argument(
+        "--side", choices=["call", "put"], default="call",
+        help="Direction to scan. 'call' (default, production) = bullish upside target. "
+             "'put' = bearish PoC (S28): flips the Phase 2/2B target to a downside move "
+             "(<= -WIN_THRESHOLD) and reports gross put P&L (= -underlying return). Phase 3 "
+             "unchanged. Writes *_backtest_results_put.csv; skips call-oriented gate A/Bs + chart.",
     )
     args = parser.parse_args()
     P2_CALIBRATE  = args.calibrate
     IV_FEATURES   = args.iv_features
     ECON_FEATURES = args.econ_features
+    SIDE          = args.side
     P2_THRESHOLD  = 0.50 if P2_CALIBRATE else 0.55
 
     mode_label = "CALIBRATED  (Decision 1 — isotonic, 5-fold CV)" if P2_CALIBRATE else "RAW  (Decision 1 disabled — class_weight=balanced)"
     print("═" * 64)
     print(f"  Phase 2 mode: {mode_label}")
     print(f"  P2_THRESHOLD = {P2_THRESHOLD}  |  P2B_THRESHOLD = {P2B_THRESHOLD}  |  P3_THRESHOLD = {P3_THRESHOLD}")
+    if SIDE == "put":
+        print(f"  SIDE: PUT  (bearish PoC — downside target; Avg Ret = gross put P&L = -underlying return)")
     print("═" * 64)
     print()
 
@@ -796,8 +817,8 @@ if __name__ == "__main__":
                 df, verbose=True,
                 p2_vol_multiple=p2_mult, p2b_vol_multiple=p2b_mult, p3_vol_multiple=p3_mult,
             )
-            results = run_backtest(df_full, p2_mult=p2_mult, p2b_mult=p2b_mult, p3_mult=p3_mult)
-            stats   = collect_signal_stats(results)
+            results = run_backtest(df_full, p2_mult=p2_mult, p2b_mult=p2b_mult, p3_mult=p3_mult, side=SIDE)
+            stats   = collect_signal_stats(results, side=SIDE)
             sweep_results.append({"p2": p2_mult, "p2b": p2b_mult, "p3": p3_mult,
                                   "stats": stats, "results": results})
             print(f"  STRONG ENTRY: {stats['STRONG ENTRY']['count']} signals, "
@@ -821,28 +842,32 @@ if __name__ == "__main__":
                     "avg_return_126d": s["avg_return_126d"],
                     "win_rate_126d":   s["win_rate_126d"],
                 })
-        out = os.path.join(DATA_DIR, f"{TICKER.lower()}_multiplier_backtest_sweep.csv")
+        out = os.path.join(DATA_DIR, f"{TICKER.lower()}_multiplier_backtest_sweep{'_put' if SIDE == 'put' else ''}.csv")
         pd.DataFrame(sweep_rows).to_csv(out, index=False)
         print(f"\nSweep summary saved -> {out}")
     else:
-        results = run_backtest(df_full)
+        results = run_backtest(df_full, side=SIDE)
 
         # Ungated (baseline) — current production hierarchy
-        df_stats, order, colors = summarize(results, signal_col="signal", label="UNGATED")
+        df_stats, order, colors = summarize(results, signal_col="signal", label="UNGATED", side=SIDE)
 
-        # Gated (Option B candidate) — P4 downgrades STRONG ENTRY → CAUTION, CAUTION/SHORT-TERM → STAY OUT
-        summarize(results, signal_col="signal_gated", label="GATED (Phase 4)")
+        # The P4 / VIX gate A/Bs + chart are call-oriented (Phase 4 is an EXIT signal for calls;
+        # for puts a drawdown is entry-confirmation, so the gates would be inverted). PoC keeps
+        # puts to the ungated table — re-enable if the put side is productionized.
+        if SIDE == "call":
+            # Gated (Option B candidate) — P4 downgrades STRONG ENTRY → CAUTION, CAUTION/SHORT-TERM → STAY OUT
+            summarize(results, signal_col="signal_gated", label="GATED (Phase 4)")
 
-        # A/B comparison + accept/reject verdict on STRONG ENTRY
-        summarize_p4_gate_ab(results)
+            # A/B comparison + accept/reject verdict on STRONG ENTRY
+            summarize_p4_gate_ab(results)
 
-        # VIX regime gate — STRONG ENTRY → CAUTION, CAUTION → STAY OUT in stress regime
-        summarize(results, signal_col="signal_regime_gated", label="GATED (VIX regime)")
-        summarize_regime_gate_ab(results)
+            # VIX regime gate — STRONG ENTRY → CAUTION, CAUTION → STAY OUT in stress regime
+            summarize(results, signal_col="signal_regime_gated", label="GATED (VIX regime)")
+            summarize_regime_gate_ab(results)
 
-        plot_results(df_stats, order, colors, results)
+            plot_results(df_stats, order, colors, results)
 
-        out = os.path.join(DATA_DIR, f"{TICKER.lower()}_backtest_results.csv")
+        out = os.path.join(DATA_DIR, f"{TICKER.lower()}_backtest_results{'_put' if SIDE == 'put' else ''}.csv")
         results.to_csv(out)
         print(f"Full results saved -> {out}")
 

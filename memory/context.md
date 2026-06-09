@@ -335,7 +335,7 @@ Data source: FRED API (https://api.stlouisfed.org/fred). Free key required;
 read from $env:FRED_API_KEY. Endpoint release/dates with
 include_release_dates_with_no_data=true returns the forward calendar.
 
-Schema (modules/econ_calendar.csv):
+Schema (data/econ_calendar.csv — moved from modules/ in S27):
   series,date,release_id,release_name,tier
 
 Tracked series:
@@ -390,9 +390,9 @@ Daily-use display CLI (S22):
   python -m modules.econ_calendar --upcoming 14     # next 14 days
 
 Display helpers used by entry.py (S22, both in modules/econ_calendar.py):
-  next_event_per_series(as_of=None, data_dir="modules")
+  next_event_per_series(as_of=None, data_dir="data")
     → {series_name: (date | None, days_to | SENTINEL_DAYS)} for all 9 series
-  upcoming_events(within_days=7, as_of=None, data_dir="modules")
+  upcoming_events(within_days=7, as_of=None, data_dir="data")
     → DataFrame sorted by date with columns date / weekday / days_to / tier /
       series / release_name; empty df if no events or CSV missing
 
@@ -686,6 +686,81 @@ Tradier Config (modules/tradier.py + sizing.py + pc_oi.py)
 
 Recent Session Log
 ------------------
+
+S28 (2026-06-08) — PUT-entry feasibility PoC (--side put in backtest.py) -> NO-GO (directional)
+1. QUESTION: adjust the (long-only) framework to look for PUT option entries — directional
+   (bearish alpha), hedging kept in mind. Approach: feasibility PoC BEFORE any build (framework
+   iron law — validate cross-ticker, default-OFF, kill on failure).
+2. IMPLEMENTATION: added `--side {call,put}` (default call) to backtest.py — surgical, reuses the
+   whole walk-forward harness:
+   - run_backtest(side): Phase 2/2B target flips `(fwd_ret >= WIN_THRESHOLD)` ->
+     `(fwd_ret <= -WIN_THRESHOLD)` (same vol-adjusted magnitude, 15d/63d windows kept). Phase 3
+     (IV expansion) UNCHANGED — vol expansion helps puts (leverage effect); down+down+expansion is
+     a coherent put STRONG ENTRY. 5-tier signal logic is side-agnostic (reused as-is).
+   - summarize(side)/collect_signal_stats(side): negate subset to -fwd_return for puts so every
+     stat (avg/win/strong-win/avg win/loss/best) is put-correct with no other change. Put "win" =
+     underlying fell. Gross (pre-cost), same simplification as the call backtest.
+   - side=call byte-identical to production: separate *_backtest_results_put.csv; call-only P4/VIX
+     gate A/Bs + chart skipped for puts (Phase 4 is an EXIT signal for calls; for puts a drawdown
+     is entry-confirmation, so those gates would be inverted).
+3. CROSS-TICKER RESULT (put STRONG ENTRY, gross):
+                  15d Avg   6mo Avg   hierarchy
+     QQQ          +2.1%     +6.2%     holds (best both)      <- PASS (lone)
+     NVDA         -2.4%    -26.8%     inverted               <- FAIL
+     AMD          -1.5%    -35.1%     inverted (worst 6mo)   <- FAIL
+   VERDICT: NO-GO on directional puts. 2/3 fail, and the failures are the INDIVIDUAL STOCKS (where
+   the call framework's edge concentrates). QQQ alone would have been a false GO.
+4. MECHANISM: confirms the long/mean-reversion bias IS the edge. Flip bearish and the secular
+   uptrends of NVDA/AMD overwhelm any downside-timing signal — "strong bearish" setups are exactly
+   the dips that mean-revert hardest (cf. S21 stress=contrarian-buy, S23 NVDA post-drop-recovery
+   tail), so puts get destroyed at 6mo (AMD STRONG ENTRY AvgLoss -79.8%). NOTABLE INVERSION vs
+   calls: puts only worked on the INDEX (QQQ), opposite the call finding (edge in single names);
+   and even QQQ is gross / high-variance (6mo AvgLoss -14.6%) / fighting drift.
+5. DISPOSITION: --side put retained as an opt-in research flag (like --calibrate / --econ-features
+   / --regime-gate / --p4-gate — all REJECTED-but-kept). Directional puts NOT productionized. The
+   viable put use is HEDGING via the already-validated Phase 4 drawdown model (exit.py), which does
+   not depend on directional edge.
+6. BUG found+fixed mid-verify: the `[{label}]` -> `{side_tag}` replace_all also rewrote the
+   side_tag DEFINITION line (self-reference -> UnboundLocalError, CALL branch only; puts take the
+   else branch so all 3 put runs were unaffected/valid). Fixed; call regression restored (QQQ
+   UNGATED STRONG ENTRY 574/1.7%/63.9% = baseline within today-row drift); 13/13 smoke pass.
+7. PROCESS: 7th time cross-ticker validation was load-bearing (S11/S18/S20/S21/S24/S25/S28).
+   PoC-before-build cheaply killed a plausible idea (QQQ looked great in isolation).
+
+S27 (2026-06-08) — Graphical econ calendar (econ_calendar_view.py); econ_calendar.csv moved modules/ -> data/
+1. NEW TOOL: econ_calendar_view.py — matplotlib popup of a month grid of the 9 tracked macro
+   releases (Tier 1 FOMC/CPI/NFP/PCE red, Tier 2 PPI/GDP/Retail/JOLTS/Claims blue), today
+   outlined gold, multi-event days stacked, tier legend + coverage footnotes + freshness banner.
+   Current + next 2 months by default (--months N wraps to a 3-col grid). Always saves
+   data/econ_calendar.png; opens a popup unless --save-only. Flags: --months/--tier1-only/
+   --no-refresh/--save-only/--data-dir/--out. No input() prompts (argparse only). matplotlib
+   forced to Agg when --save-only (headless/verification). Verified: renders Jun-Aug 2026 off the
+   real cache; 13/13 smoke pass.
+2. CACHE MOVED modules/ -> data/ (user request). econ_calendar.csv now at data/econ_calendar.csv
+   (45KB preserved via Move-Item). All data_dir defaults in modules/econ_calendar.py flipped
+   "modules" -> "data" (refresh, next_event_per_series, upcoming_events, add_macro_event_proximity,
+   CLI --data-dir). Every consumer econ call flipped MODULE_DIR -> DATA_DIR (entry:142/390,
+   direction:377, backtest:191, exit:302, volatility:408, calibrate:210/229). CRITICAL:
+   add_catalyst_proximity calls LEFT on MODULE_DIR — catalysts.csv stays in modules/ (only the
+   econ CSV moved). Help text "from modules/econ_calendar.csv" -> "data/..." in 5 argparse blocks.
+   Tests use tmp_path (explicit data_dir) so unaffected; 13/13 pass.
+3. NEW MODULE HELPERS (modules/econ_calendar.py):
+   - refresh_if_stale(max_age_days=7, data_dir="data") — TTL refresh for on-demand tools. Returns
+     (status, msg). Refreshes only when cache older than threshold AND FRED key present; falls back
+     to existing cache on missing key / network error; NEVER raises, NEVER overwrites a good cache.
+     This answers "auto-refresh on every call?" — NO: every-call would force a key + network +
+     redundant fetch + partial-overwrite risk on a read-only display tool. TTL-with-fallback gives
+     freshness without those costs; default reads are offline/no-key.
+   - events_in_range(start, end) / coverage_end_per_series() — GUI accessors (events between two
+     dates; per-series forward horizon for coverage footnotes) so the GUI never touches _load_cache.
+4. HARDENED refresh() with a Tier-1 partial-overwrite guard: a transient FRED outage that drops a
+   Tier-1 series no longer overwrites a complete cache with the gap (keeps old + warns; with no
+   prior cache, writes partial + warns). Prereq for safe automation via refresh_if_stale.
+5. Caveat: auto-refresh does NOT fix the FOMC 2027 cliff (hardcoded FOMC_MEETING_DATES) or uneven
+   per-series FRED horizons — the GUI surfaces these via coverage_end_per_series footnotes + a
+   freshness banner (green fresh/refreshed, gray skipped, red stale/failed).
+6. Docs: CLAUDE.md (architecture + prompt-counts + as-needed + Econ Calendar Config) and context.md
+   (this entry + Econ Calendar Integration cache path / helper signatures) updated.
 
 S26 (2026-06-07) — New tool pc_oi.py (put/call OI + volume viewer); sizing.py IV legend reworded
 1. sizing.py IV cheap/expensive legend reworded for clarity (WORDING ONLY — thresholds

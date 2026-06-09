@@ -47,6 +47,9 @@ python backtest.py
 
 # Put/call OI + volume by expiry off the live Tradier chain (positioning vs flow; ad-hoc)
 python pc_oi.py
+
+# Graphical economic calendar — popup month grid of tracked macro release dates (S27)
+python econ_calendar_view.py
 ```
 
 Install dependencies:
@@ -75,6 +78,7 @@ Run smoke tests:
 | backtest.py | 2 (ticker, benchmarks) + trailing chart prompt |
 | sizing.py | interactive (ticker, budget, strikes) |
 | pc_oi.py | 2 (ticker, optional expiry filter — blank = all) |
+| econ_calendar_view.py | 0 (argparse flags only — no prompts) |
 
 ### Running scripts via Claude Code on Windows
 
@@ -105,10 +109,11 @@ cmd /c "(echo TICKER && echo.) | python -X utf8 script.py" 2>&1
 | `backfill_iv.py` | Standalone 2-year historical IV backfill via BS-inversion (one-off per ticker) | Updates `data/{ticker}_indicators.csv` in place; checkpointed |
 | `probability_deciles.py` | Bucket STRONG ENTRY signals by Phase 2 probability; reports 15d + 6mo edge per bucket. Pure analysis on existing `data/{ticker}_backtest_results.csv` — no model retrain. (S23) | Console only |
 | `probability_diagnostics.py` | Investigate WHY a probability bucket under/over-performs. Runs 4-hypothesis tests (time clustering, walk-forward window, multi-phase filter, preceding 20d return). (S23) | Console only |
+| `econ_calendar_view.py` | Graphical economic-release calendar (matplotlib popup): month grid of tracked macro releases color-coded by tier, today highlighted; TTL refresh-if-stale + coverage footnotes + PNG export (S27) | `data/econ_calendar.png` + popup window |
 | `modules/features.py` | Shared feature engineering (HV, VIX, earnings, normalize, vol thresholds, IV imputation, P4 drawdown threshold + target, trend-break features) + constants | Imported by direction/volatility/exit/entry/backtest |
 | `modules/benchmarks.py` | Sector benchmarks, macro features, catalyst proximity | Imported by direction/entry/backtest/volatility |
 | `modules/massive.py` | Massive.com API client + `get_chain_summary()` + `get_historical_iv_snapshot()`; exports `IV_COLS`, `IV_FEATURE_COLS`, `IV_META_COLS` | Imported by `indicators.py` (harvest), `backfill_iv.py` (history), and 5 ML scripts (exclude from features) |
-| `modules/econ_calendar.py` | FRED API client + `add_macro_event_proximity()` — adds `Days_to_FOMC/CPI/NFP/PCE/PPI/GDP/Retail/JOLTS/Claims/macro` proximity features. Standalone CLI: `python -m modules.econ_calendar --refresh` (weekly) | Imported by entry/direction/volatility/exit/backtest/calibrate_multipliers; gated by `--econ-features` flag (default OFF) |
+| `modules/econ_calendar.py` | FRED client + `add_macro_event_proximity()` proximity features; display/GUI helpers `next_event_per_series`/`upcoming_events`/`events_in_range`/`coverage_end_per_series`/`refresh_if_stale` (S22/S27). Cache: `data/econ_calendar.csv`. CLI: `--refresh` (weekly) / `--upcoming` | Imported by entry/direction/volatility/exit/backtest/calibrate_multipliers (gated by `--econ-features`, default OFF) + `econ_calendar_view.py` |
 | `modules/bs_invert.py` | Black-Scholes implied-vol solver (Newton-Raphson + bisection fallback) — used by `backfill_iv.py` | Imported by `modules/massive.py` |
 | `modules/tradier.py` | Tradier API client + `get_atm_iv()` | Imported by `sizing.py` and `pc_oi.py` |
 | `tests/test_smoke.py` | 8 pytest regression guards (signal hierarchy, STRONG ENTRY baseline, vol thresholds, signal logic, S16 threshold-sensitivity, econ_calendar loads, Days_to_* bounds, days-to-specific-event) | Run manually; requires `data/QQQ_*.csv` |
@@ -233,13 +238,23 @@ CLI flags (default OFF; available on direction/entry/volatility/exit/backtest):
   is automatic if upstream changes alter behavior.
 - `--econ-features` — adds 10 macro-release proximity columns (`Days_to_FOMC`, `Days_to_CPI`,
   `Days_to_NFP`, `Days_to_PCE`, `Days_to_PPI`, `Days_to_GDP`, `Days_to_Retail`, `Days_to_JOLTS`,
-  `Days_to_Claims`, `Days_to_macro`) from `modules/econ_calendar.csv`. Requires FRED API key
+  `Days_to_Claims`, `Days_to_macro`) from `data/econ_calendar.csv`. Requires FRED API key
   (`$env:FRED_API_KEY`) and a prior `python -m modules.econ_calendar --refresh`. Default OFF.
   **REJECTED by S20 backtest validation**: QQQ STRONG ENTRY 1.8% → 1.7% (marginal); NVDA STRONG
   ENTRY 15d 2.9% → -0.1% (-3.0pp), 6mo 33.4% → 13.6% (-19.8pp), hierarchy inverted. Same
   failure mode as S11 isotonic calibration — ~33% feature inflation compresses individual-stock
   high-confidence tail. Retained as opt-in flag for future experiments (Tier 1-only subset,
   surprise-data features, etc.).
+- `--side {call,put}` (backtest.py only; default `call` = production) — bearish-entry PoC (S28).
+  `put` flips the Phase 2/2B direction target to a downside move (`<= -WIN_THRESHOLD`); Phase 3
+  unchanged; `summarize` reports gross put P&L (`= -fwd_return`) and a downside win. Writes a
+  separate `*_backtest_results_put.csv` and skips the call-oriented P4/VIX gate A/Bs + chart, so
+  the call baseline is untouched. **NO-GO (S28 cross-ticker)**: put STRONG ENTRY passes only on
+  QQQ (15d +2.1% / 6mo +6.2%, best + hierarchy holds) but FAILS both individual stocks — NVDA
+  (15d -2.4% / 6mo -26.8%) and AMD (15d -1.5% / 6mo -35.1%, worst signal), hierarchy inverted.
+  Confirms the framework's edge IS the long/mean-reversion bias: bearish signals on secular-
+  uptrend names catch dips that mean-revert, so the puts get crushed at 6mo. Retained opt-in for
+  research; directional puts NOT productionized. Hedging puts → use Phase 4 (`exit.py`) instead.
 
 ## Sizing Config (`sizing.py`)
 
@@ -288,12 +303,22 @@ CLI flags (default OFF; available on direction/entry/volatility/exit/backtest):
   Free signup at https://fredaccount.stlouisfed.org/apikeys. Add to `$PROFILE` for persistence.
 - `FRED_URL = https://api.stlouisfed.org/fred` — endpoint `release/dates` with
   `include_release_dates_with_no_data=true` returns forward release dates.
-- Cache: `modules/econ_calendar.csv` (~50–500 rows: 5y history + ~12mo forward × 9 series).
+- Cache: `data/econ_calendar.csv` (~50–500 rows: 5y history + ~12mo forward × 9 series). Moved from `modules/` in S27.
   Schema: `series,date,release_id,release_name,tier`.
 - Tier 1 series (always tracked): FOMC, CPI, NFP, PCE.
 - Tier 2 series: PPI, GDP, Retail, JOLTS, Claims.
 - Refresh cadence: weekly. Run `python -m modules.econ_calendar --refresh`.
-- `add_macro_event_proximity(df, data_dir="modules", for_direction=False)` adds 10 columns:
+- **Cache moved to `data/` (S27)** — all `data_dir` defaults are now `"data"` (was `"modules"`);
+  physical CSV at `data/econ_calendar.csv`. `add_catalyst_proximity` still uses `modules/` for
+  `catalysts.csv` — only the econ calls flipped `MODULE_DIR`→`DATA_DIR`.
+- `refresh_if_stale(max_age_days=7, data_dir="data")` (S27) — TTL refresh for on-demand tools:
+  refreshes only when the cache is older than the threshold, falls back to the existing cache on
+  missing key / network error, never raises. Used by `econ_calendar_view.py`. (Chosen over
+  refresh-on-every-call, which would force a key + network + redundant fetches on a read-only tool.)
+- `refresh()` Tier-1 partial-overwrite guard (S27) — won't replace a complete cache with one
+  missing a Tier-1 series (transient FRED-outage protection).
+- `events_in_range(start, end)` / `coverage_end_per_series()` (S27) — accessors for the calendar GUI.
+- `add_macro_event_proximity(df, data_dir="data", for_direction=False)` adds 10 columns:
   per-series `Days_to_{name}` (sentinel-90 fallback) + aggregate `Days_to_macro` (min across all).
   Values capped at `SENTINEL_DAYS=90`. Integer. Gated by `--econ-features` CLI flag in every
   consumer; default OFF until validated.

@@ -251,7 +251,7 @@ if __name__ == "__main__":
         "--econ-features", action=argparse.BooleanOptionalAction, default=False,
         dest="econ_features",
         help="Include macro-release proximity features (Days_to_FOMC, Days_to_CPI, ...) "
-             "from modules/econ_calendar.csv. Default OFF. "
+             "from data/econ_calendar.csv. Default OFF. "
              "Requires `python -m modules.econ_calendar --refresh` to have been run.",
     )
     args = parser.parse_args()
@@ -299,7 +299,7 @@ if __name__ == "__main__":
     df = add_earnings_proximity(df, TICKER)
     df = add_catalyst_proximity(df, TICKER, MODULE_DIR, for_direction=True)
     if ECON_FEATURES:
-        df = add_macro_event_proximity(df, MODULE_DIR)
+        df = add_macro_event_proximity(df, DATA_DIR)
     df = normalize_features(df)
 
     # Save feature dataset (pre-target-truncation) — single CSV shared across windows.

@@ -207,7 +207,7 @@ def build_p2_features(ticker):
     df = add_earnings_block(df, ticker)
     df = add_catalyst_proximity(df, ticker, MODULE_DIR, for_direction=True)
     if ECON_FEATURES:
-        df = add_macro_event_proximity(df, MODULE_DIR)
+        df = add_macro_event_proximity(df, DATA_DIR)
     df = normalize_features(df)
     return df
 
@@ -226,7 +226,7 @@ def build_p3_features(ticker):
     df = add_earnings_block(df, ticker)
     df = add_catalyst_proximity(df, ticker, MODULE_DIR, for_direction=False)
     if ECON_FEATURES:
-        df = add_macro_event_proximity(df, MODULE_DIR)
+        df = add_macro_event_proximity(df, DATA_DIR)
     df = normalize_features(df)
     return df
 

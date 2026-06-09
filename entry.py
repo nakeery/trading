@@ -139,7 +139,7 @@ def build_features(df, benchmarks):
     df = add_earnings_proximity(df, TICKER)
     df = add_catalyst_proximity(df, TICKER, MODULE_DIR, for_direction=True)
     if ECON_FEATURES:
-        df = add_macro_event_proximity(df, MODULE_DIR)
+        df = add_macro_event_proximity(df, DATA_DIR)
     df = add_trend_break_features(df)  # must precede normalize_features (drops MA cols)
     df = normalize_features(df)
 
@@ -387,7 +387,7 @@ def print_combined_signal(df_full, direction_prob, dir_prob_63, expansion_prob,
     # Macro release proximity — display-only (no model wiring; --econ-features
     # remains opt-in / rejected at S20).  Reads CSV via modules/econ_calendar
     # helper, falls back to 'N/A' if CSV missing or no future event for a series.
-    econ_events = next_event_per_series(data_dir=MODULE_DIR)
+    econ_events = next_event_per_series(data_dir=DATA_DIR)
     for series_name, _, _ in ALL_SERIES:
         next_date, days = econ_events.get(series_name, (None, None))
         label = f"Days to {series_name}:"
@@ -512,7 +512,7 @@ if __name__ == "__main__":
         "--econ-features", action=argparse.BooleanOptionalAction, default=False,
         dest="econ_features",
         help="Include macro-release proximity features (Days_to_FOMC, Days_to_CPI, ...) "
-             "from modules/econ_calendar.csv. Default OFF. "
+             "from data/econ_calendar.csv. Default OFF. "
              "Requires `python -m modules.econ_calendar --refresh` to have been run.",
     )
     parser.add_argument(

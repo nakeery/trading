@@ -22,7 +22,7 @@ import requests
 
 FRED_API_KEY   = os.environ.get("FRED_API_KEY", "")
 FRED_URL       = "https://api.stlouisfed.org/fred"
-CACHE_FILENAME = "econ_calendar.csv"
+CACHE_FILENAME = "econ_calendar.csv"   # cache lives in data/ (S27; moved from modules/)
 SENTINEL_DAYS  = 90    # matches modules/benchmarks.py:153 catalyst sentinel
 
 # Tier 1 — highest market-impact releases. Tracked on every ticker by default.
@@ -98,7 +98,7 @@ def list_releases():
     print(f"\n  Total: {len(releases)} releases")
 
 
-def refresh(data_dir="modules"):
+def refresh(data_dir="data"):
     """
     Fetch forward release dates for every series in ALL_SERIES from FRED and
     write atomic CSV (tmp → rename on success).
@@ -169,8 +169,19 @@ def refresh(data_dir="modules"):
         print("\n  ✗ no rows fetched — leaving any existing CSV in place")
         return
 
-    df = pd.DataFrame(rows).sort_values(["series", "date"]).reset_index(drop=True)
     out_path = os.path.join(data_dir, CACHE_FILENAME)
+    # Partial-overwrite guard (S27): don't let a transient FRED outage that dropped a
+    # Tier-1 series silently overwrite a complete cache with a gap. Require all Tier-1
+    # series before replacing an existing cache; with no prior cache, write but warn.
+    got_series = {r["series"] for r in rows}
+    missing_t1 = [name for name, _, _ in TIER1_SERIES if name not in got_series]
+    if missing_t1 and os.path.exists(out_path):
+        print(f"\n  Missing Tier-1 {missing_t1} — keeping existing cache (no overwrite)")
+        return
+    if missing_t1:
+        print(f"\n  Missing Tier-1 {missing_t1} — writing partial cache (no prior to preserve)")
+
+    df = pd.DataFrame(rows).sort_values(["series", "date"]).reset_index(drop=True)
     tmp_path = out_path + ".tmp"
     df.to_csv(tmp_path, index=False)
     os.replace(tmp_path, out_path)
@@ -187,7 +198,7 @@ def _load_cache(data_dir):
     return df
 
 
-def next_event_per_series(as_of=None, data_dir="modules"):
+def next_event_per_series(as_of=None, data_dir="data"):
     """
     Return {series_name: (date | None, days_to | SENTINEL_DAYS)} for every
     series in ALL_SERIES.  `as_of` defaults to today (normalized).
@@ -218,7 +229,7 @@ def next_event_per_series(as_of=None, data_dir="modules"):
     return out
 
 
-def upcoming_events(within_days=7, as_of=None, data_dir="modules"):
+def upcoming_events(within_days=7, as_of=None, data_dir="data"):
     """
     Return DataFrame of all upcoming events in the next `within_days` days,
     sorted ascending by date.  Columns: date, weekday, days_to, tier, series,
@@ -246,6 +257,77 @@ def upcoming_events(within_days=7, as_of=None, data_dir="modules"):
     return window[["date", "weekday", "days_to", "tier", "series", "release_name"]]
 
 
+def events_in_range(start, end, data_dir="data"):
+    """
+    Return all calendar events with start <= date <= end (inclusive), sorted by date.
+    Columns: date, series, tier, release_name.  Empty DataFrame if no cache or none in
+    range.  Public accessor for the graphical calendar (econ_calendar_view.py) so callers
+    don't reach into _load_cache.
+    """
+    cols = ["date", "series", "tier", "release_name"]
+    cal = _load_cache(data_dir)
+    if cal is None:
+        return pd.DataFrame(columns=cols)
+    start = pd.Timestamp(start).normalize()
+    end   = pd.Timestamp(end).normalize()
+    window = cal[(cal["date"] >= start) & (cal["date"] <= end)].copy()
+    return window.sort_values("date").reset_index(drop=True)[cols]
+
+
+def coverage_end_per_series(data_dir="data"):
+    """
+    Return {series_name: last_known_date | None} — the forward horizon of the cache per
+    series.  Lets the calendar footnote series whose data runs out (FOMC's hardcoded list
+    ends ~2027; some FRED series only publish a few months ahead).
+    """
+    cal = _load_cache(data_dir)
+    if cal is None:
+        return {name: None for name, _, _ in ALL_SERIES}
+    out = {}
+    for name, _, _ in ALL_SERIES:
+        s = cal[cal["series"] == name]["date"]
+        out[name] = s.max().normalize() if not s.empty else None
+    return out
+
+
+def refresh_if_stale(max_age_days=7, data_dir="data"):
+    """
+    TTL refresh with graceful fallback — for on-demand tools that want fresh data without
+    making refresh mandatory.  Returns (status, message) for display:
+
+      ("fresh", ...)         cache younger than max_age_days — no network touched
+      ("refreshed", ...)     cache was stale; FRED refresh succeeded
+      ("stale_no_key", ...)  stale but FRED_API_KEY unset — kept existing cache
+      ("refresh_failed", ..) stale, refresh raised — kept existing cache
+      ("missing_no_key", ..) no cache and no key — caller should warn / show empty
+      ("missing_failed", ..) no cache and refresh failed
+
+    NEVER raises and NEVER overwrites a good cache with a worse one (refresh() has the
+    Tier-1 partial-overwrite guard).  Reading the cache needs no key; only the refresh does.
+    """
+    path   = os.path.join(data_dir, CACHE_FILENAME)
+    exists = os.path.exists(path)
+    age    = None
+    if exists:
+        age = (datetime.datetime.now()
+               - datetime.datetime.fromtimestamp(os.path.getmtime(path))).days
+        if age <= max_age_days:
+            return ("fresh", f"cache {age}d old (<= {max_age_days}d threshold)")
+
+    if not FRED_API_KEY:
+        if exists:
+            return ("stale_no_key", f"cache {age}d old; FRED_API_KEY unset — showing cached data")
+        return ("missing_no_key", "no cache and FRED_API_KEY unset — run --refresh with a FRED key")
+
+    try:
+        refresh(data_dir=data_dir)
+    except Exception as e:
+        if exists:
+            return ("refresh_failed", f"refresh failed ({e}); showing {age}d-old cache")
+        return ("missing_failed", f"refresh failed ({e}); no cache available")
+    return ("refreshed", "cache refreshed just now")
+
+
 def _check_staleness(cal, today):
     """Print one-line warning for any series with < 30 forward days."""
     cutoff = today + pd.Timedelta(days=30)
@@ -258,7 +340,7 @@ def _check_staleness(cal, today):
             print(f"  ⚠ econ_calendar.csv: only {days_left}d forward for {series_name}")
 
 
-def add_macro_event_proximity(df, data_dir="modules", for_direction=False):
+def add_macro_event_proximity(df, data_dir="data", for_direction=False):
     """
     Add Days_to_FOMC, Days_to_CPI, ..., Days_to_macro columns to df.
 
@@ -320,7 +402,7 @@ if __name__ == "__main__":
     parser.add_argument("--upcoming", nargs="?", const=7, type=int, metavar="N",
                         help="Print upcoming economic events in the next N days "
                              "(default 7).  Sorted chronologically by date.")
-    parser.add_argument("--data-dir", default="modules",
+    parser.add_argument("--data-dir", default="data",
                         help="Cache directory (default: modules).")
     args = parser.parse_args()
 
