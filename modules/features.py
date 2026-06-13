@@ -87,6 +87,40 @@ def add_trend_break_features(df):
     return df
 
 
+def add_bear_duration_features(df):
+    """Add bear-market DURATION features (S31, gated by --bear-duration; default OFF).
+
+    Hypothesis: the framework already sees drawdown DEPTH (price_vs_52w_high,
+    price_vs_ma200) but not how LONG a decline has persisted. Duration is what
+    separates grind-bears (2002: months below the 200-day MA) from V-dips (2020:
+    days) — the distinction behind the S25 NVDA "post-drop recovery" misfire.
+
+    Both columns are strictly backward-looking. Uses MA_200 and the 252-day rolling
+    high, so MUST run BEFORE normalize_features (which drops MA_* columns). No-ops
+    with a warning if MA_200 is missing.
+
+      days_below_ma200     — consecutive sessions Close < MA_200 (0 while above)
+      days_since_52w_high  — sessions since Close last set its 252-day rolling max
+    """
+    if "MA_200" not in df.columns:
+        print("  ⚠ MA_200 missing — skipping bear-duration features")
+        return df
+
+    # Consecutive-below streak — same groupby-cumsum idiom as days_above_ma20/50.
+    below = (df["Close"] < df["MA_200"]).astype(int)
+    groups = (below != below.shift()).cumsum()
+    df["days_below_ma200"] = below.groupby(groups).cumsum()
+
+    # Sessions since the last 252-day high (0 on a new high). cumcount within the
+    # constant run between highs gives the elapsed-session count.
+    roll_max = df["Close"].rolling(252, min_periods=1).max()
+    is_high  = (df["Close"] >= roll_max)
+    df["days_since_52w_high"] = df.groupby(is_high.cumsum()).cumcount()
+
+    print("  ✓ days_below_ma200, days_since_52w_high")
+    return df
+
+
 def compute_p4_drawdown_threshold(df, forward_days, vol_multiple=None, fallback_hv=0.20):
     """Vol-adjusted Phase 4 drawdown threshold: vol_multiple × median_HV × sqrt(N/252).
 
@@ -145,6 +179,16 @@ def compute_vix_features(df, vix_df, vix9d_df, vix3m_df):
         df = df.join(series, how="left")
         df[col] = df[col].ffill()
 
+    # Missingness indicators (S31): VIX9D history starts ~2011, VIX3M ~2007. Before that the
+    # ratios below are sentinel-filled 1.0, which otherwise acts as a pre-history era marker
+    # (corr -0.5..-0.6 with calendar time — the same family as the Days_to_earnings leak).
+    # The indicator lets the model separate a real 1.0 from a filled 1.0 rather than reading
+    # the fill as a calendar tag. Mirrors the iv_available/term_available pattern. Safe in
+    # walk-forward: the flag is constant within nearly every train/test window (only the one
+    # ~2007 transition window mixes eras), so it cannot inject a within-window time gradient.
+    df["vix9d_available"] = df["VIX9D"].notna().astype(int)
+    df["vix3m_available"] = df["VIX3M"].notna().astype(int)
+
     df["VIX9D_VIX_ratio"] = (df["VIX9D"] / df["VIX"]).fillna(1.0)
     df["VIX_VIX3M_ratio"] = (df["VIX"] / df["VIX3M"]).fillna(1.0)
     df.drop(columns=["VIX9D", "VIX3M"], inplace=True)
@@ -152,7 +196,11 @@ def compute_vix_features(df, vix_df, vix9d_df, vix3m_df):
 
 
 def add_earnings_proximity(df, ticker):
-    """Add Days_to_earnings column. Defaults to 45 (neutral) on failure."""
+    """Add Days_to_earnings column, capped at 90. Defaults to 45 (neutral) on failure.
+
+    The cap matters for long-history stock tickers: yfinance only returns ~20
+    recent earnings dates, so uncapped values for old rows reach thousands of
+    days — a calendar-era marker, not an earnings-proximity signal."""
     yf_ticker = yf.Ticker(ticker)
     ed = []
     try:
@@ -174,7 +222,7 @@ def add_earnings_proximity(df, ticker):
 
     def _days_to_next(date):
         future = [e for e in ed if e >= date]
-        return (future[0] - date).days if future else 90
+        return min((future[0] - date).days, 90) if future else 90
 
     df["Days_to_earnings"] = [_days_to_next(d) for d in df.index]
     print("  ✓ Days_to_earnings")

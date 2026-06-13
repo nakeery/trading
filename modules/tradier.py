@@ -34,6 +34,35 @@ def get_current_price(ticker):
     return float(data["quotes"]["quote"]["last"])
 
 
+def get_daily_quote(ticker):
+    """Full session quote dict for ticker (open/high/low/close/volume/trade_date...).
+
+    The 'close' field is null while the session is open and populates at the
+    bell — callers can use it as a completed-session latch. Returns None on
+    any failure."""
+    try:
+        data = _get("/markets/quotes", {"symbols": ticker})
+        quote = (data.get("quotes") or {}).get("quote")
+        return quote if isinstance(quote, dict) else None
+    except Exception:
+        return None
+
+
+def get_daily_history(ticker, start, end):
+    """Official daily OHLCV bars from Tradier, start/end inclusive (YYYY-MM-DD).
+
+    NOTE: prices are split/dividend-UNADJUSTED (yfinance closes are adjusted).
+    Returns a list of {date, open, high, low, close, volume} dicts; [] on failure."""
+    try:
+        data = _get("/markets/history", {
+            "symbol": ticker, "interval": "daily", "start": start, "end": end,
+        })
+        days = (data.get("history") or {}).get("day", [])
+        return [days] if isinstance(days, dict) else (days or [])
+    except Exception:
+        return []
+
+
 def get_expirations(ticker):
     data = _get("/markets/options/expirations", {"symbol": ticker})
     return data["expirations"]["date"]

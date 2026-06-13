@@ -106,7 +106,7 @@ cmd /c "(echo TICKER && echo.) | python -X utf8 script.py" 2>&1
 | `direction.py` | Direction ML models (Phase 2 + 2B) | `data/{ticker}_ml_features.csv`, `data/{ticker}_ml_results.png` |
 | `volatility.py` | IV expansion ML model (Phase 3) | `data/{ticker}_phase3_features.csv`, `data/{ticker}_phase3_results.png` |
 | `exit.py` | Exit signal ML model (Phase 4) — drawdown forecast across 5d/15d/63d windows | `data/{ticker}_exit_features.csv`, `data/{ticker}_exit_results.png` |
-| `entry.py` | Combines all models → SIGNAL + POSITION SIZING (reads IV from CSV — no live API) | Console only |
+| `entry.py` | Combines all models → SIGNAL + POSITION SIZING (reads IV from CSV — no live API) | Console + `data/{ticker}_signal_ledger.csv` (S30 forward ledger — one row per as-of date; same-day re-run overwrites that date's row) |
 | `backtest.py` | Walk-forward backtest + 6-month forward return table (53 windows QQQ; 91 AMD; 53 NVDA; 31y SPY; 17 CRSP) | `data/{ticker}_backtest.png`, `data/{ticker}_backtest_results.csv` |
 | `sizing.py` | Live options chain sizing via Tradier API | Console only |
 | `pc_oi.py` | Ad-hoc put/call OI + volume by future expiry off the live Tradier chain (positioning vs flow); optional date filter, LEAPS-tenor flag (S26) | Console only |
@@ -121,7 +121,7 @@ cmd /c "(echo TICKER && echo.) | python -X utf8 script.py" 2>&1
 | `modules/econ_calendar.py` | FRED client + `add_macro_event_proximity()` proximity features; display/GUI helpers `next_event_per_series`/`upcoming_events`/`events_in_range`/`coverage_end_per_series`/`refresh_if_stale` (S22/S27). Cache: `data/econ_calendar.csv`. CLI: `--refresh` (weekly) / `--upcoming` | Imported by entry/direction/volatility/exit/backtest/calibrate_multipliers (gated by `--econ-features`, default OFF) + `econ_calendar_view.py` |
 | `modules/sentiment.py` | Band-labelers (IV/HV, skew, term, P/C, IV-regime) + `gather_context()` — per-ticker fear/positioning gauges with trailing percentiles, reusing `compute_hv_features`/`add_vix`/`classify_regime` (S29) | Imported by `market_context.py` (and the future #5 sizing amplifier) |
 | `modules/bs_invert.py` | Black-Scholes implied-vol solver (Newton-Raphson + bisection fallback) — used by `backfill_iv.py` | Imported by `modules/massive.py` |
-| `modules/tradier.py` | Tradier API client + `get_atm_iv()` | Imported by `sizing.py` and `pc_oi.py` |
+| `modules/tradier.py` | Tradier API client + `get_atm_iv()`; S30 adds `get_daily_quote()` (post-close OHLCV latch) + `get_daily_history()` (unadjusted daily bars) | Imported by `sizing.py`, `pc_oi.py`, and `indicators.py` (same-day close stamp) |
 | `tests/test_smoke.py` | 14 pytest regression guards (signal hierarchy, STRONG ENTRY baseline, vol thresholds, signal logic, S16 threshold-sensitivity, econ_calendar loads, Days_to_* bounds, days-to-specific-event, regime thresholds/gate/NaN, next_event/upcoming shape, sentiment labelers) | Run manually; requires `data/QQQ_*.csv` |
 
 All CSVs and PNGs are written to the `data/` subdirectory (must exist — create manually if missing).
@@ -134,13 +134,17 @@ All CSVs and PNGs are written to the `data/` subdirectory (must exist — create
 |---|---|---|
 | **STRONG ENTRY** | 15d WIN + 63d WIN + Phase 3 EXPANSION | FULL |
 | **CAUTION** | 15d WIN + 63d WIN + Phase 3 CONTRACTION | REDUCED |
-| **SHORT-TERM ONLY** | 15d WIN + 63d NO SIGNAL (any Phase 3) | REDUCED |
+| **SHORT-TERM ONLY** | 15d WIN + 63d NO SIGNAL (any Phase 3) | Informational-only (S30) — do not trade |
 | **LEAPS ONLY** | 15d NO SIGNAL + 63d WIN | LEAPS (6–9mo expiries) |
 | **STAY OUT** | 15d NO SIGNAL + 63d NO SIGNAL | N/A |
 
 - Phase 2 (15d) drives ENTER vs STAY OUT for short-DTE setups
 - Phase 2B (63d) confirms or rejects medium-term thesis (LEAPS-aligned)
 - Phase 3 (IV expansion) modulates sizing — not a go/no-go gate
+- **SHORT-TERM ONLY demoted to informational (S30)**: backtest avg ≈ STAY OUT on QQQ (0.7% vs
+  0.7% 15d) and a documented hard NO on AMD (−2.5%); a +0.7% 15d underlying edge is likely
+  negative on an actual option after spread + theta. Treat as STAY OUT in practice, pending
+  forward-ledger evidence.
 - **IV/HV gate (`entry.py` only)**: ATM IV (~30 DTE) read from `atm_iv_30d` column in indicators
   CSV (harvested by `indicators.py` from Massive) and compared to HV-20. If `signal == STRONG ENTRY`
   and `IV/HV >= 1.40`, downgrade to `CAUTION`. The ratio + label (cheap/fair/rich/very rich) prints
@@ -161,7 +165,7 @@ All CSVs and PNGs are written to the `data/` subdirectory (must exist — create
 - **Logistic regression only** — intentional for interpretability; black-box models avoided
 - **Time-based train/test split** (not random) — avoids lookahead bias in time series
 - **Price-level features normalized** to ratios/pct_change — ticker-agnostic and scale-invariant
-- **Earnings proximity capped** at 45–90 days, defaults to neutral when earnings data unavailable
+- **Earnings proximity capped at 90 days** (`min(d,90)` in `add_earnings_proximity`), defaults to neutral (45/90) when earnings data unavailable. **The cap is load-bearing (S31)**: yfinance returns only ~20–25 recent earnings dates, so without it every row older than that horizon gets days-until-the-earliest-known-date — a near-perfect calendar-time ramp (corr −0.99) that manufactured spurious edge on secular-uptrend stocks. The cap pins those rows to the neutral 90 sentinel. (This doc previously *claimed* a cap that did not exist in code until S31.)
 - **IV proxied from HV-20** — approximates IV rank/percentile without a paid options feed
 - **Vol-adjusted thresholds** via `compute_vol_thresholds()` — auto-calibrates per ticker:
   - `WIN_THRESHOLD = P2_VOL_MULTIPLE × median_HV × sqrt(15/252)` (Phase 2)
@@ -192,18 +196,41 @@ All CSVs and PNGs are written to the `data/` subdirectory (must exist — create
   rows. Every `train()` / `train_model()` must include `*IV_COLS` in its exclude set (or
   `*IV_META_COLS` if `--iv-features` is on), or `dropna()` removes the entire training set.
   Applied in entry/direction/volatility/backtest/calibrate_multipliers.
-- **Today-row addition in `indicators.py`** (S16) — when today is a weekday and yfinance hasn't
-  returned today's bar yet (yfinance `end` is exclusive), `harvest_iv_snapshot` appends a today-row
-  with NaN OHLCV so the IV stamp lands on today's date instead of overwriting yesterday's IV.
-  Side effect: each `indicators.py` run grows the df by 1 row, shifting the 80/20 split forward
-  by 1 sample. Daily probabilities can drift run-to-run (observed +16pp shift in QQQ Phase 3
-  expansion prob during S16 verification). Expected behavior, not a bug — but worth knowing if
-  comparing run-to-run probabilities.
+- **Today-row addition in `indicators.py`** (S16, extended S30) — yfinance is fetched with
+  `END_DATE = today` and `end` is exclusive, so today's bar is structurally never requested.
+  Post-S30: `augment_recent_prices_from_tradier()` (runs before `add_indicators`, only when
+  END_DATE is the default today) stamps today's OHLCV from the Tradier quote **after 4 PM ET**
+  (quote `close` is null until the bell — completed-session latch; `trade_date` must be today)
+  and backfills trailing-week sessions yfinance skipped from Tradier daily history. Pre-close
+  runs are unchanged: `harvest_iv_snapshot` appends the NaN-OHLCV today-row so the IV stamp
+  lands on today's date. Tradier prices are unadjusted vs yfinance's adjusted series — stamped
+  rows are replaced by the next run's fresh yfinance fetch (only IV columns merge-persist).
+  Side effect unchanged: each run can grow the df by 1 row, shifting the 80/20 split forward
+  by 1 sample; daily probabilities can drift run-to-run (observed +16pp shift in QQQ Phase 3
+  expansion prob during S16 verification). Expected behavior, not a bug.
 - **Shared feature engineering** (`modules/features.py`, S14/S16) — `compute_hv_features`,
   `compute_vix_features`, `add_earnings_proximity`, `normalize_features`, `compute_vol_thresholds`,
   `impute_iv_features`, plus all phase constants. Used by direction/volatility/entry/backtest.
   `direction.py` and `volatility.py` still wrap `compute_vix_features` and the benchmarks loop
   with thin local helpers (`add_vix`, `add_benchmarks`) — refactor incomplete.
+- **Price data source policy (S30)** — one source per job; do NOT consolidate to a single vendor:
+  - **yfinance** = full dividend-adjusted daily history (AMD back to 1980) + index/yield symbols
+    (^SOX, ^TNX, ^IRX) + earnings dates. **Tradier** = post-close same-day OHLCV stamp + trailing
+    gap backfill (`augment_recent_prices_from_tradier`) + live quotes/chains (sizing/pc_oi).
+    **Massive** = options-chain harvest + IV backfill only (2-yr plan cap — never a price-history
+    candidate).
+  - Consolidating the harvest to Tradier was evaluated and REJECTED (probed live 2026-06-12):
+    (1) Tradier daily history is capped/short for AMD — 1994-08-30 onward / exactly 8,000 bars vs
+    the CSV's 1980 start (silently loses ~30% of the history behind the 91-window backtest);
+    (2) Tradier closes are split-adjusted but NOT dividend-adjusted (QQQ Sep-2025 runs ≈ +$2.20
+    above yfinance adjusted) — switching shifts the price basis of every target/threshold and
+    invalidates comparability with all recorded baselines; (3) Tradier has no ^SOX / ^TNX / ^IRX
+    and no earnings dates, so yfinance stays load-bearing regardless — "one dependency" is not
+    reachable.
+  - Disaster recovery: if yfinance breaks permanently, Tradier CAN serve QQQ/NVDA-depth history
+    plus the VIX complex (VIX/VIX9D/VIX3M) and SPX with daily history — migration would require
+    threshold re-validation (dividend-unadjusted basis); AMD pre-1994, SOX, and TNX/IRX have no
+    Tradier fallback.
 
 ## Model Details
 
@@ -241,7 +268,13 @@ CLI flags (default OFF; available on direction/entry/volatility/exit/backtest):
   QQQ STRONG ENTRY 1.8% → 1.5% (−0.24pp 15d), 9.4% → 7.6% (−1.8pp 6mo); NVDA gated count 294 < 300
   sample-size floor. 15d gate filters 6mo winners that had 15d wobbles. Retained as opt-in flag for
   future experimentation. backtest.py always reports gated/ungated A/B (no flag) so re-validation
-  is automatic if upstream changes alter behavior.
+  is automatic if upstream changes alter behavior. **NOTE (S30)**: `backtest.py`'s `P4_FORWARD_DAYS`
+  was 5 (not 15) from S18 until 2026-06-12 — all P4-gate A/B numbers before then, including the
+  S18 rejection above, were generated with a **5d** gate while entry.py/docs said 15d. Constant
+  now aligned to 15d; first true 15d-gate A/B (QQQ, 2026-06-12): REJECT, and worse than the 5d
+  gate — STRONG ENTRY 1.77% → 1.52% (−0.25pp 15d; 5d gate was −0.05pp), 6mo 9.6% → 7.7%, same
+  winners-filtered-with-losers signature (gated win rate UP 64.0→66.9%, avg DOWN). The S18
+  rejection conclusion now stands on directly-measured 15d evidence.
 - `--econ-features` — adds 10 macro-release proximity columns (`Days_to_FOMC`, `Days_to_CPI`,
   `Days_to_NFP`, `Days_to_PCE`, `Days_to_PPI`, `Days_to_GDP`, `Days_to_Retail`, `Days_to_JOLTS`,
   `Days_to_Claims`, `Days_to_macro`) from `data/econ_calendar.csv`. Requires FRED API key
@@ -362,6 +395,29 @@ See `memory/context.md` "Geopolitical Risk Limitation" for proposed mitigations 
   AMD (462 rows, RESTORED S24) and NVDA (452 rows, S23) are intact.
 - AAPL indicators CSV is missing entirely — needs `indicators.py` run then `backfill_iv.py`.
 
+## Recently Fixed (S31)
+
+- **`Days_to_earnings` CALENDAR-TIME LEAK** (latent since the feature was added; surfaced by the
+  S30 cap). `add_earnings_proximity` computes days-to-next-earnings, but yfinance only returns
+  ~20–25 recent earnings dates — so for any row older than that horizon, "next earnings" resolves
+  to the *earliest known date*, making the value a near-perfect calendar-time ramp (NVDA 79% of
+  rows, corr −0.999; AMD 87%, corr −1.000; values up to 14,743 days). In walk-forward this ramp
+  varies *within every window*, letting the model fit the secular uptrend as "edge." It inflated
+  NVDA STRONG ENTRY 6mo to +33.3% (clean: +15.2%, anti-predictive) and AMD to +33.9% (clean:
+  +18.1%, below STAY OUT). QQQ was immune (ETF → constant 45), which is why the S30 QQQ-only
+  verification missed it. **Fix:** `min(d,90)` cap (`modules/features.py`). Confirmed sole cause by
+  controlled revert (revert → documented numbers return exactly; restore → collapse).
+- **`add_catalyst_proximity` same latent bug** — capped `min(d,90)` defensively. Dormant today
+  (catalysts.csv is CRSP-only; CRSP direction-neutralized) so no production impact, but it would
+  have leaked identically if catalyst dates were ever added for a long-history stock.
+- **VIX term-structure era marker** — `VIX_VIX3M_ratio`/`VIX9D_VIX_ratio` `fillna(1.0)` for
+  pre-2007/2011 history was a weaker era marker (corr −0.5..−0.6). Added `vix3m_available` /
+  `vix9d_available` missingness indicators (`compute_vix_features`, mirrors `iv_available`) so the
+  model separates a real 1.0 from a filled 1.0. Negligible backtest impact (the flag is constant
+  within nearly every walk-forward window) — hygiene, not the smoking gun.
+- **Feature-set leak audit** (corr-vs-calendar-order scan): only the one major leak (earnings);
+  everything else clean or excluded. Method retained as the standard new-feature check.
+
 ## Recently Fixed (S24)
 
 - **Phase 2/2B IV-indicator leak** (latent since S13). `impute_iv_features()` adds binary
@@ -399,7 +455,7 @@ See `memory/context.md` "Geopolitical Risk Limitation" for proposed mitigations 
 - **NEVER name a script `signal.py`** — it shadows Python's built-in `signal` module and causes `AttributeError: partially initialized module 'subprocess'`. The original `entry_signal.py` was renamed to `entry.py` to resolve this.
 - **Re-running `indicators.py` is safe by default**, but **never enter a START_DATE more recent than the existing CSV's earliest date** unless you intend to lose history. The S23 fix preserves prior rows outside the range and prints "Preserving N prior rows outside current range" — if you see that line, your existing history was saved by the guard. Accepting the START_DATE default (`1792-05-17`) always fetches full history and is unconditionally safe.
 - **`backtest.py` is self-contained** relative to `direction.py` / `volatility.py` (only imports from `modules/features.py`). If feature engineering changes outside `modules/features.py` (e.g. add_benchmarks loop bodies), `backtest.py` must be manually updated to match.
-- **Today-row in `indicators.py`** (S16) — re-running `indicators.py` mid-day appends a today-row with NaN OHLCV so the IV harvest stamps onto today's date. This grows the df by 1, shifting train/test splits in downstream scripts. Today's HV/indicators come from yesterday's bar (the latest non-NaN row), today's IV is from a fresh Massive snapshot.
+- **Today-row in `indicators.py`** (S16/S30) — re-running `indicators.py` mid-day appends a today-row with NaN OHLCV so the IV harvest stamps onto today's date; **after 4 PM ET** the today-row instead gets real OHLCV from the Tradier quote, so HV/indicators/signal use today's actual close. Either way the df grows by 1, shifting train/test splits in downstream scripts. Today's IV is from a fresh Massive snapshot.
 - **`data/` directory must exist** before running any script — create it manually if missing.
 - **`modules/` directory** holds `features.py`, `benchmarks.py`, `massive.py`, `bs_invert.py`, `tradier.py`, and `catalysts.csv`. Catalyst CSV path is `data_dir`-relative; the `csv_path = os.path.join(data_dir, "catalysts.csv")` fix in Session 7 is required for catalyst loading to work.
 - **`trade/` subdirectory** is the Python virtual environment — do not delete. Use `.\trade\Scripts\python.exe -X utf8` explicitly; Claude Code's shell doesn't inherit venv activation.
@@ -416,18 +472,28 @@ See `memory/context.md` "Geopolitical Risk Limitation" for proposed mitigations 
 
 ## Ticker Suitability Notes
 
-- **QQQ**: framework reference baseline; 53 windows (2001–2026); clean hierarchy. Post-S15 STRONG ENTRY 1.9% / 63.3% win at 15d, +10.6% / 77.3% at 6mo.
-- **AMD**: well-suited; 91 windows (2000–2026); post-S24 HV baseline STRONG ENTRY 383 / 3.4% / 58.7% win / 6mo 33.9% / 74.8% (best both horizons); STRONG AvgWin/AvgLoss 11.6% / -8.3% supports FULL sizing. **Only trade STRONG ENTRY** — CAUTION ≈ STAY OUT (Phase 3 HV proxy doesn't discriminate at AMD's vol scale), SHORT-TERM ONLY is a hard NO (-2.5% / 41.3% — 63d confirmation is load-bearing); LEAPS ONLY 6mo (17.1%) > STAY OUT (16.3%). IV backfill RESTORED S24 (462 rows); `--iv-features` clean A/B shows no edge (6mo 33.9→31.9%) — HV proxy is production.
-- **NVDA**: well-suited in RAW mode; 53 windows. Post-S24 with P2B=0.55: HV proxy 355 / 2.8% / 58.9% / 6mo 33.3% (production). ⚠️ **S24 correction**: S23's "`--iv-features` 318 / 35.6% / +2.3pp — first to pass NVDA" was a **leak artifact** (Phase 2/2B IV-indicator leak). Post-fix `--iv-features` is 355 / 2.9% / 6mo 33.9% (= HV, +0.6pp noise) — does NOT pass. Pre-S17 baseline was 391 / 4.4% / 65.5%; drop reflects P2B threshold tightening (0.41 → 0.55), not regression. ⚠️ CALIBRATED mode COLLAPSES STRONG ENTRY to -0.4% / 52% (S11 regression). **Edge does NOT live in high-confidence tail (S23 finding)** — probability-decile analysis shows edge concentrates in MID-confidence range (P2 prob 0.60-0.70: +5-7% 15d / +45-47% 6mo); the high-confidence tail (≥0.75) INVERTS to -0.7% / +11%. Mechanism: model over-applies a "post-drop recovery" pattern learned from 2009 GFC. The original S11 calibration explanation (compressed extremes) is no longer supported.
-- **SOFI**: marginal — short history (2021 IPO); rate features wired but need more rate-regime variation.
+> **⚠️ S31 LEAK CORRECTION (2026-06-13).** The `Days_to_earnings` calendar-time leak (yfinance
+> returns only ~20–25 recent earnings dates, so pre-~2020 rows became a near-perfect time ramp —
+> NVDA 79% of rows / corr −0.999, AMD 87% / corr −1.000) inflated NVDA/AMD 6mo edge ~entirely.
+> Fixed (cap `min(d,90)`). **Clean leak-free baselines below supersede all prior stock numbers.**
+> The "individual stocks > index" thesis was the leak; on clean features QQQ is the only ticker
+> with intact hierarchy + real edge. NVDA/AMD STRONG-ENTRY figures elsewhere in this file predate
+> the fix and are leak-inflated.
+
+- **QQQ**: framework reference baseline AND now the only trustworthy edge; 53 windows (2001–2026); clean hierarchy, leak-free. Clean (S31) STRONG ENTRY 609 / 1.6% / 64.2% at 15d (+0.7pp over all-days), 8.9% / 75.2% at 6mo (+1.8pp). Modest but real and hierarchy-intact.
+- **AMD**: **DOWNGRADED to marginal (S31)**; 91 windows. Clean STRONG ENTRY 562 / 2.0% / 55.7% at 15d (only +0.2pp over all-days; CAUTION edges it), 6mo 18.1% — *below* STAY OUT (19.4%). The documented 383 / 3.4% / 33.9% was the calendar-time leak. Not the signal to trade on clean features.
+- **NVDA**: **DOWNGRADED to UNSUITABLE (S31)**; 53 windows. Clean STRONG ENTRY 417 / −0.8% at 15d (the WORST signal — anti-predictive), 6mo 15.2% — well below STAY OUT (25.7%). The documented 355 / 2.8% / 33.3% was ENTIRELY the leak. ⚠️ All NVDA lore built on the leaked features — the S23/S25 mid-confidence sweet spot, the high-confidence-tail inversion, every "passed the NVDA cross-check" result — is now SUSPECT and needs re-validation on clean features.
+- **SOFI**: marginal — short history (2021 IPO); rate features wired but need more rate-regime variation. Has earnings → re-baseline post-S31 leak fix before trusting any prior number.
 - **AAPL**: backfill partial (180 IV rows since 2025-07-24); backtest not yet run.
 - **LYFT**: backfill complete (439 IV rows); backtest not yet run.
 - **CRSP**: unsuitable for direction (binary FDA/trial events dominate); Phase 3 viable for vol plays — consider straddles/strangles around PDUFA dates rather than directional calls. Catalyst feature is automatically neutralized in direction models via `EVENT_DRIVEN_TICKERS = {"CRSP"}`.
 - **SPY**: structurally UNSUITABLE — 0.1pp edge over base, hierarchy broken. Framework's price-action lens vs SPY's macro-driven moves don't match.
 
 Cross-ticker findings:
-- **STRONG ENTRY win rate ~65%** reproduces across QQQ/NVDA — use as suitability test. New ticker that can't hit ~60%+ STRONG win rate is probably unsuitable.
-- **CAUTION avg loss 3–4pt worse than STRONG ENTRY** consistently across AMD/NVDA/SOFI — validates REDUCED sizing for IV-contraction signals.
-- **Phase 2B (63d) edge stronger than Phase 2 (15d)** on AMD (+8.5pt) and CRSP (+22.5pt — longer horizon filters binary event noise).
-- **Edge-in-tail theory REVISED (S23)**: pre-S23, the framework held "individual stocks concentrate edge in the high-confidence tail." Directly measured on NVDA via `probability_deciles.py`: edge actually concentrates in the MID-confidence range (P2 prob 0.60-0.70). The high-confidence tail (≥0.75) inverts to negative edge. QQQ shows the conventional pattern (mild edge-in-tail). The S11 calibration regression mechanism is therefore no longer attributable to "compressed extremes" — open question. AMD/SOFI/LYFT need re-backfill before cross-ticker validation can extend.
-- **Cross-ticker validation required for any framework change**: QQQ alone is INSUFFICIENT. Always co-validate on QQQ + NVDA minimum before adopting as production default.
+- **⚠️ Most findings below predate the S31 leak fix and used leak-inflated NVDA/AMD baselines — re-validate before trusting.**
+- ~~**STRONG ENTRY win rate ~65% reproduces across QQQ/NVDA**~~ — leak artifact (S31). Clean NVDA STRONG ENTRY is anti-predictive; the ~65% was the calendar-time ramp.
+- **CAUTION avg loss 3–4pt worse than STRONG ENTRY** — measured on leaked features; re-check.
+- **Phase 2B (63d) edge stronger than Phase 2 (15d)** on AMD/CRSP — measured on leaked features; re-check.
+- ~~**Edge-in-tail / mid-confidence sweet spot (S23/S25)**~~ — the NVDA decile findings were computed on the leaked feature set (a calendar-time index dominated Phase 2); SUSPECT until re-run on clean features.
+- **Cross-ticker validation required for any framework change**: QQQ alone is INSUFFICIENT — BUT note (S31) that NVDA's historical role as the co-validation ticker rested on a leaked baseline. Until NVDA/AMD are re-validated clean, treat QQQ as the only trustworthy reference and seek a genuinely independent second ticker (different sector, non-secular-trend).
+- **NEW S31 lesson**: any feature that ramps with calendar time (an unbounded "days since/until X" where X is sparse, a cumulative sum, a raw level) will manufacture edge on a secular-uptrend name in walk-forward. Audit new features with a corr-vs-calendar-order scan; cap or difference them. See `confidence_band_ab.py` sibling tooling and the S31 context.md log.

@@ -106,8 +106,11 @@ def train(df, forward_days):
     y = df_model["target"]
 
     split_idx = int(len(X) * (1 - TEST_SIZE))
-    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
-    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+    # Embargo: the last forward_days training rows have drawdown labels computed
+    # from test-period prices — drop them so no label's window crosses the split.
+    embargo   = max(0, split_idx - forward_days)
+    X_train, X_test = X.iloc[:embargo], X.iloc[split_idx:]
+    y_train, y_test = y.iloc[:embargo], y.iloc[split_idx:]
 
     print(f"  Train: {len(X_train)} rows ({X_train.index[0].date()} → {X_train.index[-1].date()})")
     print(f"  Test:  {len(X_test)} rows ({X_test.index[0].date()} → {X_test.index[-1].date()})")

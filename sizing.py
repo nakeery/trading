@@ -4,7 +4,7 @@ Options Trading — Position Sizing (Phase 4)
 Pulls the live options chain from Tradier, and recommends position sizes
 based on your budget.
 
-Run after signal.py fires an ENTER signal to determine:
+Run after entry.py fires an actionable signal to determine:
   - Which strikes and expiries are available within your range
   - How many contracts you can buy at your budget
   - Daily theta decay cost at that position size
@@ -39,7 +39,7 @@ from modules.tradier import (
 DATA_DIR             = "data"
 # INDICATORS_CSV       = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
 MIN_DTE              = 180   # ~6 months
-MAX_DTE              = 365 * 2   # ~12 months
+MAX_DTE              = 365   # ~12 months (6–12mo expiry window per CLAUDE.md)
 DEFAULT_STRIKE_RANGE = 10    # strikes above and below ATM
 HV_WINDOW            = 20
 

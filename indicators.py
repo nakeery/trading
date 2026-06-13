@@ -60,6 +60,74 @@ def fetch_data(ticker, start, end):
 
 
 # ─────────────────────────────────────────
+# 1B. TRADIER PRICE AUGMENT (same-day close + gap backfill)
+# ─────────────────────────────────────────
+def augment_recent_prices_from_tradier(df, ticker):
+    """Fill today's bar after the close + backfill recent sessions yfinance skipped.
+
+    yfinance is fetched with an exclusive end date (END_DATE = today), so today's
+    bar is never requested — without this, every signal runs on yesterday's close
+    at best. The Tradier quote's 'close' field is null while the session is open
+    and populates at the bell, so it acts as a completed-session latch; trade_date
+    must also be today (guards a pre-open run picking up the prior session).
+
+    Tradier prices are split/dividend-unadjusted vs yfinance's adjusted series.
+    Acceptable: stamped rows are replaced by the next run's fresh yfinance fetch
+    (only IV columns are merge-preserved in harvest_iv_snapshot).
+
+    Must run BEFORE add_indicators so the stamped bars flow into RSI/MA/etc.
+    Graceful: any failure leaves df unchanged."""
+    try:
+        from modules.tradier import get_daily_quote, get_daily_history
+
+        now_et = pd.Timestamp.now(tz="America/New_York")
+        today  = pd.Timestamp(now_et.date())
+        ohlcv  = ["Open", "High", "Low", "Close", "Volume"]
+
+        if now_et.weekday() < 5 and now_et.hour >= 16 and today not in df.index:
+            q = get_daily_quote(ticker) or {}
+            tdate = q.get("trade_date")
+            tdate_is_today = (
+                tdate is not None
+                and pd.Timestamp(tdate, unit="ms", tz="UTC")
+                      .tz_convert("America/New_York").date() == now_et.date()
+            )
+            if tdate_is_today and all(q.get(k) is not None for k in ["open", "high", "low", "close"]):
+                df.loc[today, ohlcv] = [
+                    float(q["open"]), float(q["high"]), float(q["low"]),
+                    float(q["close"]), float(q.get("volume") or 0),
+                ]
+                df = df.sort_index()
+                print(f"  Today's close stamped from Tradier: ${float(q['close']):.2f} (post-4PM ET)")
+
+        # Trailing-week holes (yfinance can lag a bar — e.g. 2026-06-10 was
+        # missing the morning after). Days absent at Tradier too are holidays.
+        recent  = pd.bdate_range(end=today - pd.Timedelta(days=1), periods=5)
+        missing = [d for d in recent if d not in df.index]
+        if missing:
+            bars = {pd.Timestamp(b["date"]): b
+                    for b in get_daily_history(ticker,
+                                               missing[0].strftime("%Y-%m-%d"),
+                                               missing[-1].strftime("%Y-%m-%d"))}
+            filled = []
+            for d in missing:
+                b = bars.get(d)
+                if b is None or any(b.get(k) is None for k in ["open", "high", "low", "close"]):
+                    continue
+                df.loc[d, ohlcv] = [
+                    float(b["open"]), float(b["high"]), float(b["low"]),
+                    float(b["close"]), float(b.get("volume") or 0),
+                ]
+                filled.append(str(d.date()))
+            if filled:
+                df = df.sort_index()
+                print(f"  Backfilled {len(filled)} missing session(s) from Tradier: {', '.join(filled)}")
+    except Exception as e:
+        print(f"  Tradier price augment skipped ({e})")
+    return df
+
+
+# ─────────────────────────────────────────
 # 2. CALCULATE INDICATORS
 # ─────────────────────────────────────────
 def add_indicators(df):
@@ -134,7 +202,13 @@ def print_signal_summary(df):
     print(f"{'═'*50}")
     print(f"  SIGNAL SUMMARY — {TICKER} as of {date}")
     print(f"{'═'*50}")
-    print(f"  Price:        ${latest['Close']:.2f}")
+    prev_close = df["Close"].iloc[-2] if len(df) > 1 else latest["Open"]
+    chg     = latest["Close"] - prev_close
+    chg_pct = (chg / prev_close * 100) if prev_close else 0.0
+    arrow   = "▲" if chg >= 0 else "▼"
+    print(f"  Close:        ${latest['Close']:.2f}   {arrow} {chg:+.2f} ({chg_pct:+.2f}%)")
+    print(f"  OHLC:         O ${latest['Open']:.2f}  H ${latest['High']:.2f}  "
+          f"L ${latest['Low']:.2f}  C ${latest['Close']:.2f}")
     print()
     for period in RSI_PERIODS:
         val = latest[f'RSI_{period}']
@@ -236,6 +310,30 @@ def plot_dashboard(df):
     ax1.legend(fontsize=7, loc="upper left", facecolor="#161b22", labelcolor="white")
     ax1.tick_params(colors="#8b949e", labelbottom=False)
     ax1.spines[:].set_color("#30363d")
+
+    # ── Latest-bar OHLC readout (upper-right) ──
+    last      = plot_df.iloc[-1]
+    last_date = plot_df.index[-1].strftime("%Y-%m-%d")
+    o, h, l, c = last["Open"], last["High"], last["Low"], last["Close"]
+    prev_c = plot_df["Close"].iloc[-2] if len(plot_df) > 1 else o
+    chg    = c - prev_c
+    chg_pct = (chg / prev_c * 100) if prev_c else 0.0
+    up      = chg >= 0
+    chg_col = "#3fb950" if up else "#f85149"
+    arrow   = "▲" if up else "▼"
+    ohlc_txt = (
+        f"{last_date}\n"
+        f"O {o:.2f}   H {h:.2f}\n"
+        f"L {l:.2f}   C {c:.2f}\n"
+        f"{arrow} {chg:+.2f} ({chg_pct:+.2f}%)"
+    )
+    ax1.text(
+        0.985, 0.97, ohlc_txt, transform=ax1.transAxes,
+        ha="right", va="top", fontsize=8.5, family="monospace",
+        color="#e6edf3", linespacing=1.5,
+        bbox=dict(boxstyle="round,pad=0.5", facecolor="#161b22",
+                  edgecolor=chg_col, linewidth=1.2),
+    )
 
     # ── Panel 2: RSI triple ──
     ax2 = fig.add_subplot(gs[1], sharex=ax1)
@@ -392,6 +490,11 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"  ERROR: Failed to fetch data for {TICKER} -> {e}")
         sys.exit(1)
+
+    # Same-day close + gap backfill only applies to current-dated fetches —
+    # a historical END_DATE must not get a today-row appended.
+    if END_DATE == datetime.date.today().strftime("%Y-%m-%d"):
+        df = augment_recent_prices_from_tradier(df, TICKER)
 
     df = add_indicators(df)
     print_signal_summary(df)

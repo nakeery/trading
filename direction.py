@@ -142,7 +142,10 @@ def print_calibration_diagnostic(y_true, y_prob, label):
         print(f"  {lo:.1f}-{hi:.1f}      {n:>5}  {pred:>7.1%}  {actual:>7.1%}  {gap:>+8.1%}{marker}")
 
 
-def train_model(df, calibrate=False, decision_threshold=DECISION_THRESHOLD):
+def train_model(df, calibrate=False, decision_threshold=DECISION_THRESHOLD, forward_days=0):
+    # forward_days: embargo width at the train/test boundary. Targets are built with
+    # shift(-N) on the full frame, so the last N training rows have labels computed
+    # from test-period prices — drop them so no label's forward window crosses the split.
     exclude = {"Open", "High", "Low", "Close", "Volume", "target", *IV_COLS}
     feature_cols = [c for c in df.columns if c not in exclude]
 
@@ -151,8 +154,9 @@ def train_model(df, calibrate=False, decision_threshold=DECISION_THRESHOLD):
     y = df_model["target"]
 
     split_idx = int(len(X) * (1 - TEST_SIZE))
-    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
-    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+    embargo   = max(0, split_idx - forward_days)
+    X_train, X_test = X.iloc[:embargo], X.iloc[split_idx:]
+    y_train, y_test = y.iloc[:embargo], y.iloc[split_idx:]
 
     print(f"Train: {len(X_train)} rows  |  Test: {len(X_test)} rows")
     print(f"Test period: {X_test.index[0].date()} → {X_test.index[-1].date()}\n")
@@ -381,6 +385,7 @@ if __name__ == "__main__":
     df_15 = add_target(df.copy())
     clf, X_test, y_test, y_pred, y_prob, feature_cols = train_model(
         df_15, calibrate=P2_CALIBRATE, decision_threshold=P2_THRESHOLD,
+        forward_days=FORWARD_DAYS,
     )
     plot_results(clf, X_test, y_test, y_pred, feature_cols)
 
@@ -393,7 +398,7 @@ if __name__ == "__main__":
     print(f"\nPhase 2B — 63-day direction model")
     print(f"  Target: {FORWARD_DAYS_63}d forward ≥ {WIN_THRESHOLD_63*100:.0f}% gain = win")
     print(f"  → Win rate: {win_rate_63:.1%}  ({df_63['target'].sum()} wins / {len(df_63)} samples)")
-    clf63, X_test63, y_test63, y_pred63, y_prob63, fcols63 = train_model(df_63)
+    clf63, X_test63, y_test63, y_pred63, y_prob63, fcols63 = train_model(df_63, forward_days=FORWARD_DAYS_63)
 
     df_15.to_csv(os.path.join(DATA_DIR, f"{TICKER.lower()}_ml_features.csv"))
     print(f"\nEnriched feature dataset saved -> {os.path.join(DATA_DIR, f'{TICKER.lower()}_ml_features.csv')}")

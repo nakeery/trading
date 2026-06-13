@@ -144,11 +144,13 @@ def print_calibration_diagnostic(y_true, y_prob, label):
 # impute_iv_features imported from modules.features
 
 
-def train_model(df):
+def train_model(df, forward_days=0):
     # --iv-features: include IV_FEATURE_COLS + binary missing indicators as features;
     #   impute_iv_features() called before this ensures no NaN in IV cols so
     #   dropna() uses the full training history.
     # default (HV proxy): exclude all IV_COLS so full price history is used.
+    # forward_days: embargo width at the train/test boundary — the last N training
+    # rows have targets built from test-period HV (shift(-N) on the full frame).
     exclude = {"Open", "High", "Low", "Close", "Volume", "target",
                *(IV_META_COLS if IV_FEATURES else IV_COLS)}
     feature_cols = [c for c in df.columns if c not in exclude]
@@ -158,8 +160,9 @@ def train_model(df):
     y = df_model["target"]
 
     split_idx = int(len(X) * (1 - TEST_SIZE))
-    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
-    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+    embargo   = max(0, split_idx - forward_days)
+    X_train, X_test = X.iloc[:embargo], X.iloc[split_idx:]
+    y_train, y_test = y.iloc[:embargo], y.iloc[split_idx:]
 
     print(f"Train: {len(X_train)} rows  |  Test: {len(X_test)} rows")
     print(f"Test period: {X_test.index[0].date()} → {X_test.index[-1].date()}\n")
@@ -415,7 +418,7 @@ if __name__ == "__main__":
 
     df = add_target(df)
 
-    clf, scaler, X_test, y_test, y_pred, y_prob, feature_cols = train_model(df)
+    clf, scaler, X_test, y_test, y_pred, y_prob, feature_cols = train_model(df, forward_days=FORWARD_DAYS)
     print_signal_summary(df_full, clf, scaler, feature_cols)
     plot_results(df_full, clf, feature_cols)
 

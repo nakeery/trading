@@ -149,8 +149,12 @@ def add_catalyst_proximity(df, ticker, data_dir="modules", for_direction=False):
     dates = sorted(cats["date"].dt.normalize().unique())
 
     def _days_to_next(date):
+        # Cap at 90 (S31): mirrors add_earnings_proximity. Without it, a ticker whose
+        # history predates its first catalyst date gets a calendar-time ramp for old rows
+        # (the same leak fixed in earnings). Dormant today — catalysts.csv is CRSP-only and
+        # CRSP is direction-neutralized — but capped defensively against future additions.
         future = [d for d in dates if d >= date]
-        return int((future[0] - date).days) if future else 90
+        return min(int((future[0] - date).days), 90) if future else 90
 
     df["Days_to_catalyst"] = [_days_to_next(d) for d in df.index]
     print(f"  ✓ Days_to_catalyst ({len(dates)} event(s) for {ticker})")

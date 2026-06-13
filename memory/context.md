@@ -80,6 +80,25 @@ that does not translate into STRONG-ENTRY return edge. Stays opt-in, default OFF
 Current Backtest Baselines
 --------------------------
 
+*** S31 LEAK CORRECTION (2026-06-13) — all per-ticker blocks below are SUPERSEDED for the
+    individual stocks. The Days_to_earnings calendar-time leak (see S31 log) inflated NVDA/AMD
+    6mo edge ~entirely. Corrected leak-free baselines (capped earnings + capped catalyst + VIX
+    missingness indicators): ***
+
+  CLEAN BASELINES (2026-06-13, post-leak-fix):
+    Ticker  STRONG 15d / vs all-days   STRONG 6mo / vs all-days     Hierarchy
+    QQQ     1.6% / +0.7pp (best)       8.9% / +1.8pp (best)         INTACT ✓
+    NVDA   -0.8% / -3.4pp (WORST)     15.2% / -8.4pp (< STAY OUT)   INVERTED ✗
+    AMD     2.0% / +0.2pp             18.1% / +2.1pp (< STAY OUT)   BROKEN  ✗
+  - QQQ is now the ONLY ticker with intact hierarchy + real (modest) edge. The "individual
+    stocks > index" thesis was the leak. NVDA STRONG ENTRY is anti-predictive on clean features;
+    AMD STRONG ENTRY is marginal and below STAY OUT.
+  - VIX missingness-indicator fix moved the stocks negligibly (NVDA 15.4->15.2%, AMD 18.8->18.1%
+    6mo) — earnings ramp was essentially the whole leak. QQQ barely moved (never had the earnings
+    leak; ETF constant 45): 9.6->8.9% from the 2 new VIX columns perturbing the fit.
+  - SUSPECT (built on leaked features, need re-validation): S23/S25 NVDA mid-confidence sweet
+    spot + tail inversion; every prior "passed the NVDA cross-check" result; the AMD decile shape.
+
 QQQ (53 windows, 2001-2026, post-S18) — framework reference baseline
   P2_VOL_MULTIPLE=0.41, P2B_VOL_MULTIPLE=0.55, P3_VOL_MULTIPLE=0.20
   WIN_THRESHOLD 1.82%, WIN_THRESHOLD_63 5.00%, EXPANSION_THRESHOLD 3.64%
@@ -140,12 +159,13 @@ vol plays — straddles/strangles around PDUFA dates rather than directional cal
 Ticker Suitability
 ------------------
 
-  QQQ   framework reference baseline; clean hierarchy; 53 windows
-  AMD   well-suited; STRONG ENTRY only (CAUTION ≈ STAY OUT, SHORT-TERM ONLY
-        is a hard NO); STRONG AvgWin/AvgLoss skew (13.0% / -8.3%) supports
-        FULL sizing
-  NVDA  well-suited in RAW mode (STRONG ENTRY 4.4% / 65.5%); calibration
-        destroys edge; high-confidence-tail-driven
+  *** REVISED S31 after the Days_to_earnings leak fix — old stock ratings were leak-inflated ***
+  QQQ   THE reference baseline AND now the only trustworthy edge; clean hierarchy,
+        leak-free (+1.8pp 6mo / +0.7pp 15d over buy-and-hold); 53 windows
+  AMD   DOWNGRADED — clean STRONG ENTRY 18.1% 6mo is BELOW STAY OUT (19.4%) and only
+        +0.2pp 15d; the documented 33.9% was the calendar-time leak. Marginal at best.
+  NVDA  DOWNGRADED to UNSUITABLE — clean STRONG ENTRY is anti-predictive (-0.8% 15d /
+        worst signal; 15.2% 6mo < STAY OUT 25.7%). The documented 33% was ENTIRELY leak.
   SOFI  marginal — short history (2021 IPO); rate features need more rate-regime
         variation
   AAPL  backfill partial (180 IV rows since 2025-07-24); backtest not run
@@ -164,9 +184,12 @@ Cross-ticker findings:
   (+22.5pt — longer horizon filters binary event noise)
 - SHORT-TERM ONLY ticker-dependent: best on AMD when computed without 63d split
   but post-S15 splits show it as a hard NO; QQQ is near-zero either way
-- Framework edge concentrates where micro-inefficiencies exist:
-  individual stocks (NVDA 4.4%, AMD 3.9%) > tech-heavy index (QQQ 1.9%) >
-  broad index (SPY 0.8%)
+- ~~Framework edge concentrates in individual stocks (NVDA 4.4%, AMD 3.9%) > index (QQQ 1.9%)~~
+  REFUTED S31 — that ordering was the Days_to_earnings calendar-time leak (79-87% of stock
+  history was a disguised time index; corr -0.99). On CLEAN features the ordering INVERTS: QQQ
+  (+1.8pp 6mo, hierarchy intact) > AMD (marginal, < STAY OUT) > NVDA (anti-predictive). The
+  index is the honest edge; the stocks' apparent advantage was the leak. Lesson: a feature that
+  ramps with calendar time will manufacture edge on any secular-uptrend name in a walk-forward.
 
 ────────────────────────────────────────────────────────────────────────
 
@@ -686,6 +709,113 @@ Tradier Config (modules/tradier.py + sizing.py + pc_oi.py)
 
 Recent Session Log
 ------------------
+
+S31 (2026-06-13) — Days_to_earnings CALENDAR-TIME LEAK found -> NVDA/AMD edge was ~entirely artifact
+1. CONTEXT: implementing two S30-spec'd experiments (P2 confidence band; bear-duration features) +
+   user add-on (OHLC readout on indicators.py dashboard + console — shipped, verified).
+2. CONFIDENCE BAND (Candidate 1): NEW confidence_band_ab.py (post-processing on backtest_results
+   CSVs). Phase A (hindsight) CONFIRMED the S25 mechanism — banding NVDA's >=0.70 tail lifts STRONG
+   6mo 33.3->42.0%; QQQ degrades (control); AMD horizon-split. BUT Phase B (honest in-window
+   self-test in backtest.py: activate band iff training-window tail_avg < 0.5*mid_avg) NEVER
+   ACTIVATES (0.0% of windows on QQQ+NVDA+AMD). The tail poison is an OUT-OF-SAMPLE phenomenon
+   (model over-applying a learned pattern to new data) — invisible in training, so an honest rule
+   can't catch it. Candidate 1 = confirmed no-op; not productionized. Code retained as research.
+3. THE LEAK (found while running NVDA's first backtest since S30): the S30 Days_to_earnings cap
+   (min(d,90)) COLLAPSED NVDA STRONG 6mo 33.3->15.4% and inverted the hierarchy. QQQ was immune
+   (ETF, constant 45) so S30's QQQ-only verification missed it. Controlled revert confirmed the cap
+   is the sole cause (revert -> exactly 33.3%; restore -> 15.4%). MECHANISM: yfinance returns only
+   ~20-25 recent earnings dates, so for any row older than ~2020 _days_to_next returns days-until-
+   the-earliest-known-date = a near-perfect calendar-time RAMP. Quantified: NVDA 79% of rows leaked
+   (corr -0.999 with calendar order); AMD 87% (corr -1.000), values up to 14,743 days. The cap is
+   CORRECT; it removes a time-index that propped up the backtest edge on these secular-uptrend names.
+4. USER-DIRECTED AUDIT of the whole feature set (corr-with-calendar-order scan on saved ml_features
+   CSVs): only ONE major leak (Days_to_earnings, corr ~-0.99). Secondary: VIX_VIX3M_ratio /
+   VIX9D_VIX_ratio fillna(1.0) for pre-2007/2011 -> era marker (corr -0.5..-0.6, ~60% of AMD rows)
+   but it's a binary step constant-WITHIN-window (only the ~2007 transition window mixes eras), so
+   low walk-forward impact. Days_to_catalyst = same code structure but CONSTANT 90 for production
+   tickers (catalysts.csv is CRSP-only, CRSP direction-neutralized) -> dormant, no leak. Red
+   herrings flagged by the scan but EXCLUDED from features: Open/High/Low/Close/Volume/atm_strike.
+   Everything else (price_vs_52w_high, HV_20, bench vs_ma200) < 0.5 and economically real.
+5. FIXES: (a) earnings cap min(d,90) [S30, kept]; (b) add_catalyst_proximity capped min(d,90)
+   defensively (benchmarks.py); (c) VIX missingness indicators vix9d_available/vix3m_available in
+   compute_vix_features (features.py) — mirrors iv_available; lets the model separate a real 1.0
+   from a filled 1.0. 14/14 smoke pass.
+6. CLEAN RE-BASELINES (see "S31 LEAK CORRECTION" block above). QQQ intact + modest real edge
+   (+1.8pp 6mo); NVDA STRONG anti-predictive (-8.4pp vs all-days); AMD STRONG marginal (< STAY OUT).
+   VIX fix negligible on stocks (earnings was the whole leak); QQQ 9.6->8.9% from the 2 VIX cols.
+7. IMPLICATION: the "individual stocks > index" thesis + the QQQ+NVDA cross-validation standard
+   were leak-dependent. QQQ is now the lone trustworthy edge. Re-validate all NVDA-passed history.
+8. OHLC dashboard add-on: indicators.py plot_dashboard upper-right OHLC box (date, O/H/L/C, chg +
+   %); print_signal_summary gains Close+change and full OHLC line. Verified on QQQ render.
+9. OPEN: Candidate 2 (bear-duration, --bear-duration default OFF) coded but A/B deferred — validate
+   against clean baselines. Re-baseline SOFI/CRSP if they're used for any cross-check.
+
+S30 (2026-06-11/12) — Train/test audit + soundness readout -> 7 fixes + forward signal ledger
+1. AUDIT (read-only, day 1): full QQQ pipeline run + backtest reproduced the documented baseline
+   (STRONG 571/1.8%/64.1%, 6mo 9.6%/76.7%; P4 + VIX gates both re-REJECT; 14/14 smoke). Walk-forward
+   verified CLEAN line-by-line: per-window targets truncated inside df_train, scaler fit train-only,
+   thresholds per-window (S13), all features trailing. No fatal train/test flaw.
+2. FINDINGS (mechanics): (a) overlapping daily 15d/126d outcome windows mean counts overstate
+   evidence (~570 STRONG signals ≈ 40-100 independent 15d bets; 6mo table ≈ a dozen episodes) —
+   inherent, not a bug; ±1-2pp config deltas are noise. (b) entry/direction/exit/volatility 80/20
+   split had NO embargo — last N train labels (15/63/10/15) used test-period prices (printed test
+   precision only; backtest + live signal unaffected). (c) backtest.py P4_FORWARD_DAYS was 5 while
+   comment/docs/entry.py said 15 — committed at 5 since S18 (6fb8131): ALL prior P4-gate A/Bs incl.
+   the S18 rejection were 5d-gate results. (d) Days_to_earnings uncapped -> thousands-of-days era
+   marker on stock tickers (yfinance returns only ~20 recent earnings dates). (e) entry.py staleness
+   warning keyed on index max -> IV today-row masked stale prices (observed live: Wed signal ran on
+   Mon close, no warning — Jun 10 bar was transient yfinance lag). (f) sizing.py MAX_DTE=730 vs
+   docs 365; stale signal.py docstring ref.
+3. SOUNDNESS READOUT (logic layer): core sound (exhaustive 5-tier mapping, vol-scaled bars,
+   direction-gates/vol-sizes split matches measured edge). Gaps are POST-SIGNAL: instrument gap
+   (validated on stock returns, trades options — delta/theta/vega never modeled; marginal tiers
+   likely flip negative on the option), IV/HV >= 1.40 gate is the only ACTIVE production rule never
+   A/B-validated (backtest has no IV/HV gate; ~2yr IV < 300-signal floor) AND tensions with S21/S29
+   stress=contrarian-buy, SHORT-TERM ONLY more permissive than its own evidence, close-fill execution
+   assumption. Structural caveat logged: ~29 sessions of tuning on the same 25y history -> published
+   edge margins are CEILING estimates; only forward data can set the floor.
+4. FIXES SHIPPED: (1) embargo kwarg `forward_days` in entry/direction/exit/volatility train —
+   trims last N rows from train slice (mirrors backtest construction; default 0 = no-op, smoke-test
+   compatible). (2) backtest.py P4_FORWARD_DAYS 5->15 + CLAUDE.md note (next backtest run = first
+   true 15d-gate A/B). (3) Days_to_earnings capped at 90 (features.py). (4a) staleness keys on
+   Close-dropna index. (5) sizing.py MAX_DTE 730->365 + docstring entry.py.
+5. SAME-DAY CLOSE (4b, root cause): yfinance END_DATE=today + end-exclusive means today's bar was
+   NEVER REQUESTED — every signal ran on yesterday's close at best, by construction. Verified live
+   minutes after Fri 4PM ET: Tradier quote `close` populates AT the bell (721.34) and /markets/history
+   already had today's bar; yfinance also had it when asked with end=tomorrow; Massive stock-aggs
+   key IS entitled (DELAYED tier) but lacked today's bar -> backfill-grade only. NEW
+   indicators.py:augment_recent_prices_from_tradier() (before add_indicators, gated to default
+   END_DATE): stamps today's OHLCV from Tradier quote AFTER 16:00 ET (close-null-until-bell latch +
+   trade_date==today guard vs pre-open stale quote) + backfills trailing-5-bday holes from Tradier
+   history. NEW tradier.py helpers get_daily_quote()/get_daily_history(). Tradier prices unadjusted
+   vs yfinance adjusted — stamped rows live <1 day (next run's yfinance fetch replaces OHLCV; only
+   IV cols merge-persist). Pre-close runs unchanged (NaN today-row as before).
+6. FORWARD SIGNAL LEDGER (the big add): entry.py:append_signal_ledger() writes one row per as-of
+   date to data/{ticker}_signal_ledger.csv (signal pre/post gate, sizing, 4 probs, IV/HV, term,
+   P/C OI, close, 3 thresholds); same-day re-run overwrites that date's row. Purpose: pristine
+   out-of-sample record — the only data that can validate the post-signal layers (IV/HV gate,
+   option translation) the backtest never sees, and the floor-estimator for the structural caveat.
+   print_combined_signal now returns (signal_pre_gate, signal, sizing).
+7. POLICY: SHORT-TERM ONLY demoted to informational-only in CLAUDE.md (QQQ ~= STAY OUT 15d;
+   AMD hard NO; +0.7% underlying likely negative on the option after spread+theta). Pending
+   forward-ledger evidence.
+8. Process: 4b placed BEFORE add_indicators (plan had said inside harvest_iv_snapshot) — stamping
+   after indicators would leave today's RSI/MA NaN and entry.py would still signal off yesterday's
+   row; placement is what makes the same-day signal actually work end-to-end.
+9. DATA-SOURCE CONSOLIDATION question (user: drop yfinance for Tradier?) -> KEEP YFINANCE (probed
+   live): Tradier AMD history caps at 1994/8000 bars (vs 1980 CSV, -30%); Tradier closes are
+   split-adjusted but NOT dividend-adjusted (QQQ Sep-2025 +$2.20 vs yf adjusted -> would shift
+   every baseline); no ^SOX/^TNX/^IRX/earnings on Tradier so yfinance stays load-bearing anyway.
+   Surprise finding: Tradier DOES serve VIX/VIX9D/VIX3M/SPX quotes + daily history -> viable
+   disaster-recovery path if Yahoo ever breaks (except AMD pre-1994, SOX, yields). Policy recorded
+   in CLAUDE.md "Price data source policy (S30)".
+10. POST-FIX REGRESSION RUN (QQQ full pipeline + backtest, post-close 2026-06-12): NO REGRESSIONS.
+   UNGATED baseline within today-row drift (STRONG 573/1.8%/64.0%, 6mo 9.6%/76.4% vs Wed
+   571/1.8%/64.1%/9.6%/76.7%); hierarchy intact; LEAPS 6mo 7.6% > ALL DAYS 7.1%; VIX gate REJECT
+   unchanged (-1.06pp). Tradier stamp + ledger overwrite + embargo all behaved; 14/14 smoke.
+   FIRST TRUE 15d P4-GATE A/B: REJECT, worse than the old (mislabeled) 5d gate — STRONG 1.77->1.52%
+   (-0.25pp vs 5d's -0.05pp), 6mo 9.6->7.7%, win rate UP 64.0->66.9% while avg DOWN (the
+   winners-filtered-with-losers signature). S18's rejection now rests on direct 15d evidence.
 
 S29 (2026-06-09) — Market-context surface: modules/sentiment.py + market_context.py (backlog #4)
 1. MOTIVATION: the framework computes a rich fear/positioning gauge set but only surfaces it buried

@@ -36,6 +36,7 @@ from modules.features import (
     P2_FORWARD_DAYS, P2B_FORWARD_DAYS, P3_FORWARD_DAYS,
     P2_VOL_MULTIPLE, P3_VOL_MULTIPLE, P4_VOL_MULTIPLE,
     compute_hv_features, compute_vix_features, add_trend_break_features,
+    add_bear_duration_features,
     compute_p4_drawdown_threshold, add_p4_drawdown_target,
     add_earnings_proximity, normalize_features, compute_vol_thresholds,
 )
@@ -66,6 +67,7 @@ RANDOM_STATE        = 42
 
 IV_FEATURES   = False  # set by --iv-features CLI arg; when True, Phase 3 uses IV_FEATURE_COLS as features
 ECON_FEATURES = False  # set by --econ-features CLI arg; when True, Days_to_FOMC/CPI/... added
+BEAR_DURATION = False  # set by --bear-duration CLI arg (S31); adds days_below_ma200 + days_since_52w_high
 REGIME_GATE   = False  # set by --regime-gate CLI arg; when True, VIX stress regime downgrades SIGNAL one tier
 
 # IV/HV gate thresholds — ATM IV (30 DTE) divided by realized HV-20.
@@ -98,7 +100,10 @@ def load_indicators(path):
     END_DATE   = df.index.max().strftime("%Y-%m-%d")
     print(f"  → Ticker: {TICKER} | {START_DATE} to {END_DATE}")
     print(f"  → {len(df)} rows, {len(df.columns)} columns")
-    last_date = df.index.max()
+    # Staleness keys on the latest REAL price bar — the IV today-row has NaN
+    # OHLCV and would otherwise make a stale CSV look current.
+    price_dates = df["Close"].dropna().index
+    last_date = price_dates.max() if len(price_dates) else df.index.max()
     today = pd.Timestamp.today().normalize()
     days_old = np.busday_count(last_date.date(), today.date())
     if days_old > 1:
@@ -141,6 +146,8 @@ def build_features(df, benchmarks):
     if ECON_FEATURES:
         df = add_macro_event_proximity(df, DATA_DIR)
     df = add_trend_break_features(df)  # must precede normalize_features (drops MA cols)
+    if BEAR_DURATION:
+        df = add_bear_duration_features(df)  # also pre-normalize (needs MA_200)
     df = normalize_features(df)
 
     return df
@@ -149,7 +156,8 @@ def build_features(df, benchmarks):
 # ─────────────────────────────────────────
 # 3. TRAIN MODELS
 # ─────────────────────────────────────────
-def train(df, target_col, calibrate=False, use_iv_features=False, decision_threshold=0.50):
+def train(df, target_col, calibrate=False, use_iv_features=False, decision_threshold=0.50,
+          forward_days=0):
     # use_iv_features=True: include IV_FEATURE_COLS as features (Phase 3 only when --iv-features
     # );
     #   dropna() auto-limits training to the ~2yr backfilled window.
@@ -157,6 +165,9 @@ def train(df, target_col, calibrate=False, use_iv_features=False, decision_thres
     # decision_threshold: probability cutoff used for precision reporting — must match the
     # production threshold for the phase (P2/P2B/P3) so the printed precision reflects the
     # signal that will actually fire.
+    # forward_days: embargo width at the train/test boundary. Targets are built with
+    # shift(-N) on the full frame, so the last N training rows have labels computed from
+    # test-period prices — drop them so no training label's forward window crosses the split.
     exclude = {"Open", "High", "Low", "Close", "Volume", target_col,
                *(IV_META_COLS if use_iv_features else IV_COLS + IV_INDICATOR_COLS)}
     feature_cols = [c for c in df.columns if c not in exclude]
@@ -166,8 +177,9 @@ def train(df, target_col, calibrate=False, use_iv_features=False, decision_thres
     y = df_model[target_col]
 
     split_idx  = int(len(X) * (1 - TEST_SIZE))
-    X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
-    y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+    embargo    = max(0, split_idx - forward_days)
+    X_train, X_test = X.iloc[:embargo], X.iloc[split_idx:]
+    y_train, y_test = y.iloc[:embargo], y.iloc[split_idx:]
 
     scaler = StandardScaler()
     X_train_s = scaler.fit_transform(X_train)
@@ -482,7 +494,51 @@ def print_combined_signal(df_full, direction_prob, dir_prob_63, expansion_prob,
     print(f"  {sizing_note}")
     print(f"{'═'*w}\n")
 
-    return signal_pre_gate, signal
+    return signal_pre_gate, signal, sizing
+
+
+def append_signal_ledger(df_full, ticker, signal_pre_gate, signal, sizing,
+                         direction_prob, dir_prob_63, expansion_prob, exit_prob,
+                         iv_info, data_dir=DATA_DIR):
+    """Append/refresh today's row in the forward signal ledger.
+
+    One row per as-of date (the price bar the signal was computed on); re-running
+    the same day overwrites that date's row. This is the live out-of-sample
+    record — the only data that can validate the post-signal layers (IV/HV gate,
+    option translation) that the walk-forward backtest never sees."""
+    df_clean = df_full.drop(columns=IV_COLS, errors="ignore").dropna()
+    as_of = df_clean.index[-1]
+
+    def _iv(key, digits=3):
+        if iv_info is None or iv_info.get(key) is None:
+            return None
+        return round(float(iv_info[key]), digits)
+
+    row = {
+        "ticker":              ticker,
+        "signal_pre_gate":     signal_pre_gate,
+        "signal":              signal,
+        "sizing":              sizing,
+        "dir_prob":            round(float(direction_prob), 4),
+        "dir_prob_63":         round(float(dir_prob_63), 4),
+        "exp_prob":            round(float(expansion_prob), 4),
+        "exit_prob":           round(float(exit_prob), 4) if exit_prob is not None else None,
+        "iv_hv_ratio":         _iv("ratio"),
+        "term_structure":      _iv("term"),
+        "put_call_oi":         _iv("pc_oi"),
+        "close":               round(float(df_clean["Close"].iloc[-1]), 2),
+        "win_threshold":       round(WIN_THRESHOLD, 6),
+        "win_threshold_63":    round(WIN_THRESHOLD_63, 6),
+        "expansion_threshold": round(EXPANSION_THRESHOLD, 6),
+    }
+    path = os.path.join(data_dir, f"{ticker.lower()}_signal_ledger.csv")
+    ledger = pd.DataFrame([row], index=pd.Index([as_of], name="date"))
+    if os.path.exists(path):
+        prior = pd.read_csv(path, index_col=0, parse_dates=True)
+        prior.index.name = "date"
+        ledger = pd.concat([prior[prior.index != as_of], ledger]).sort_index()
+    ledger.to_csv(path)
+    print(f"Signal ledger updated -> {path}  ({as_of.date()}: {signal})")
 
 
 # ─────────────────────────────────────────
@@ -570,7 +626,7 @@ if __name__ == "__main__":
     future_close = df_p2["Close"].shift(-P2_FORWARD_DAYS)
     df_p2["direction_target"] = ((future_close / df_p2["Close"] - 1) >= WIN_THRESHOLD).astype(int)
     df_p2 = df_p2.iloc[:-P2_FORWARD_DAYS]
-    clf2, scaler2, fcols2, tr2, te2, base2 = train(df_p2, "direction_target", calibrate=P2_CALIBRATE, decision_threshold=P2_THRESHOLD)
+    clf2, scaler2, fcols2, tr2, te2, base2 = train(df_p2, "direction_target", calibrate=P2_CALIBRATE, decision_threshold=P2_THRESHOLD, forward_days=P2_FORWARD_DAYS)
     print(f"Phase 2  (15d direction, {'calibrated' if P2_CALIBRATE else 'raw'}) — train precision: {tr2:.1%}  test precision: {te2:.1%}  base rate: {base2:.1%}")
 
     # Phase 2B — 63-day direction target
@@ -578,7 +634,7 @@ if __name__ == "__main__":
     future_close_63 = df_p2b["Close"].shift(-P2B_FORWARD_DAYS)
     df_p2b["direction_target_63"] = ((future_close_63 / df_p2b["Close"] - 1) >= WIN_THRESHOLD_63).astype(int)
     df_p2b = df_p2b.iloc[:-P2B_FORWARD_DAYS]
-    clf2b, scaler2b, fcols2b, tr2b, te2b, base2b = train(df_p2b, "direction_target_63", decision_threshold=P2B_THRESHOLD)
+    clf2b, scaler2b, fcols2b, tr2b, te2b, base2b = train(df_p2b, "direction_target_63", decision_threshold=P2B_THRESHOLD, forward_days=P2B_FORWARD_DAYS)
     print(f"Phase 2B (63d direction) — train precision: {tr2b:.1%}  test precision: {te2b:.1%}  base rate: {base2b:.1%}")
 
     # Phase 3 — IV expansion target
@@ -586,13 +642,13 @@ if __name__ == "__main__":
     future_hv = df_p3["HV_20"].shift(-P3_FORWARD_DAYS)
     df_p3["iv_target"] = ((future_hv / df_p3["HV_20"] - 1) >= EXPANSION_THRESHOLD).astype(int)
     df_p3 = df_p3.iloc[:-P3_FORWARD_DAYS]
-    clf3, scaler3, fcols3, tr3, te3, base3 = train(df_p3, "iv_target", use_iv_features=IV_FEATURES, decision_threshold=P3_THRESHOLD)
+    clf3, scaler3, fcols3, tr3, te3, base3 = train(df_p3, "iv_target", use_iv_features=IV_FEATURES, decision_threshold=P3_THRESHOLD, forward_days=P3_FORWARD_DAYS)
     print(f"Phase 3  (IV timing)     — train precision: {tr3:.1%}  test precision: {te3:.1%}  base rate: {base3:.1%}")
 
     # Phase 4 — exit risk target (15d max drawdown >= vol-adjusted bar). Display-only.
     p4_drawdown_threshold = compute_p4_drawdown_threshold(df_full, P4_FORWARD_DAYS)
     df_p4 = add_p4_drawdown_target(df_full, P4_FORWARD_DAYS, p4_drawdown_threshold)
-    clf4, scaler4, fcols4, tr4, te4, base4 = train(df_p4, "exit_target", decision_threshold=P4_THRESHOLD)
+    clf4, scaler4, fcols4, tr4, te4, base4 = train(df_p4, "exit_target", decision_threshold=P4_THRESHOLD, forward_days=P4_FORWARD_DAYS)
     print(f"Phase 4  (exit risk)     — train precision: {tr4:.1%}  test precision: {te4:.1%}  base rate: {base4:.1%}\n")
 
     # Current signals
@@ -610,7 +666,7 @@ if __name__ == "__main__":
     # Read today's IV snapshot harvested by indicators.py and compute IV/HV ratio
     iv_info = read_iv_from_csv(df_full, float(latest["HV_20"]))
 
-    print_combined_signal(
+    signal_pre_gate, signal, sizing = print_combined_signal(
         df_full,
         direction_prob,
         dir_prob_63,
@@ -630,5 +686,8 @@ if __name__ == "__main__":
         exit_contributors=exit_contributors,
         exit_drawdown_threshold=p4_drawdown_threshold,
     )
+
+    append_signal_ledger(df_full, TICKER, signal_pre_gate, signal, sizing,
+                         direction_prob, dir_prob_63, expansion_prob, exit_prob, iv_info)
 
     print(f"[Phase 2: {'CALIBRATED' if P2_CALIBRATE else 'RAW'} — P2_THRESHOLD={P2_THRESHOLD} | Phase 3 IV: {'REAL' if IV_FEATURES else 'HV proxy'}]")

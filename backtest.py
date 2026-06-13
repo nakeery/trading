@@ -36,6 +36,7 @@ from modules.features import (
     P2_FORWARD_DAYS, P2B_FORWARD_DAYS, P3_FORWARD_DAYS,
     P2_VOL_MULTIPLE, P2B_VOL_MULTIPLE, P3_VOL_MULTIPLE, P4_VOL_MULTIPLE,
     compute_hv_features, compute_vix_features, add_trend_break_features,
+    add_bear_duration_features,
     compute_p4_drawdown_threshold, add_p4_drawdown_target,
     add_earnings_proximity, normalize_features, compute_vol_thresholds,
     impute_iv_features,
@@ -61,12 +62,18 @@ P2_CALIBRATE        = False  # Decision 1 (S11) reverted as default after NVDA r
 P2_THRESHOLD        = 0.55   # Phase 2 (15d) cutoff. Set from P2_CALIBRATE in __main__: 0.50 calibrated / 0.55 raw.
 P2B_THRESHOLD       = 0.55  # Phase 2B (63d) raw cutoff — calibration deferred to Decision 2
 P3_THRESHOLD        = 0.60
-P4_FORWARD_DAYS     = 5    # Phase 4 exit window (15d production default — S18)
+BAND_CAP            = 0.70  # Phase 2 confidence band (S31): dir_prob >= this is the "inverted tail"
+BAND_MIN_TAIL       = 30    # min training-window tail signals before the band can activate
+BAND_RATIO          = 0.50  # activate band iff tail_avg < BAND_RATIO × mid_avg (training outcomes)
+P4_FORWARD_DAYS     = 15   # Phase 4 exit window — aligned to entry.py/exit.py 15d production default.
+                           # NOTE: was 5 from S18 (commit 6fb8131) until 2026-06-12 — all P4-gate
+                           # A/B numbers before then, incl. the S18 rejection, were 5d-gate results.
 P4_THRESHOLD        = 0.55  # Phase 4 drawdown cutoff
 RANDOM_STATE        = 42
 
 IV_FEATURES   = False  # set by --iv-features CLI arg; when True, Phase 3 uses IV_FEATURE_COLS as features
 ECON_FEATURES = False  # set by --econ-features CLI arg; when True, Days_to_FOMC/CPI/... added
+BEAR_DURATION = False  # set by --bear-duration CLI arg (S31); when True, adds days_below_ma200 + days_since_52w_high
 
 # Walk-forward parameters
 # MIN_TRAIN_DAYS = 504   # ~2 years minimum training window
@@ -190,6 +197,8 @@ def build_features(df, benchmarks):
     if ECON_FEATURES:
         df = add_macro_event_proximity(df, DATA_DIR)
     df = add_trend_break_features(df)  # must precede normalize_features (drops MA cols)
+    if BEAR_DURATION:
+        df = add_bear_duration_features(df)  # also pre-normalize (needs MA_200)
     df = normalize_features(df)
 
     # Overnight gap features — computed fresh (not read from CSV) for self-containment
@@ -238,6 +247,38 @@ def train_model(df_train, target_col, calibrate=False, use_iv_features=False):
                                  max_iter=1000, random_state=RANDOM_STATE)
         clf.fit(X_s, y)
     return clf, scaler, feature_cols
+
+
+# ─────────────────────────────────────────
+# 4B. PHASE 2 CONFIDENCE BAND — in-window self-test (S31)
+# ─────────────────────────────────────────
+def compute_band_active(clf2, scaler2, fcols2, df_p2, p2_ret,
+                        band_cap=BAND_CAP, min_tail=BAND_MIN_TAIL, ratio=BAND_RATIO):
+    """Decide — using ONLY training-window data — whether the high-confidence tail
+    underperforms the mid band, i.e. whether the S25 NVDA inversion is present for
+    THIS ticker/window. No lookahead: probabilities and realized 15d returns both
+    come from the training slice.
+
+    Returns True iff the band should activate: tail ([band_cap, 1]) has >= min_tail
+    signals and its mean realized return is below ratio × the mid band's
+    ([P2_THRESHOLD, band_cap)) mean. mid_avg must be positive (a broken-signal
+    window where the mid band itself doesn't pay should not trigger a veto)."""
+    if clf2 is None or fcols2 is None:
+        return False
+    sub = df_p2[fcols2].dropna()
+    if len(sub) < 50:
+        return False
+    prob = clf2.predict_proba(scaler2.transform(sub))[:, 1]
+    realized = p2_ret.reindex(sub.index).values
+    mid_mask  = (prob >= P2_THRESHOLD) & (prob < band_cap)
+    tail_mask = (prob >= band_cap)
+    if tail_mask.sum() < min_tail or mid_mask.sum() < min_tail:
+        return False
+    mid_avg  = np.nanmean(realized[mid_mask])
+    tail_avg = np.nanmean(realized[tail_mask])
+    if not np.isfinite(mid_avg) or not np.isfinite(tail_avg) or mid_avg <= 0:
+        return False
+    return tail_avg < ratio * mid_avg
 
 
 # ─────────────────────────────────────────
@@ -309,6 +350,11 @@ def run_backtest(df_full, p2_mult=None, p2b_mult=None, p3_mult=None, side="call"
             train_end += STEP_DAYS
             continue
 
+        # Phase 2 confidence band (S31): in-window self-test decides band ON/OFF for
+        # this window (call side only — the S25 inversion evidence is call/long).
+        band_active = (side == "call") and compute_band_active(
+            clf2, scaler2, fcols2, df_p2, p2_ret)
+
         # Generate signals on test period
         for i in range(test_start, test_end):
             date = df_full.index[i]
@@ -359,6 +405,21 @@ def run_backtest(df_full, p2_mult=None, p2b_mult=None, p3_mult=None, side="call"
             regime = regime_series.loc[date]
             signal_regime_gated, _, _ = apply_regime_gate(signal, "", regime)
 
+            # Phase 2 confidence band (S31): when active for this window, a dir_prob in
+            # the inverted tail (>= BAND_CAP) is treated as NO 15d signal, so STRONG/
+            # CAUTION/SHORT-TERM fall through to LEAPS ONLY / STAY OUT.
+            dir_signal_banded = dir_signal and not (band_active and dir_prob >= BAND_CAP)
+            if dir_signal_banded and dir_signal_63 and exp_signal:
+                signal_banded = "STRONG ENTRY"
+            elif dir_signal_banded and dir_signal_63 and not exp_signal:
+                signal_banded = "CAUTION"
+            elif dir_signal_banded and not dir_signal_63:
+                signal_banded = "SHORT-TERM ONLY"
+            elif not dir_signal_banded and dir_signal_63:
+                signal_banded = "LEAPS ONLY"
+            else:
+                signal_banded = "STAY OUT"
+
             fwd_return = close.iloc[i + P2_FORWARD_DAYS] / close.iloc[i] - 1
             fwd_126 = i + 126
             fwd_return_126d = (
@@ -371,6 +432,8 @@ def run_backtest(df_full, p2_mult=None, p2b_mult=None, p3_mult=None, side="call"
                 "signal":               signal,
                 "signal_gated":         signal_gated,
                 "signal_regime_gated":  signal_regime_gated,
+                "signal_banded":        signal_banded,
+                "band_active":          band_active,
                 "regime":               regime,
                 "dir_prob":             dir_prob,
                 "dir_prob_63":          dir_prob_63,
@@ -520,6 +583,62 @@ def summarize_p4_gate_ab(results):
         print(f"    ✓ ACCEPT — gated avg {g_avg:.2%} > ungated {u_avg:.2%}  (Δ {g_avg - u_avg:+.2%})")
     else:
         print(f"    ✗ REJECT — gated avg {g_avg:.2%} not strictly above ungated {u_avg:.2%}  (Δ {g_avg - u_avg:+.2%})")
+    print(f"{'═'*80}\n")
+
+
+def summarize_band_ab(results):
+    """A/B of ungated vs Phase-2-confidence-band signals (S31).
+
+    The band is per-ticker by construction: the in-window self-test only activates
+    where the high-confidence tail underperforms (NVDA-like). Accept criteria:
+      1. STRONG ENTRY banded 6mo avg >= ungated (the tail it removes should be dead
+         weight at the LEAPS horizon on a band-ON ticker; flat-or-better on band-OFF)
+      2. STRONG ENTRY banded 15d avg >= ungated − 0.2pp (no 15d compression)
+      3. Hierarchy STRONG > CAUTION on the banded arm (15d)
+      4. STRONG ENTRY banded count >= 300 (sample-size floor)
+    """
+    if "band_active" in results.columns:
+        frac = results["band_active"].mean()
+        print(f"\n  Band-active window fraction: {frac:.1%} of test rows "
+              f"(per-window self-test; 0% = ticker never triggers the band)")
+
+    print(f"\n{'═'*80}")
+    print(f"  PHASE 2 CONFIDENCE BAND — A/B COMPARISON (S31)")
+    print(f"{'═'*80}")
+    print(f"  {'Signal':<18} {'Cnt U':>7} {'Cnt B':>7} {'15d U':>7} {'15d B':>7} "
+          f"{'6mo U':>7} {'6mo B':>7} {'Δ6mo':>7}")
+    print(f"  {'─'*78}")
+    for sig in ["STRONG ENTRY", "CAUTION", "SHORT-TERM ONLY", "LEAPS ONLY", "STAY OUT"]:
+        u   = results[results["signal"] == sig]
+        b   = results[results["signal_banded"] == sig]
+        u15 = u["fwd_return"].mean() if len(u) else 0
+        b15 = b["fwd_return"].mean() if len(b) else 0
+        u126 = u["fwd_return_126d"].dropna().mean() if len(u) else 0
+        b126 = b["fwd_return_126d"].dropna().mean() if len(b) else 0
+        d126 = (b126 - u126) if (len(u) and len(b)) else float("nan")
+        print(f"  {sig:<18} {len(u):>7} {len(b):>7} {u15:>7.1%} {b15:>7.1%} "
+              f"{u126:>7.1%} {b126:>7.1%} {d126:>+7.2%}")
+
+    us = results[results["signal"] == "STRONG ENTRY"]
+    bs = results[results["signal_banded"] == "STRONG ENTRY"]
+    u15, b15 = us["fwd_return"].mean(), bs["fwd_return"].mean()
+    u126 = us["fwd_return_126d"].dropna().mean()
+    b126 = bs["fwd_return_126d"].dropna().mean()
+    bc = results[results["signal_banded"] == "CAUTION"]["fwd_return"].mean()
+    c1 = b126 >= u126
+    c2 = b15 >= u15 - 0.002
+    c3 = b15 > bc
+    c4 = len(bs) >= 300
+    print(f"  {'─'*78}")
+    print(f"  ACCEPT criteria:")
+    print(f"    [{'✓' if c1 else '✗'}] STRONG 6mo no worse:   banded {b126:.1%} vs ungated {u126:.1%} (Δ {b126-u126:+.2%})")
+    print(f"    [{'✓' if c2 else '✗'}] STRONG 15d no compress: banded {b15:.2%} vs ungated {u15:.2%} (Δ {b15-u15:+.2%}, need ≥ −0.2pp)")
+    print(f"    [{'✓' if c3 else '✗'}] Hierarchy STRONG>CAUTION (15d, banded): {b15:.2%} > {bc:.2%}")
+    print(f"    [{'✓' if c4 else '✗'}] STRONG sample floor:    banded count {len(bs)} (need ≥ 300)")
+    if c1 and c2 and c3 and c4:
+        print(f"  ✓ ACCEPT — band is non-harmful here; on a band-OFF ticker this means dormant.")
+    else:
+        print(f"  ✗ REJECT / band harmful for this ticker (expected on band-OFF tickers like QQQ).")
     print(f"{'═'*80}\n")
 
 
@@ -749,6 +868,13 @@ if __name__ == "__main__":
              "Requires `python -m modules.econ_calendar --refresh` to have been run.",
     )
     parser.add_argument(
+        "--bear-duration", action=argparse.BooleanOptionalAction, default=False,
+        dest="bear_duration",
+        help="Add bear-market DURATION features (days_below_ma200, days_since_52w_high). "
+             "S31 experiment, default OFF — targets the grind-bear vs V-dip distinction "
+             "behind the NVDA high-confidence-tail misfire. Validate cross-ticker before use.",
+    )
+    parser.add_argument(
         "--side", choices=["call", "put"], default="call",
         help="Direction to scan. 'call' (default, production) = bullish upside target. "
              "'put' = bearish PoC (S28): flips the Phase 2/2B target to a downside move "
@@ -759,6 +885,7 @@ if __name__ == "__main__":
     P2_CALIBRATE  = args.calibrate
     IV_FEATURES   = args.iv_features
     ECON_FEATURES = args.econ_features
+    BEAR_DURATION = args.bear_duration
     SIDE          = args.side
     P2_THRESHOLD  = 0.50 if P2_CALIBRATE else 0.55
 
@@ -864,6 +991,10 @@ if __name__ == "__main__":
             # VIX regime gate — STRONG ENTRY → CAUTION, CAUTION → STAY OUT in stress regime
             summarize(results, signal_col="signal_regime_gated", label="GATED (VIX regime)")
             summarize_regime_gate_ab(results)
+
+            # Phase 2 confidence band (S31) — per-ticker in-window self-test
+            summarize(results, signal_col="signal_banded", label="BANDED (P2 confidence)")
+            summarize_band_ab(results)
 
             plot_results(df_stats, order, colors, results)
 
