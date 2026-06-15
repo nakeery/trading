@@ -94,7 +94,7 @@ def load_indicators(path):
 # 3. TRAIN / EVALUATE
 # ─────────────────────────────────────────
 def train(df, forward_days):
-    exclude = {"Open", "High", "Low", "Close", "Volume", "target", *IV_COLS}
+    exclude = {"Open", "High", "Low", "Close", "Volume", "target", "Days_to_earnings", *IV_COLS}
     feature_cols = [c for c in df.columns if c not in exclude and pd.api.types.is_numeric_dtype(df[c])]
 
     df_model = df[feature_cols + ["target"]].dropna()

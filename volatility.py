@@ -152,6 +152,7 @@ def train_model(df, forward_days=0):
     # forward_days: embargo width at the train/test boundary — the last N training
     # rows have targets built from test-period HV (shift(-N) on the full frame).
     exclude = {"Open", "High", "Low", "Close", "Volume", "target",
+               "Days_to_earnings",  # S31: dropped from features framework-wide (leak source; display-only)
                *(IV_META_COLS if IV_FEATURES else IV_COLS)}
     feature_cols = [c for c in df.columns if c not in exclude]
 

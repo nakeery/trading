@@ -169,6 +169,7 @@ def train(df, target_col, calibrate=False, use_iv_features=False, decision_thres
     # shift(-N) on the full frame, so the last N training rows have labels computed from
     # test-period prices — drop them so no training label's forward window crosses the split.
     exclude = {"Open", "High", "Low", "Close", "Volume", target_col,
+               "Days_to_earnings",  # S31: dropped from features framework-wide (leak source; display-only)
                *(IV_META_COLS if use_iv_features else IV_COLS + IV_INDICATOR_COLS)}
     feature_cols = [c for c in df.columns if c not in exclude]
 

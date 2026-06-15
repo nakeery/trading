@@ -179,6 +179,7 @@ def build_features(df, benchmarks):
     macro_features = detect_macro_features(TICKER)
     if macro_features:
         fetched = {}
+        macro_cols = []
         for symbol, name in macro_features:
             rate_raw = _fetch_cached(symbol, f"{name.lower()}_cache.csv")
             series = rate_raw[["Close"]].rename(columns={"Close": name})
@@ -187,10 +188,21 @@ def build_features(df, benchmarks):
             df = df.join(series, how="left")
             ff_cols = [name, f"{name}_chg_5d", f"{name}_vs_ma20"]
             df[ff_cols] = df[ff_cols].ffill()
+            macro_cols += ff_cols
             fetched[name] = True
         if "UST10Y" in fetched and "UST3M" in fetched:
             df["yield_curve"]        = df["UST10Y"] - df["UST3M"]
-            df["yield_curve_chg_5d"] = df["yield_curve"].pct_change(5)
+            # diff(5), not pct_change(5): the 10Y-3M spread crosses zero at curve
+            # inversions (e.g. 2007-08-10), so a percentage change divides by ~0 and
+            # explodes to +inf (crashes StandardScaler). An absolute 5-day change in the
+            # spread (percentage points) is well-defined through the zero crossing.
+            df["yield_curve_chg_5d"] = df["yield_curve"].diff(5)
+            macro_cols += ["yield_curve", "yield_curve_chg_5d"]
+        # Defensive: near-zero / negative short rates (^IRX during ZIRP and the 2008
+        # panic) can still make a pct_change/ratio feature non-finite; convert any inf
+        # to NaN so the affected row drops out cleanly rather than crashing the model.
+        if macro_cols:
+            df[macro_cols] = df[macro_cols].replace([np.inf, -np.inf], np.nan)
 
     df = add_earnings_proximity(df, TICKER)
     df = add_catalyst_proximity(df, TICKER, MODULE_DIR, for_direction=True)
@@ -221,6 +233,7 @@ def train_model(df_train, target_col, calibrate=False, use_iv_features=False):
     # default (Phase 2/2B/4): exclude all IV_COLS *and* the impute indicator cols, so the
     #   full price history is used and --iv-features stays Phase-3-scoped (no Phase 2/2B leak).
     exclude = {"Open", "High", "Low", "Close", "Volume", target_col,
+               "Days_to_earnings",  # S31: dropped from features framework-wide (leak source; display-only)
                *(IV_META_COLS if use_iv_features else IV_COLS + IV_INDICATOR_COLS)}
     feature_cols = [c for c in df_train.columns if c not in exclude]
 
@@ -758,7 +771,11 @@ def plot_results(df_stats, order, colors, results):
     out = os.path.join(DATA_DIR, f"{TICKER.lower()}_backtest.png")
     plt.savefig(out, dpi=150, bbox_inches="tight", facecolor="#0d1117")
     print(f"Chart saved -> {out}")
-    if input("Show chart? [y/N]: ").strip().lower() == "y":
+    try:
+        _show = input("Show chart? [y/N]: ").strip().lower() == "y"
+    except EOFError:
+        _show = False  # piped / exhausted stdin — skip the chart, don't crash before the CSV save
+    if _show:
         plt.show()
 
 

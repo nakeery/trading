@@ -13,6 +13,7 @@ To add macro features for a ticker: add an entry to MACRO_FEATURES.
 """
 
 import os
+import numpy as np
 import yfinance as yf
 import pandas as pd
 
@@ -101,6 +102,7 @@ def add_macro_features(df, macro_features, start_date, end_date):
         return df
 
     fetched = {}
+    macro_cols = []
     for symbol, name in macro_features:
         raw = yf.download(symbol, start=start_date, end=end_date, progress=False)
         raw.columns = raw.columns.get_level_values(0)
@@ -110,13 +112,24 @@ def add_macro_features(df, macro_features, start_date, end_date):
         df = df.join(series, how="left")
         ff_cols = [name, f"{name}_chg_5d", f"{name}_vs_ma20"]
         df[ff_cols] = df[ff_cols].ffill()
+        macro_cols += ff_cols
         fetched[name] = True
         print(f"  ✓ {name}, {name}_chg_5d, {name}_vs_ma20")
 
     if "UST10Y" in fetched and "UST3M" in fetched:
         df["yield_curve"]        = df["UST10Y"] - df["UST3M"]
-        df["yield_curve_chg_5d"] = df["yield_curve"].pct_change(5)
+        # diff(5), not pct_change(5): the 10Y-3M spread crosses zero at curve inversions
+        # (e.g. 2007-08-10), so a percentage change divides by ~0 and explodes to +inf
+        # (crashes StandardScaler). An absolute 5-day spread change (pp) is well-defined.
+        df["yield_curve_chg_5d"] = df["yield_curve"].diff(5)
+        macro_cols += ["yield_curve", "yield_curve_chg_5d"]
         print("  ✓ yield_curve, yield_curve_chg_5d")
+
+    # Defensive: near-zero / negative short rates (^IRX during ZIRP and the 2008 panic)
+    # can still make a pct_change/ratio feature non-finite; convert any inf to NaN so the
+    # affected row drops out cleanly rather than crashing the model.
+    if macro_cols:
+        df[macro_cols] = df[macro_cols].replace([np.inf, -np.inf], np.nan)
 
     return df
 

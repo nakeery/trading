@@ -53,6 +53,10 @@ python econ_calendar_view.py
 
 # Consolidated market-context surface — fear/positioning gauges + trailing percentiles (S29)
 python market_context.py            # add --graphical for a matplotlib panel + PNG
+
+# Multi-timeframe market-structure & risk LENS (S34) — wide-angle context for chart-based decisions
+python lens.py                      # 1h/4h/D/W/M trend+momentum+volume, vol profile, risk scorecard
+python lens.py --thesis bullish --level 700   # confirm/contradict overlay vs your bias
 ```
 
 Install dependencies:
@@ -83,6 +87,7 @@ Run smoke tests:
 | pc_oi.py | 2 (ticker, optional expiry filter — blank = all) |
 | econ_calendar_view.py | 0 (argparse flags only — no prompts) |
 | market_context.py | 1 (ticker) + argparse flags (--graphical / --save-only / --no-vix) |
+| lens.py | 1 (ticker) + argparse flags (--thesis / --level / --no-intraday / --no-vix) |
 
 ### Running scripts via Claude Code on Windows
 
@@ -115,11 +120,15 @@ cmd /c "(echo TICKER && echo.) | python -X utf8 script.py" 2>&1
 | `probability_diagnostics.py` | Investigate WHY a probability bucket under/over-performs. Runs 4-hypothesis tests (time clustering, walk-forward window, multi-phase filter, preceding 20d return). (S23) | Console only |
 | `econ_calendar_view.py` | Graphical economic-release calendar (matplotlib popup): month grid of tracked macro releases color-coded by tier, today highlighted; TTL refresh-if-stale + coverage footnotes + PNG export (S27) | `data/econ_calendar.png` + popup window |
 | `market_context.py` | Consolidated fear/positioning surface — IV/HV, 25Δ skew, term structure, P/C OI, HV/IV-rank, VIX complex + regime, each with trailing-1y percentile + net read; console always, optional `--graphical` panel (S29). Human-context (S22), not a feature/signal | Console + optional `data/{ticker}_market_context.png` |
+| `lens.py` | **Multi-timeframe market-structure & risk LENS (S34)** — the framework's reoriented role: wide-angle CONTEXT for the user's own chart-based entries (NOT a signal, NO predicted edge). Reads trend/momentum/RSI-OB-OS/volume across 1h/4h/1D/1W/1M (confluence vs conflict — e.g. oversold daily but overbought weekly), divergences, volume profile (POC/value-area/HVN-LVN), a transparent two-sided rally/drawdown risk scorecard, options/vol context (reuses `gather_context`), macro proximity, an always-on SPY+VIX backdrop, and an optional `--thesis` confirm/contradict overlay | Console |
 | `modules/features.py` | Shared feature engineering (HV, VIX, earnings, normalize, vol thresholds, IV imputation, P4 drawdown threshold + target, trend-break features) + constants | Imported by direction/volatility/exit/entry/backtest |
 | `modules/benchmarks.py` | Sector benchmarks, macro features, catalyst proximity | Imported by direction/entry/backtest/volatility |
 | `modules/massive.py` | Massive.com API client + `get_chain_summary()` + `get_historical_iv_snapshot()`; exports `IV_COLS`, `IV_FEATURE_COLS`, `IV_META_COLS` | Imported by `indicators.py` (harvest), `backfill_iv.py` (history), and 5 ML scripts (exclude from features) |
 | `modules/econ_calendar.py` | FRED client + `add_macro_event_proximity()` proximity features; display/GUI helpers `next_event_per_series`/`upcoming_events`/`events_in_range`/`coverage_end_per_series`/`refresh_if_stale` (S22/S27). Cache: `data/econ_calendar.csv`. CLI: `--refresh` (weekly) / `--upcoming` | Imported by entry/direction/volatility/exit/backtest/calibrate_multipliers (gated by `--econ-features`, default OFF) + `econ_calendar_view.py` |
-| `modules/sentiment.py` | Band-labelers (IV/HV, skew, term, P/C, IV-regime) + `gather_context()` — per-ticker fear/positioning gauges with trailing percentiles, reusing `compute_hv_features`/`add_vix`/`classify_regime` (S29) | Imported by `market_context.py` (and the future #5 sizing amplifier) |
+| `modules/sentiment.py` | Band-labelers (IV/HV, skew, term, P/C, IV-regime) + `gather_context()` — per-ticker fear/positioning gauges with trailing percentiles, reusing `compute_hv_features`/`add_vix`/`classify_regime` (S29) | Imported by `market_context.py` + `lens.py` |
+| `modules/timeframes.py` | (S34) `build_timeframes()` → per-timeframe OHLCV {1h,4h,1D,1W,1M}: resamples daily (indicators CSV or yfinance fallback) for D/W/M; yfinance 60m (~3yr, cached `data/intraday/`) + 1h→4h resample for intraday | Imported by `lens.py` |
+| `modules/structure.py` | (S34) transparent per-timeframe reads — `read_timeframe` (trend/RSI/Stoch/MACD), `read_volume` (RVOL/up-down/price-volume confirmation), `detect_divergence` (price vs RSI/OBV), `multi_timeframe_summary` (confluence/conflict), `rally_drawdown_risk` (two-sided scorecard). No ML, no prediction | Imported by `lens.py` |
+| `modules/volume_profile.py` | (S34) `volume_profile()` → volume-at-price: POC, value area (70%), HVN/LVN levels + price location | Imported by `lens.py` |
 | `modules/bs_invert.py` | Black-Scholes implied-vol solver (Newton-Raphson + bisection fallback) — used by `backfill_iv.py` | Imported by `modules/massive.py` |
 | `modules/tradier.py` | Tradier API client + `get_atm_iv()`; S30 adds `get_daily_quote()` (post-close OHLCV latch) + `get_daily_history()` (unadjusted daily bars) | Imported by `sizing.py`, `pc_oi.py`, and `indicators.py` (same-day close stamp) |
 | `tests/test_smoke.py` | 14 pytest regression guards (signal hierarchy, STRONG ENTRY baseline, vol thresholds, signal logic, S16 threshold-sensitivity, econ_calendar loads, Days_to_* bounds, days-to-specific-event, regime thresholds/gate/NaN, next_event/upcoming shape, sentiment labelers) | Run manually; requires `data/QQQ_*.csv` |
@@ -165,7 +174,7 @@ All CSVs and PNGs are written to the `data/` subdirectory (must exist — create
 - **Logistic regression only** — intentional for interpretability; black-box models avoided
 - **Time-based train/test split** (not random) — avoids lookahead bias in time series
 - **Price-level features normalized** to ratios/pct_change — ticker-agnostic and scale-invariant
-- **Earnings proximity capped at 90 days** (`min(d,90)` in `add_earnings_proximity`), defaults to neutral (45/90) when earnings data unavailable. **The cap is load-bearing (S31)**: yfinance returns only ~20–25 recent earnings dates, so without it every row older than that horizon gets days-until-the-earliest-known-date — a near-perfect calendar-time ramp (corr −0.99) that manufactured spurious edge on secular-uptrend stocks. The cap pins those rows to the neutral 90 sentinel. (This doc previously *claimed* a cap that did not exist in code until S31.)
+- **`Days_to_earnings` DROPPED FROM ALL MODEL FEATURES (S31)** — excluded in every `train()`/`train_model()` (backtest/entry/direction/volatility/exit); `add_earnings_proximity` still computes it (capped `min(d,90)`) purely for `entry.py`'s "Days to Earnings: Nd" display. History: yfinance returns only ~20–25 recent earnings dates, so older rows got days-until-the-earliest-known-date — a near-perfect calendar-time ramp (NVDA corr −0.999 over 79% of rows) that manufactured spurious edge on secular-uptrend stocks (inflated NVDA/AMD 6mo to ~+33%). The S30 cap killed the ramp but left a residual 90-vs-real era split that still drove suspect live readings. Cross-ticker drop test → safe to remove entirely: no-op on QQQ (ETF), neutral on JPM (72% win preserved), helps AMD, only NVDA (unsuitable) depended on it. So the feature is gone from the models, kept as display-only context.
 - **IV proxied from HV-20** — approximates IV rank/percentile without a paid options feed
 - **Vol-adjusted thresholds** via `compute_vol_thresholds()` — auto-calibrates per ticker:
   - `WIN_THRESHOLD = P2_VOL_MULTIPLE × median_HV × sqrt(15/252)` (Phase 2)
@@ -417,6 +426,17 @@ See `memory/context.md` "Geopolitical Risk Limitation" for proposed mitigations 
   within nearly every walk-forward window) — hygiene, not the smoking gun.
 - **Feature-set leak audit** (corr-vs-calendar-order scan): only the one major leak (earnings);
   everything else clean or excluded. Method retained as the standard new-feature check.
+- **`Days_to_earnings` dropped from all model features** — after the cap, a cross-ticker drop test
+  showed removal is safe (no-op QQQ, neutral JPM, helps AMD, only unsuitable NVDA depended on it).
+  Excluded in all 5 train fns; kept as `entry.py` display only. New earnings-free clean validator
+  trio: QQQ / Ford / JPM (see Ticker Suitability).
+- **JPM / rate-ticker `inf` crash** — `yield_curve_chg_5d` used `pct_change(5)` on the 10Y–3M
+  spread, which crossed exactly 0.0 at the 2007-08-10 curve inversion → `+inf` → `StandardScaler`
+  `ValueError`. Fixed: `diff(5)` (absolute spread change, well-defined through zero) + a defensive
+  `inf→NaN` sweep on macro columns, in both `backtest.py` (inline) and `benchmarks.py:add_macro_features`.
+  Unblocks all 6 rate tickers (JPM/BAC/GS/MS/WFC/C) over 2007; SOFI was immune (post-2021 IPO).
+- **`backtest.py` chart-prompt EOF guard** — `plot_results` `input()` wrapped in `try/except
+  EOFError` so piped runs don't crash before `results.to_csv`.
 
 ## Recently Fixed (S24)
 
@@ -483,7 +503,9 @@ See `memory/context.md` "Geopolitical Risk Limitation" for proposed mitigations 
 - **QQQ**: framework reference baseline AND now the only trustworthy edge; 53 windows (2001–2026); clean hierarchy, leak-free. Clean (S31) STRONG ENTRY 609 / 1.6% / 64.2% at 15d (+0.7pp over all-days), 8.9% / 75.2% at 6mo (+1.8pp). Modest but real and hierarchy-intact.
 - **AMD**: **DOWNGRADED to marginal (S31)**; 91 windows. Clean STRONG ENTRY 562 / 2.0% / 55.7% at 15d (only +0.2pp over all-days; CAUTION edges it), 6mo 18.1% — *below* STAY OUT (19.4%). The documented 383 / 3.4% / 33.9% was the calendar-time leak. Not the signal to trade on clean features.
 - **NVDA**: **DOWNGRADED to UNSUITABLE (S31)**; 53 windows. Clean STRONG ENTRY 417 / −0.8% at 15d (the WORST signal — anti-predictive), 6mo 15.2% — well below STAY OUT (25.7%). The documented 355 / 2.8% / 33.3% was ENTIRELY the leak. ⚠️ All NVDA lore built on the leaked features — the S23/S25 mid-confidence sweet spot, the high-confidence-tail inversion, every "passed the NVDA cross-check" result — is now SUSPECT and needs re-validation on clean features.
-- **SOFI**: marginal — short history (2021 IPO); rate features wired but need more rate-regime variation. Has earnings → re-baseline post-S31 leak fix before trusting any prior number.
+- **Ford (F)**: **CLEAN VALIDATOR (S31)** — cyclical auto, no secular trend (STAY OUT 6mo ≈ 0), so edge can't be drift-fitting. Earnings-free STRONG ENTRY 403 / 4.0% / 58% win at 15d, 25.0% / 48% win at 6mo (+19.3pp vs all-days); hierarchy intact. Survived both the leak fix and the earnings drop. High-magnitude / lower-accuracy (lottery-tailed: big winners, 48% 6mo hit rate). Signals start 2000 (benchmark XLY launched 1998-12 — the binding feature-availability gate; 1972–1998 history is training-only).
+- **JPM**: **CLEAN VALIDATOR (S31), best accuracy** — financial, cyclical (real 2008 drawdown). Earnings-free STRONG ENTRY 566 / 2.6% / 64% win at 15d, 13.4% / 73% win at 6mo (+6.2pp vs all-days); hierarchy intact; broad/flat decile profile (every bucket 63–90% 6mo win → robust, not tail-fragile). Rate ticker (UST10Y/UST3M macro features); required the S31 yield-curve inf fix to backtest over 2007.
+- **SOFI**: marginal — short history (2021 IPO); rate features wired but need more rate-regime variation. Has earnings → already excluded from features post-S31; re-baseline before trusting any prior number.
 - **AAPL**: backfill partial (180 IV rows since 2025-07-24); backtest not yet run.
 - **LYFT**: backfill complete (439 IV rows); backtest not yet run.
 - **CRSP**: unsuitable for direction (binary FDA/trial events dominate); Phase 3 viable for vol plays — consider straddles/strangles around PDUFA dates rather than directional calls. Catalyst feature is automatically neutralized in direction models via `EVENT_DRIVEN_TICKERS = {"CRSP"}`.

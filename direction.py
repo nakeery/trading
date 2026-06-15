@@ -146,7 +146,7 @@ def train_model(df, calibrate=False, decision_threshold=DECISION_THRESHOLD, forw
     # forward_days: embargo width at the train/test boundary. Targets are built with
     # shift(-N) on the full frame, so the last N training rows have labels computed
     # from test-period prices — drop them so no label's forward window crosses the split.
-    exclude = {"Open", "High", "Low", "Close", "Volume", "target", *IV_COLS}
+    exclude = {"Open", "High", "Low", "Close", "Volume", "target", "Days_to_earnings", *IV_COLS}
     feature_cols = [c for c in df.columns if c not in exclude]
 
     df_model = df[feature_cols + ["target"]].dropna()

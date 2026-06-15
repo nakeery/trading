@@ -98,6 +98,15 @@ Current Backtest Baselines
     leak; ETF constant 45): 9.6->8.9% from the 2 new VIX columns perturbing the fit.
   - SUSPECT (built on leaked features, need re-validation): S23/S25 NVDA mid-confidence sweet
     spot + tail inversion; every prior "passed the NVDA cross-check" result; the AMD decile shape.
+  - FOLLOW-ON: Days_to_earnings then DROPPED FROM FEATURES entirely (still leak-free-but-suspect
+    even capped). Final EARNINGS-FREE CLEAN TRIO (2026-06-13):
+      Ticker  STRONG 15d / win   STRONG 6mo / win   6mo vs all-days   Hierarchy
+      QQQ     1.6% / 64%         8.9% / 75%         +1.8pp            INTACT ✓
+      Ford    4.0% / 58%        25.0% / 48%         +19.3pp           INTACT ✓
+      JPM     2.6% / 64%        13.4% / 73%         +6.2pp            INTACT ✓
+    QQQ + Ford + JPM are the trustworthy validation set (index / cyclical auto / financial; none a
+    secular grower). NVDA unsuitable, AMD marginal even earnings-free. JPM/QQQ = high accuracy
+    (73-75% 6mo win); Ford = high magnitude / lower accuracy (48%).
 
 QQQ (53 windows, 2001-2026, post-S18) — framework reference baseline
   P2_VOL_MULTIPLE=0.41, P2B_VOL_MULTIPLE=0.55, P3_VOL_MULTIPLE=0.20
@@ -710,6 +719,55 @@ Tradier Config (modules/tradier.py + sizing.py + pc_oi.py)
 Recent Session Log
 ------------------
 
+S34 (2026-06-14) — REORIENTATION: framework = wide-angle CONTEXT tool, not alpha generator. Built lens.py
+1. PIVOT (resolves the whole session's tension): every test failed the framework as a STANDALONE ALPHA
+   GENERATOR. User reframed — THEY bring the edge (charting, key levels, structure); the framework's role
+   is a wide-angle CONTEXT layer so their narrow read doesn't miss something. This needs ACCURACY +
+   COMPLETENESS, not predictive edge — which the framework CAN do. "State characterization, not prediction."
+2. NEW TOOL lens.py + modules/{timeframes,structure,volume_profile}.py. Multi-timeframe (1h/4h/1D/1W/1M;
+   intraday via yfinance 60m ~3yr cached data/intraday/, 4h resampled from 1h; D/W/M resampled from daily).
+   Sections: multi-TF trend/RSI-OB-OS/volume table with CONFLUENCE vs CONFLICT (the oversold-daily/
+   overbought-weekly blind spot), divergences (price vs RSI/OBV), volume profile (POC/value-area/HVN-LVN),
+   transparent two-sided rally/drawdown RISK SCORECARD (multi-TF + volume + options + profile aware; lists
+   every firing factor), options/vol context (reuses gather_context), macro proximity, always-on SPY+VIX
+   backdrop, optional --thesis bullish/bearish confirm/contradict overlay. NO ML, NO prediction, NO claimed
+   edge. Works for any ticker (yfinance daily fallback if no indicators CSV). 14/14 smoke; existing pipeline
+   untouched (all-new files). Verified QQQ + F render; thesis-check correctly returns 1 confirm / 4 contradict
+   for a bullish-QQQ-at-700 (higher-TF stretched, weekly bearish divergence, volume unconfirmed, extended
+   above value). DEFERRED: --graphical panel; live verification of the RSI-conflict flag (needs a ticker
+   currently in that state).
+
+S33 (2026-06-14) — Cross-sectional + GARCH REWRITE GATES: both negative-to-marginal -> don't rebuild
+1. After the red-team, scoped a cross-sectional rebuild (the real fix for the ~40-independent-bet sample
+   problem) + GARCH vol upgrade, STAGED WITH KILL-GATES so the cheap check precedes the expensive build.
+2. GATE A (cross-sectional IC, modules/{universe,cross_sectional}.py + xs_research.py): 48 liquid mega-caps,
+   standard factors (mom_12_1, reversal, low_vol, mom_20), rank-normalized, IC on NON-OVERLAPPING monthly
+   rebalances. FAIL — best |t|<2 at every horizon (21/63/126/252d); momentum right-sign but t≈1.0, low_vol
+   wrong-sign (beta). Methodology validated (random anchor t≈0). Expected: mega-caps are the efficient slice.
+3. GATE B (GARCH vs naive persistence vol forecast, modules/garch_vol.py + garch_research.py, `arch` pkg):
+   MARGINAL/index-only — GARCH beats naive on QQQ (-15% RMSE), ties JPM, LOSES NVDA. Not a general upgrade.
+   (EGARCH needs simulation forecasting; deferred — GARCH already shows marginal.)
+4. VERDICT: the tractable rewrite directions (simple factors on options-liquid names; GARCH vol) don't show
+   edge worth building. The cheap gates saved weeks. The data has now said the same thing 3 escalating ways:
+   leak fix -> stock edges were artifact; red-team -> small/regime-dependent dip-buyer; gates -> rewrites
+   don't clear the bar. Honest conclusion: edge accessible here (free data, standard methods, liquid names)
+   is marginal at best. This directly motivated the S34 reorientation.
+
+S32 (2026-06-13/14) — Contrarian red-team + options-P&L tradeability test
+1. RED-TEAM (empirical): (a) Ford "validator" is a MIRAGE — top-10% of trades = 102% of return, GFC-
+   concentrated (2008-10), collapses post-2022 (+28%->+3%); QQQ+JPM survive (durable post-2022, not tail-
+   concentrated). (b) Effective sample ~40 independent 6mo bets/ticker, not the ~570 signals. (c) The signal
+   is fundamentally a DIP-BUYER: 68-80% of STRONG ENTRY days follow a negative 20d (vs ~40% base) -> regime-
+   dependent (works in recoveries). (d) ML beats a naive "buy after 3% drop" rule by only +1.6pp (QQQ) /
+   +5pp (JPM). (e) Shared-calendar tickers aren't independent; survivorship; etc.
+2. OPTIONS-P&L OVERLAY (options_pnl.py, BS-modeled since no historical option prices + backfill disallowed;
+   HV-as-IV proxy = generous): STRONG ENTRY net call P&L BEATS all-days + naive-dip baselines robustly
+   (+~20pp/15d, +13-35pp/6mo, survives 10% spread + iv×1.2; median positive). BUT absolute returns are
+   leverage+beta (random calls made +38% 6mo in the bull sample) — the ALPHA is the relative edge. Directional
+   PASS, not validated: 2yr real IV exists only for AMD/NVDA (rejected tickers); QQQ/JPM have ~0 real IV;
+   no single-ticker test clears confidence at ~40 bets. -> only cross-sectional (more names) or the forward
+   ledger can give confidence. Code shipped: options_pnl.py (modeled call-P&L overlay on existing signals).
+
 S31 (2026-06-13) — Days_to_earnings CALENDAR-TIME LEAK found -> NVDA/AMD edge was ~entirely artifact
 1. CONTEXT: implementing two S30-spec'd experiments (P2 confidence band; bear-duration features) +
    user add-on (OHLC readout on indicators.py dashboard + console — shipped, verified).
@@ -749,6 +807,36 @@ S31 (2026-06-13) — Days_to_earnings CALENDAR-TIME LEAK found -> NVDA/AMD edge 
    %); print_signal_summary gains Close+change and full OHLC line. Verified on QQQ render.
 9. OPEN: Candidate 2 (bear-duration, --bear-duration default OFF) coded but A/B deferred — validate
    against clean baselines. Re-baseline SOFI/CRSP if they're used for any cross-check.
+10. Days_to_earnings DROPPED FROM FEATURES FRAMEWORK-WIDE (after cross-ticker drop test). The cap
+    (S30) killed the ramp leak but left a residual 90-vs-real era split that still drove suspicious
+    live readings (F 63d 93.5%). Drop test (exclude from all phases): QQQ no-op (ETF constant); JPM
+    NEUTRAL, 72.4->72.7% win preserved; AMD both up (18.1->19.4% / 58->60% win); Ford avg up but
+    win down (20.1->25.0% / 55->48% — lottery shift); NVDA HURTS (15.2->7.7%) but NVDA is
+    unsuitable/anti-predictive either way. Verdict: droppable — no harm to any tradeable ticker,
+    removes the leak-source feature. Implemented as "Days_to_earnings" in the exclude set of all 5
+    train fns (backtest/entry/direction/volatility/exit); add_earnings_proximity still computes it
+    for entry.py's display ("Days to Earnings: Nd"). 14/14 smoke.
+11. NEW CLEAN VALIDATOR TRIO (earnings-free, S31): QQQ +1.6%/64% 15d, +8.9%/75% 6mo (+1.8pp);
+    Ford +4.0%/58%, +25.0%/48% (+19.3pp); JPM +2.6%/64%, +13.4%/73% (+6.2pp). All STRONG-best at
+    6mo, hierarchy intact, all on non-secular-trend names (STAY OUT ~= 0, so not drift-fitting).
+    Ford + JPM SURVIVED the leak fix AND the earnings drop (NVDA/AMD collapsed) — they are genuine
+    independent validators (cyclical auto + financial), replacing the leak-propped QQQ+NVDA pair.
+    JPM is the high-accuracy name (73% 6mo win, broad/flat decile profile); QQQ high-accuracy too
+    (75%); Ford high-magnitude/lower-accuracy (48% 6mo win, lottery-tailed).
+12. JPM INF BUG fixed (user hit it): yield_curve_chg_5d = (UST10Y-UST3M).pct_change(5) divided by
+    the spread which crossed exactly 0.0 on 2007-08-10 (curve inversion) -> +inf -> StandardScaler
+    ValueError. Fix: diff(5) not pct_change(5) (spread change in pp, well-defined through zero) +
+    defensive inf->NaN sweep on macro cols. Both places (backtest.py inline + benchmarks.py
+    add_macro_features). Unblocks all 6 rate tickers (JPM/BAC/GS/MS/WFC/C) over 2007. SOFI was
+    immune (post-2021 IPO, no 2007 crossing). ^IRX also goes near-zero/negative in ZIRP/2008
+    (UST3M_chg_5d max 24.3) — finite, caught by the sweep if it ever hits inf.
+13. CHART-PROMPT EOF guard: backtest.py plot_results input() wrapped in try/except EOFError so piped
+    runs don't crash before results.to_csv. (Earlier 255s were actually `Select-Object -First N`
+    truncating the pipe and SIGPIPE-killing python before the save — not the chart prompt; both are
+    now harmless.)
+14. probability_deciles JPM (with earnings, pre-drop): broad/flat, every bucket +13..16% 6mo at
+    63-90% win — edge distributed not tail-concentrated (robust), opposite of NVDA's leaked
+    inversion. Confirmed JPM as the accuracy-favorable validator.
 
 S30 (2026-06-11/12) — Train/test audit + soundness readout -> 7 fixes + forward signal ledger
 1. AUDIT (read-only, day 1): full QQQ pipeline run + backtest reproduced the documented baseline
