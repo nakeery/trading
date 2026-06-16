@@ -87,7 +87,7 @@ Run smoke tests:
 | pc_oi.py | 2 (ticker, optional expiry filter — blank = all) |
 | econ_calendar_view.py | 0 (argparse flags only — no prompts) |
 | market_context.py | 1 (ticker) + argparse flags (--graphical / --save-only / --no-vix) |
-| lens.py | 1 (ticker) + argparse flags (--thesis / --level / --no-intraday / --no-vix) |
+| lens.py | 1 (ticker) + argparse flags (--thesis / --level / --no-intraday / --no-vix / --no-color / --candle box\|braille / --prev N) |
 
 ### Running scripts via Claude Code on Windows
 

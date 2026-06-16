@@ -34,6 +34,8 @@ def read_timeframe(ohlcv):
     macd_line, macd_sig = macd.macd(), macd.macd_signal()
 
     price = _safe(c); m20 = _safe(ma20); m50 = _safe(ma50)
+    if price is None:                       # trailing NaN bar (e.g. an unfilled today-row) → skip TF
+        return {"ok": False}
     r = _safe(rsi); st = _safe(stoch)
     ml, ms = _safe(macd_line), _safe(macd_sig)
     slope20 = (m20 - _safe(ma20, -6)) if (m20 and _safe(ma20, -6)) else 0

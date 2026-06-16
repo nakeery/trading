@@ -41,10 +41,201 @@ except Exception:
 
 _ARROW = {"up": "↑ up", "down": "↓ dn", "mixed": "~ mix"}
 _OB = {"overbought": "OB", "oversold": "OS", "neutral": "neut"}
+_GREEN, _RED, _RESET = "\033[32m", "\033[31m", "\033[0m"
 
 
 def _ob(state):
     return _OB.get(state, state)
+
+
+def _enable_windows_ansi():
+    """Flip ENABLE_VIRTUAL_TERMINAL_PROCESSING so Windows consoles interpret ANSI colour codes.
+    No-op on non-Windows or on failure (Windows Terminal / VS Code already enable it)."""
+    if os.name != "nt":
+        return
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.GetStdHandle(-11)                     # STD_OUTPUT_HANDLE
+        mode = ctypes.c_uint()
+        k.GetConsoleMode(h, ctypes.byref(mode))
+        k.SetConsoleMode(h, mode.value | 0x0004)    # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+    except Exception:
+        pass
+
+
+def render_candle(o, h, l, c, prev_close, height=5, color=True):
+    """A small text candlestick for the last bar, TradingView 'hollow' style:
+      colour = green if close >= prev_close else red   (direction vs the PRIOR close)
+      body   = hollow if close >= open else filled █    (close vs THIS bar's open)
+    The two axes are independent. Returns a list of strings (ANSI-wrapped when `color`),
+    High at top -> Low at bottom."""
+    col = (_GREEN if c >= prev_close else _RED) if color else ""
+    rst = _RESET if color else ""
+    hollow = c >= o
+
+    def _wrap(cell):
+        return f"  {col}{cell}{rst}"
+
+    rng = h - l
+    if rng <= 1e-9:                                 # flat bar — nothing to draw
+        return [_wrap("───")]
+
+    body_hi, body_lo = max(o, c), min(o, c)
+    up_span, lo_span = h - body_hi, body_lo - l
+
+    # Segments top→bottom: upper wick, body (always present), lower wick. Each segment that EXISTS is
+    # guaranteed ≥1 row, so a thin body or a small wick never vanishes into a neighbour's band (the
+    # bug on long-wick bars like a hammer). Remaining rows are shared in proportion to price span.
+    segs = []
+    if up_span > 1e-9:
+        segs.append(["up", up_span, 1])
+    segs.append(["body", max(body_hi - body_lo, 0.0), 1])
+    if lo_span > 1e-9:
+        segs.append(["lo", lo_span, 1])
+
+    extra = height - len(segs)
+    if extra > 0:
+        total = sum(s[1] for s in segs) or 1.0
+        quotas = [s[1] / total * extra for s in segs]
+        for s, q in zip(segs, quotas):
+            s[2] += int(q)
+        leftover = extra - sum(int(q) for q in quotas)
+        for i in sorted(range(len(segs)), key=lambda j: quotas[j] - int(quotas[j]),
+                        reverse=True)[:leftover]:
+            segs[i][2] += 1
+
+    rows = []
+    for name, _span, n in segs:
+        if name != "body":
+            rows += [_wrap(" │ ")] * n                          # wick
+        elif not hollow:
+            rows += [_wrap("███")] * n                          # filled body
+        elif n == 1:
+            rows += [_wrap("├─┤")]                              # thin body, single row
+        else:
+            rows += [_wrap("┌─┐")] + [_wrap("│ │")] * (n - 2) + [_wrap("└─┘")]
+    return rows
+
+
+def braille_candle(o, h, l, c, prev_close, hcells=9, color=True):
+    """Higher-resolution last-bar candle drawn with Unicode braille: each cell packs a 2x4 dot grid,
+    giving ~2x horizontal and 4x vertical sub-cell resolution (as sharp as a text stream gets). Same
+    convention as render_candle — colour green/red vs prior close, body hollow/filled vs open. Returns
+    a list of (optionally ANSI-wrapped) strings, High at top -> Low at bottom."""
+    col = (_GREEN if c >= prev_close else _RED) if color else ""
+    rst = _RESET if color else ""
+    if h <= l:                                              # flat bar — degenerate
+        return [f"  {col}{'⠒' * 4}{rst}"]
+
+    w, H = 8, hcells * 4                                    # dot canvas: 8 wide x (4*hcells) tall
+    _DOT = {(0, 0): 0x01, (0, 1): 0x02, (0, 2): 0x04, (0, 3): 0x40,
+            (1, 0): 0x08, (1, 1): 0x10, (1, 2): 0x20, (1, 3): 0x80}
+    cells = {}
+
+    def plot(px, py):
+        if 0 <= px < w and 0 <= py < H:
+            cells[(px // 2, py // 4)] = cells.get((px // 2, py // 4), 0) | _DOT[(px % 2, py % 4)]
+
+    def ypx(price):
+        return round((h - price) / (h - l) * (H - 1))      # high -> 0 (top), low -> H-1 (bottom)
+
+    cl, cr = w // 2 - 1, w // 2                             # centered wick columns
+    bt, bb = ypx(max(o, c)), ypx(min(o, c))                # body top / bottom in dot rows
+    for y in range(ypx(h), bt):                            # upper wick (above body)
+        plot(cl, y); plot(cr, y)
+    for y in range(bb + 1, ypx(l) + 1):                    # lower wick (below body)
+        plot(cl, y); plot(cr, y)
+    hollow = c >= o
+    for y in range(bt, bb + 1):                            # body
+        if hollow and bt != bb and y not in (bt, bb):
+            plot(0, y); plot(w - 1, y)                     # hollow: left/right edges only
+        else:
+            for x in range(w):                            # filled body / top+bottom caps: full width
+                plot(x, y)
+
+    ncx, ncy = (w + 1) // 2, (H + 3) // 4
+    rows = []
+    for cy in range(ncy):
+        glyphs = ''.join(chr(0x2800 + cells.get((cx, cy), 0)) for cx in range(ncx))
+        rows.append(f"  {col}{glyphs}{rst}")
+    return rows
+
+
+_DOTS = {(0, 0): 0x01, (0, 1): 0x02, (0, 2): 0x04, (0, 3): 0x40,
+         (1, 0): 0x08, (1, 1): 0x10, (1, 2): 0x20, (1, 3): 0x80}
+
+
+def render_candles(bars, style="box", color=True, height=7):
+    """Render bars [(o, h, l, c), ...] side by side on a shared, padded price scale so adjacent days
+    are directly comparable (gaps, relative size). Up day (close >= open) = green hollow body, down =
+    red filled. Returns rows top->bottom (high -> low)."""
+    bars = [b for b in bars if all(x is not None for x in b)]
+    if not bars:
+        return []
+    hi, lo = max(b[1] for b in bars), min(b[2] for b in bars)
+    pad = (hi - lo) * 0.10 or 0.5      # headroom so candles at the high/low aren't flush to the edge
+    hi, lo = hi + pad, lo - pad
+    return (_braille_candles(bars, hi, lo, height, color) if style == "braille"
+            else _box_candles(bars, hi, lo, height, color))
+
+
+def _box_candles(bars, hi, lo, height, color):
+    """3 chars per candle on a fixed shared grid: hollow body (up) / █ body (down) + │ wicks."""
+    def row(p):
+        return int(round((hi - p) / (hi - lo) * (height - 1)))
+    out = []
+    for r in range(height):
+        cells = []
+        for (o, h, l, c) in bars:
+            up, bt, bb = c >= o, row(max(o, c)), row(min(o, c))
+            if bt <= r <= bb:
+                cell = "███" if not up else "├─┤" if bt == bb else "┌─┐" if r == bt else "└─┘" if r == bb else "│ │"
+            elif row(h) <= r <= row(l):
+                cell = " │ "
+            else:
+                cell = "   "
+            cells.append(f"{_GREEN if up else _RED}{cell}{_RESET}" if (color and cell.strip()) else cell)
+        out.append("  " + " ".join(cells))
+    return out
+
+
+def _braille_candles(bars, hi, lo, hcells, color):
+    """Braille panel: each candle = 4 dots (2 cells) wide — 2-wide centred wick + 4-wide filled body,
+    1-cell gap — coloured per candle (green up / red down by close-vs-open)."""
+    n, cw, gap = len(bars), 4, 2
+    W, H = n * (cw + gap) - gap, hcells * 4
+    grid = {}
+
+    def plot(px, py):
+        if 0 <= px < W and 0 <= py < H:
+            grid[(px // 2, py // 4)] = grid.get((px // 2, py // 4), 0) | _DOTS[(px % 2, py % 4)]
+
+    def ypx(p):
+        return int(round((hi - p) / (hi - lo) * (H - 1)))
+
+    for k, (o, h, l, c) in enumerate(bars):
+        x0 = k * (cw + gap)
+        for y in range(ypx(h), ypx(l) + 1):                  # wick: centre 2 dot-columns
+            plot(x0 + 1, y); plot(x0 + 2, y)
+        for y in range(ypx(max(o, c)), ypx(min(o, c)) + 1):  # body: all 4 columns
+            for x in range(x0, x0 + cw):
+                plot(x, y)
+
+    blank, stride = chr(0x2800), (cw + gap) // 2
+    out = []
+    for cy in range((H + 3) // 4):
+        line = ""
+        for cx in range((W + 1) // 2):
+            ch = chr(0x2800 + grid.get((cx, cy), 0))
+            k, within = cx // stride, cx % stride
+            if color and ch != blank and within < cw // 2 and k < n:
+                _o, _h, _l, _c = bars[k]
+                line += f"{_GREEN if _c >= _o else _RED}{ch}{_RESET}"
+            else:
+                line += ch
+        out.append("  " + line)
+    return out
 
 
 def analyze(ticker, include_intraday=True, data_dir="data"):
@@ -78,17 +269,48 @@ def _fmt_vol(v):
     return f"{rvol} {v.get('tag', '')}"
 
 
-def print_report(ticker, reads, divs, summary, profile, notes, last_close=None, as_of=None,
-                 ctx=None, backdrop=None, thesis=None, level=None):
+def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as_of=None,
+                 ctx=None, backdrop=None, thesis=None, level=None, color=True, candle_style="box",
+                 panel_bars=None):
     w = 78
     print(f"\n{'═'*w}")
     hdr = f"  LENS — {ticker}"
-    if last_close is not None:
-        hdr += f"   ${last_close:,.2f}"
+    if last_bar is not None:
+        chg = last_bar["close"] - last_bar["prev_close"]
+        chg_pct = (chg / last_bar["prev_close"] * 100) if last_bar["prev_close"] else 0.0
+        arrow = "▲" if chg >= 0 else "▼"
+        hdr += f"   ${last_bar['close']:,.2f}  {arrow} {chg:+.2f} ({chg_pct:+.2f}%)"
     if as_of:
         hdr += f"  (close {as_of})"
     print(f"{hdr}   ·   state characterization, NOT a prediction")
     print(f"{'═'*w}")
+
+    # last-bar OHLC + range
+    if last_bar is not None:
+        o, h, l, c = last_bar["open"], last_bar["high"], last_bar["low"], last_bar["close"]
+        pc = last_bar["prev_close"]
+        rng = h - l
+        rng_pct = (rng / pc * 100) if pc else 0.0
+        print(f"  O ${o:,.2f}   H ${h:,.2f}   L ${l:,.2f}   C ${c:,.2f}    "
+              f"range ${rng:,.2f} ({rng_pct:.2f}%)")
+
+    # candle: today + N previous side by side on a shared scale, or one detailed hollow candle (--prev 0)
+    if panel_bars and len(panel_bars) > 1:
+        for line in render_candles([(b[1], b[2], b[3], b[4]) for b in panel_bars],
+                                   style=candle_style, color=color):
+            print(line)
+        print(f"  {panel_bars[0][0][5:]} (prev) → {panel_bars[-1][0][5:]} (today)"
+              f"   ·   green = up · red = down day")
+    elif last_bar is not None:
+        up, hollow = c >= pc, c >= o
+        candle = (braille_candle(o, h, l, c, pc, color=color) if candle_style == "braille"
+                  else render_candle(o, h, l, c, pc, color=color))
+        legend = (f"   {'green' if up else 'red'} · {'hollow' if hollow else 'filled'} "
+                  f"({'close ≥ open' if hollow else 'close < open'}, "
+                  f"{'up' if up else 'down'} vs prior close)")
+        candle[len(candle) // 2] += legend
+        for line in candle:
+            print(line)
 
     # 1. MARKET BACKDROP
     if backdrop:
@@ -229,8 +451,14 @@ if __name__ == "__main__":
     ap.add_argument("--level", type=float, help="A key level you're watching (annotates the thesis check).")
     ap.add_argument("--no-intraday", action="store_true", help="Skip 1h/4h (offline / fast).")
     ap.add_argument("--no-vix", action="store_true", help="Skip the options/vol + VIX context block.")
+    ap.add_argument("--no-color", action="store_true", help="Disable ANSI colour on the candle (auto-off when piped/redirected).")
+    ap.add_argument("--candle", choices=["box", "braille"], default="box", help="Candle style: box-drawing (default) or higher-res braille.")
+    ap.add_argument("--prev", type=int, default=0, help="Previous candles to show beside today's (default 0 = single detailed candle).")
     ap.add_argument("--data-dir", default="data")
     args = ap.parse_args()
+
+    _enable_windows_ansi()
+    use_color = sys.stdout.isatty() and not args.no_color and os.environ.get("NO_COLOR") is None
 
     if args.ticker:
         tickers = [t.upper() for t in args.ticker]
@@ -264,8 +492,19 @@ if __name__ == "__main__":
         if ctx and ctx.get("regime") and ctx["regime"] != "n/a" and backdrop:
             backdrop = f"{backdrop_base}  |  VIX regime: {ctx['regime']}"
 
-        last_close = float(frames["1D"]["Close"].iloc[-1]) if "1D" in frames else None
-        as_of = frames["1D"].index[-1].date().isoformat() if "1D" in frames else None
+        last_bar, as_of, panel_bars = None, None, None
+        if "1D" in frames:
+            d = frames["1D"]
+            row = d.iloc[-1]
+            prev_close = float(d["Close"].iloc[-2]) if len(d) > 1 else float(row["Open"])
+            last_bar = {"open": float(row["Open"]), "high": float(row["High"]),
+                        "low": float(row["Low"]), "close": float(row["Close"]),
+                        "prev_close": prev_close}
+            as_of = d.index[-1].date().isoformat()
+            tail = d.iloc[-(max(0, args.prev) + 1):]
+            panel_bars = [(idx.date().isoformat(), float(rw["Open"]), float(rw["High"]),
+                           float(rw["Low"]), float(rw["Close"])) for idx, rw in tail.iterrows()]
 
-        print_report(ticker, reads, divs, summary, profile, notes, last_close=last_close, as_of=as_of,
-                     ctx=ctx, backdrop=backdrop, thesis=args.thesis, level=args.level)
+        print_report(ticker, reads, divs, summary, profile, notes, last_bar=last_bar, as_of=as_of,
+                     ctx=ctx, backdrop=backdrop, thesis=args.thesis, level=args.level, color=use_color,
+                     candle_style=args.candle, panel_bars=panel_bars)

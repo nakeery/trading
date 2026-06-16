@@ -41,13 +41,15 @@ def _load_daily(ticker, data_dir):
     if os.path.exists(path):
         df = pd.read_csv(path, index_col=0, parse_dates=True)
         if all(c in df.columns for c in _OHLCV):
-            return df[_OHLCV].sort_index()
+            # drop indicators.py's NaN-OHLCV "today-row" (appended for the IV stamp) so the daily
+            # frame never ends on a NaN bar — that crashed read_timeframe (price=None) for e.g. RIVN
+            return df[_OHLCV].dropna(subset=["Close"]).sort_index()
     raw = yf.download(ticker, period="max", interval="1d", progress=False, auto_adjust=True)
     if raw is None or len(raw) == 0:
         raise FileNotFoundError(f"no indicators CSV and no yfinance daily data for {ticker}")
     if isinstance(raw.columns, pd.MultiIndex):
         raw.columns = raw.columns.get_level_values(0)
-    return raw[_OHLCV].dropna(how="all").sort_index()
+    return raw[_OHLCV].dropna(subset=["Close"]).sort_index()
 
 
 def _load_intraday(ticker, ttl_hours=3):
