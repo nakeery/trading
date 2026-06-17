@@ -432,7 +432,7 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
     # dn-exhaust). Trend = price-vs-MA structural trend (a different read from VolTrend).
     print(f"\n  MULTI-TIMEFRAME  (longest → shortest)")
     print(f"  {'TF':<4}{'Trend':<7}{'RSI':<8}{'Stoch':<6}{'MACD':<8}"
-          f"{'RVOL (20)':<6}{'ΔPrc%':>7}{'ΔVol%':>8}   {'VolTrend':<13}")
+          f"{'RVOL':<6}{'ΔPrc%':>7}{'ΔVol%':>8}   {'VolTrend':<13}")
     # per-column ranges for the heatmap (red = column min, green = max) on ΔPrc% / ΔVol% / RVOL
     def _range(key):
         vals = [x for x in ((reads[tf].get("_vol") or {}).get(key) for tf in reads) if x is not None]
