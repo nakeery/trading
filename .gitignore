@@ -2,3 +2,4 @@ trade/
 data/
 *pycache*
 .claude/
+*.bak

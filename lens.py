@@ -44,6 +44,32 @@ _OB = {"overbought": "OB", "oversold": "OS", "neutral": "neut"}
 _GREEN, _RED, _RESET = "\033[32m", "\033[31m", "\033[0m"
 
 
+def _ramp(t):
+    """t in [0,1] -> 24-bit ANSI fg colour: red (0) → amber (0.5) → green (1), softened for dark bg."""
+    t = 0.0 if t < 0 else 1.0 if t > 1 else t
+    stops = [(216, 60, 52), (214, 186, 46), (94, 196, 94)]   # red · amber · green
+    s = 0 if t < 0.5 else 1
+    u = (t - s * 0.5) / 0.5
+    lo, hi = stops[s], stops[s + 1]
+    rgb = tuple(int(lo[i] + (hi[i] - lo[i]) * u) for i in range(3))
+    return f"\033[38;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
+
+
+def _heat(val, lo, hi):
+    """Per-column heatmap escape: red at the column min, green at the max, amber between. '' if flat."""
+    if val is None or lo is None or hi is None or hi - lo < 1e-12:
+        return ""
+    return _ramp((val - lo) / (hi - lo))
+
+
+def _rsi_tint(rsi):
+    """Absolute RSI tint: oversold (<=30) green, overbought (>=70) red, amber across the neutral band."""
+    if rsi is None:
+        return ""
+    t = (rsi - 30) / 40.0
+    return _ramp(1 - (0.0 if t < 0 else 1.0 if t > 1 else t))
+
+
 def _ob(state):
     return _OB.get(state, state)
 
@@ -238,6 +264,84 @@ def _braille_candles(bars, hi, lo, hcells, color):
     return out
 
 
+def _rle_sixels(seq):
+    """Run-length-encode a list of sixel byte values into a Sixel data string."""
+    out, i, n = [], 0, len(seq)
+    while i < n:
+        j = i
+        while j < n and seq[j] == seq[i]:
+            j += 1
+        run, ch = j - i, chr(seq[i])
+        out.append(f"!{run}{ch}" if run >= 4 else ch * run)
+        i = j
+    return "".join(out)
+
+
+def _to_sixel(grid, palette):
+    """Encode a pixel grid (grid[y][x] = palette index; 0 = transparent) into a Sixel escape string.
+    `palette` maps index -> (r, g, b) with components in 0-100 (Sixel's colour scale)."""
+    H = len(grid)
+    W = len(grid[0]) if H else 0
+    out = ["\x1bP0;1;0q", f'"1;1;{W};{H}']            # DCS (transparent bg) + raster attrs
+    for i in sorted(palette):
+        r, g, b = palette[i]
+        out.append(f"#{i};2;{r};{g};{b}")
+    for band in range(0, H, 6):
+        rows = grid[band:band + 6]
+        present = sorted({c for rr in rows for c in rr if c})
+        for ci, c in enumerate(present):
+            seq = []
+            for x in range(W):
+                bits = 0
+                for k, rr in enumerate(rows):
+                    if rr[x] == c:
+                        bits |= 1 << k
+                seq.append(0x3F + bits)
+            while seq and seq[-1] == 0x3F:           # trailing empties are implied
+                seq.pop()
+            out.append(f"#{c}" + _rle_sixels(seq))
+            if ci != len(present) - 1:
+                out.append("$")                      # CR: overlay next colour on this band
+        if band + 6 < H:
+            out.append("-")                          # next 6-row band
+    out.append("\x1b\\")                             # ST
+    return "".join(out)
+
+
+def sixel_candles(bars, color=True, cell_w=14, gap=8, height_px=128):
+    """Draw bars [(o, h, l, c), ...] as a true-pixel candlestick bitmap -> a Sixel escape string.
+    Shared padded price scale; up day (close >= open) = green hollow, down = red filled."""
+    bars = [b for b in bars if all(x is not None for x in b)]
+    if not bars:
+        return ""
+    hi, lo = max(b[1] for b in bars), min(b[2] for b in bars)
+    pad = (hi - lo) * 0.10 or 0.5                    # headroom so highs/lows aren't flush to the edge
+    hi, lo = hi + pad, lo - pad
+    n = len(bars)
+    W, H = n * cell_w + (n - 1) * gap, max(24, height_px)
+    grid = [[0] * W for _ in range(H)]
+
+    def ypx(p):
+        return int(round((hi - p) / (hi - lo) * (H - 1)))
+
+    for k, (o, h, l, c) in enumerate(bars):
+        ci = 1 if c >= o else 2                       # 1 = green (up), 2 = red (down)
+        x0 = k * (cell_w + gap)
+        wx = x0 + cell_w // 2 - 1                     # left column of the 2px wick
+        yh, yl, yt, yb = ypx(h), ypx(l), ypx(max(o, c)), ypx(min(o, c))
+        up = c >= o
+        for y in range(yh, yt):                       # upper wick (above body)
+            grid[y][wx] = ci; grid[y][wx + 1] = ci
+        for y in range(yb + 1, yl + 1):               # lower wick (below body)
+            grid[y][wx] = ci; grid[y][wx + 1] = ci
+        for y in range(yt, yb + 1):                   # body: hollow (up) outline / filled (down)
+            for x in range(x0, x0 + cell_w):
+                if not up or y < yt + 2 or y > yb - 2 or x < x0 + 2 or x >= x0 + cell_w - 2:
+                    grid[y][x] = ci
+    palette = {1: (20, 75, 40), 2: (85, 25, 30)} if color else {1: (80, 80, 80), 2: (80, 80, 80)}
+    return _to_sixel(grid, palette)
+
+
 def analyze(ticker, include_intraday=True, data_dir="data"):
     frames, notes = build_timeframes(ticker, data_dir=data_dir, include_intraday=include_intraday)
     reads, divs = {}, {}
@@ -271,7 +375,7 @@ def _fmt_vol(v):
 
 def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as_of=None,
                  ctx=None, backdrop=None, thesis=None, level=None, color=True, candle_style="box",
-                 panel_bars=None):
+                 panel_bars=None, candle_px=128):
     w = 78
     print(f"\n{'═'*w}")
     hdr = f"  LENS — {ticker}"
@@ -294,16 +398,23 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         print(f"  O ${o:,.2f}   H ${h:,.2f}   L ${l:,.2f}   C ${c:,.2f}    "
               f"range ${rng:,.2f} ({rng_pct:.2f}%)")
 
-    # candle: today + N previous side by side on a shared scale, or one detailed hollow candle (--prev 0)
-    if panel_bars and len(panel_bars) > 1:
+    # candle: sixel pixel image, or text panel (today + N previous), or one detailed candle (--prev 0)
+    eff_style = "braille" if candle_style == "sixel" else candle_style   # text fallback when sixel off
+    if candle_style == "sixel" and color and panel_bars:
+        ohlc = [(b[1], b[2], b[3], b[4]) for b in panel_bars]
+        sys.stdout.write("\n  " + sixel_candles(ohlc, color=color, height_px=candle_px) + "\n")
+        span = (f"{panel_bars[0][0][5:]} (prev) → {panel_bars[-1][0][5:]} (today)"
+                if len(panel_bars) > 1 else f"{panel_bars[-1][0][5:]} (today)")
+        print(f"  {span}   ·   green = up · red = down day")
+    elif panel_bars and len(panel_bars) > 1:
         for line in render_candles([(b[1], b[2], b[3], b[4]) for b in panel_bars],
-                                   style=candle_style, color=color):
+                                   style=eff_style, color=color):
             print(line)
         print(f"  {panel_bars[0][0][5:]} (prev) → {panel_bars[-1][0][5:]} (today)"
               f"   ·   green = up · red = down day")
     elif last_bar is not None:
         up, hollow = c >= pc, c >= o
-        candle = (braille_candle(o, h, l, c, pc, color=color) if candle_style == "braille"
+        candle = (braille_candle(o, h, l, c, pc, color=color) if eff_style == "braille"
                   else render_candle(o, h, l, c, pc, color=color))
         legend = (f"   {'green' if up else 'red'} · {'hollow' if hollow else 'filled'} "
                   f"({'close ≥ open' if hollow else 'close < open'}, "
@@ -321,7 +432,18 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
     # dn-exhaust). Trend = price-vs-MA structural trend (a different read from VolTrend).
     print(f"\n  MULTI-TIMEFRAME  (longest → shortest)")
     print(f"  {'TF':<4}{'Trend':<7}{'RSI':<8}{'Stoch':<6}{'MACD':<8}"
-          f"{'RVOL':<6}{'ΔPrc%':>7}{'ΔVol%':>8}   {'VolTrend':<13}")
+          f"{'RVOL (20)':<6}{'ΔPrc%':>7}{'ΔVol%':>8}   {'VolTrend':<13}")
+    # per-column ranges for the heatmap (red = column min, green = max) on ΔPrc% / ΔVol% / RVOL
+    def _range(key):
+        vals = [x for x in ((reads[tf].get("_vol") or {}).get(key) for tf in reads) if x is not None]
+        return (min(vals), max(vals)) if vals else (None, None)
+    dp_lo, dp_hi = _range("price_chg_10")
+    dv_lo, dv_hi = _range("vol_trend_10")
+    rv_lo, rv_hi = _range("rvol")
+
+    def _wrap(cell, esc):
+        return f"{esc}{cell}{_RESET}" if (color and esc) else cell
+
     for tf in reads:
         r = reads[tf]
         v = r.get("_vol") or {}
@@ -330,8 +452,12 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         dp = f"{v['price_chg_10']:+.1%}" if v.get("price_chg_10") is not None else "—"
         dv = f"{v['vol_trend_10']:+.1%}" if v.get("vol_trend_10") is not None else "—"
         vt = v.get("tag", "—") if v.get("ok") else "—"
-        print(f"  {tf:<4}{_ARROW.get(r['trend'], '?'):<7}{rsi:<8}{_ob(r['stoch_state']):<6}"
-              f"{r['macd_state']:<8}{rvol:<6}{dp:>7}{dv:>8}   {vt:<13}")
+        rsi_c = _wrap(f"{rsi:<8}", _rsi_tint(r.get("rsi")))
+        rvol_c = _wrap(f"{rvol:<6}", _heat(v.get("rvol"), rv_lo, rv_hi))
+        dp_c = _wrap(f"{dp:>7}", _heat(v.get("price_chg_10"), dp_lo, dp_hi))
+        dv_c = _wrap(f"{dv:>8}", _heat(v.get("vol_trend_10"), dv_lo, dv_hi))
+        print(f"  {tf:<4}{_ARROW.get(r['trend'], '?'):<7}{rsi_c}{_ob(r['stoch_state']):<6}"
+              f"{r['macd_state']:<8}{rvol_c}{dp_c}{dv_c}   {vt:<13}")
     print(f"  → {summary['synthesis']}")
     if summary.get("rsi_conflict"):
         print(f"  ⚠ {summary['rsi_conflict']}")
@@ -452,7 +578,8 @@ if __name__ == "__main__":
     ap.add_argument("--no-intraday", action="store_true", help="Skip 1h/4h (offline / fast).")
     ap.add_argument("--no-vix", action="store_true", help="Skip the options/vol + VIX context block.")
     ap.add_argument("--no-color", action="store_true", help="Disable ANSI colour on the candle (auto-off when piped/redirected).")
-    ap.add_argument("--candle", choices=["box", "braille"], default="box", help="Candle style: box-drawing (default) or higher-res braille.")
+    ap.add_argument("--candle", choices=["box", "braille", "sixel"], default="box", help="Candle style: box (default), braille, or sixel true-pixel image (Sixel-capable terminal only).")
+    ap.add_argument("--candle-px", type=int, default=128, help="Sixel candle pixel height — the resolution knob (default 128; taller = finer).")
     ap.add_argument("--prev", type=int, default=0, help="Previous candles to show beside today's (default 0 = single detailed candle).")
     ap.add_argument("--data-dir", default="data")
     args = ap.parse_args()
@@ -507,4 +634,4 @@ if __name__ == "__main__":
 
         print_report(ticker, reads, divs, summary, profile, notes, last_bar=last_bar, as_of=as_of,
                      ctx=ctx, backdrop=backdrop, thesis=args.thesis, level=args.level, color=use_color,
-                     candle_style=args.candle, panel_bars=panel_bars)
+                     candle_style=args.candle, panel_bars=panel_bars, candle_px=args.candle_px)
