@@ -68,8 +68,16 @@ def read_timeframe(ohlcv):
     }
 
 
-def read_volume(ohlcv):
-    """Volume = trend strength. RVOL, up/down balance, price-volume confirmation/divergence, OBV slope."""
+def read_volume(ohlcv, exclude_last=False):
+    """Volume = trend strength. RVOL, up/down balance, price-volume confirmation/divergence, OBV slope.
+
+    exclude_last: on a resampled timeframe whose latest bar is still forming (an in-progress week or
+    month), that bar holds only a fraction of its eventual volume, so RVOL / ΔVol% read artificially
+    low. When True the VOLUME reads are computed on completed bars only; the live close is still used
+    for price_chg so the ΔPrc% column stays current."""
+    c_live = ohlcv["Close"]                       # live close — keep ΔPrc% on the in-progress bar
+    if exclude_last and len(ohlcv) > 1:
+        ohlcv = ohlcv.iloc[:-1]                    # drop the partial bar for the volume reads
     c, v = ohlcv["Close"], ohlcv["Volume"]
     if len(v.dropna()) < 25 or v.tail(20).sum() == 0:
         return {"ok": False}
@@ -84,7 +92,7 @@ def read_volume(ohlcv):
 
     # price direction vs the TREND in average volume, both over the last ~10 bars (NOT the latest-bar
     # RVOL above). Volume should expand in the direction of the trend; if it doesn't, the move is weak.
-    price_chg = _safe(c) / _safe(c, -11) - 1 if _safe(c, -11) else 0
+    price_chg = _safe(c_live) / _safe(c_live, -11) - 1 if _safe(c_live, -11) else 0
     vol_trend = (_safe(avgvol) / _safe(avgvol, -11) - 1) if _safe(avgvol, -11) else 0
     if price_chg > 0 and vol_trend > 0:
         tag, conf = "up-confirmed", "rising price + rising volume (healthy advance)"

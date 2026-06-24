@@ -23,7 +23,7 @@ import sys
 
 import pandas as pd
 
-from modules.timeframes import build_timeframes
+from modules.timeframes import build_timeframes, last_bar_partial
 from modules.structure import (
     read_timeframe, read_volume, detect_divergence,
     multi_timeframe_summary, rally_drawdown_risk,
@@ -35,6 +35,10 @@ try:
 except Exception:
     gather_context = None
 try:
+    from modules.geocontext import gather_geo_context
+except Exception:
+    gather_geo_context = None
+try:
     from modules.econ_calendar import next_event_per_series, ALL_SERIES
 except Exception:
     next_event_per_series, ALL_SERIES = None, []
@@ -42,6 +46,7 @@ except Exception:
 _ARROW = {"up": "↑ up", "down": "↓ dn", "mixed": "~ mix"}
 _OB = {"overbought": "OB", "oversold": "OS", "neutral": "neut"}
 _GREEN, _RED, _RESET = "\033[32m", "\033[31m", "\033[0m"
+_DIM = "\033[2m"
 
 
 def _ramp(t):
@@ -213,15 +218,15 @@ def _box_candles(bars, hi, lo, height, color):
     out = []
     for r in range(height):
         cells = []
-        for (o, h, l, c) in bars:
-            up, bt, bb = c >= o, row(max(o, c)), row(min(o, c))
+        for (o, h, l, c, pc) in bars:
+            hollow, bt, bb = c >= o, row(max(o, c)), row(min(o, c))
             if bt <= r <= bb:
-                cell = "███" if not up else "├─┤" if bt == bb else "┌─┐" if r == bt else "└─┘" if r == bb else "│ │"
+                cell = "███" if not hollow else "├─┤" if bt == bb else "┌─┐" if r == bt else "└─┘" if r == bb else "│ │"
             elif row(h) <= r <= row(l):
                 cell = " │ "
             else:
                 cell = "   "
-            cells.append(f"{_GREEN if up else _RED}{cell}{_RESET}" if (color and cell.strip()) else cell)
+            cells.append(f"{_GREEN if c >= pc else _RED}{cell}{_RESET}" if (color and cell.strip()) else cell)
         out.append("  " + " ".join(cells))
     return out
 
@@ -240,13 +245,17 @@ def _braille_candles(bars, hi, lo, hcells, color):
     def ypx(p):
         return int(round((hi - p) / (hi - lo) * (H - 1)))
 
-    for k, (o, h, l, c) in enumerate(bars):
+    for k, (o, h, l, c, pc) in enumerate(bars):
         x0 = k * (cw + gap)
         for y in range(ypx(h), ypx(l) + 1):                  # wick: centre 2 dot-columns
             plot(x0 + 1, y); plot(x0 + 2, y)
-        for y in range(ypx(max(o, c)), ypx(min(o, c)) + 1):  # body: all 4 columns
-            for x in range(x0, x0 + cw):
-                plot(x, y)
+        bt, bb, hollow = ypx(max(o, c)), ypx(min(o, c)), c >= o
+        for y in range(bt, bb + 1):                           # body: hollow outline (close>=open) / filled
+            if hollow and bb > bt and y not in (bt, bb):
+                plot(x0, y); plot(x0 + cw - 1, y)
+            else:
+                for x in range(x0, x0 + cw):
+                    plot(x, y)
 
     blank, stride = chr(0x2800), (cw + gap) // 2
     out = []
@@ -256,8 +265,8 @@ def _braille_candles(bars, hi, lo, hcells, color):
             ch = chr(0x2800 + grid.get((cx, cy), 0))
             k, within = cx // stride, cx % stride
             if color and ch != blank and within < cw // 2 and k < n:
-                _o, _h, _l, _c = bars[k]
-                line += f"{_GREEN if _c >= _o else _RED}{ch}{_RESET}"
+                _o, _h, _l, _c, _pc = bars[k]
+                line += f"{_GREEN if _c >= _pc else _RED}{ch}{_RESET}"
             else:
                 line += ch
         out.append("  " + line)
@@ -324,19 +333,19 @@ def sixel_candles(bars, color=True, cell_w=14, gap=8, height_px=128):
     def ypx(p):
         return int(round((hi - p) / (hi - lo) * (H - 1)))
 
-    for k, (o, h, l, c) in enumerate(bars):
-        ci = 1 if c >= o else 2                       # 1 = green (up), 2 = red (down)
+    for k, (o, h, l, c, pc) in enumerate(bars):
+        ci = 1 if c >= pc else 2                       # colour: green = up vs PRIOR close, red = down
         x0 = k * (cell_w + gap)
         wx = x0 + cell_w // 2 - 1                     # left column of the 2px wick
         yh, yl, yt, yb = ypx(h), ypx(l), ypx(max(o, c)), ypx(min(o, c))
-        up = c >= o
+        hollow = c >= o                               # fill: hollow when close >= open (TradingView)
         for y in range(yh, yt):                       # upper wick (above body)
             grid[y][wx] = ci; grid[y][wx + 1] = ci
         for y in range(yb + 1, yl + 1):               # lower wick (below body)
             grid[y][wx] = ci; grid[y][wx + 1] = ci
-        for y in range(yt, yb + 1):                   # body: hollow (up) outline / filled (down)
+        for y in range(yt, yb + 1):                   # body: hollow outline / filled
             for x in range(x0, x0 + cell_w):
-                if not up or y < yt + 2 or y > yb - 2 or x < x0 + 2 or x >= x0 + cell_w - 2:
+                if not hollow or y < yt + 2 or y > yb - 2 or x < x0 + 2 or x >= x0 + cell_w - 2:
                     grid[y][x] = ci
     palette = {1: (20, 75, 40), 2: (85, 25, 30)} if color else {1: (80, 80, 80), 2: (80, 80, 80)}
     return _to_sixel(grid, palette)
@@ -349,7 +358,9 @@ def analyze(ticker, include_intraday=True, data_dir="data"):
         r = read_timeframe(df)
         if not r.get("ok"):
             continue
-        r["_vol"] = read_volume(df)
+        partial = last_bar_partial(frames.get("1D"), tf)
+        r["_vol"] = read_volume(df, exclude_last=partial)
+        r["_partial"] = partial
         reads[tf] = r
         k, why = detect_divergence(df)
         if k:
@@ -375,7 +386,7 @@ def _fmt_vol(v):
 
 def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as_of=None,
                  ctx=None, backdrop=None, thesis=None, level=None, color=True, candle_style="box",
-                 panel_bars=None, candle_px=128):
+                 panel_bars=None, candle_px=128, geo=None):
     w = 78
     print(f"\n{'═'*w}")
     hdr = f"  LENS — {ticker}"
@@ -401,17 +412,17 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
     # candle: sixel pixel image, or text panel (today + N previous), or one detailed candle (--prev 0)
     eff_style = "braille" if candle_style == "sixel" else candle_style   # text fallback when sixel off
     if candle_style == "sixel" and color and panel_bars:
-        ohlc = [(b[1], b[2], b[3], b[4]) for b in panel_bars]
+        ohlc = [(b[1], b[2], b[3], b[4], b[5]) for b in panel_bars]
         sys.stdout.write("\n  " + sixel_candles(ohlc, color=color, height_px=candle_px) + "\n")
         span = (f"{panel_bars[0][0][5:]} (prev) → {panel_bars[-1][0][5:]} (today)"
                 if len(panel_bars) > 1 else f"{panel_bars[-1][0][5:]} (today)")
-        print(f"  {span}   ·   green = up · red = down day")
+        print(f"  {span}   ·   green/red = up/down vs prior close · hollow = close ≥ open")
     elif panel_bars and len(panel_bars) > 1:
-        for line in render_candles([(b[1], b[2], b[3], b[4]) for b in panel_bars],
+        for line in render_candles([(b[1], b[2], b[3], b[4], b[5]) for b in panel_bars],
                                    style=eff_style, color=color):
             print(line)
         print(f"  {panel_bars[0][0][5:]} (prev) → {panel_bars[-1][0][5:]} (today)"
-              f"   ·   green = up · red = down day")
+              f"   ·   green/red = up/down vs prior close · hollow = close ≥ open")
     elif last_bar is not None:
         up, hollow = c >= pc, c >= o
         candle = (braille_candle(o, h, l, c, pc, color=color) if eff_style == "braille"
@@ -427,10 +438,17 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
     if backdrop:
         print(f"  MARKET BACKDROP — {backdrop}")
 
-    # 2. MULTI-TIMEFRAME TABLE.  RVOL = latest bar vs its 20-bar avg.  ΔPrc%/ΔVol% = price move vs
-    # avg-volume trend over the last ~10 bars (these drive VolTrend: up-confirmed/up-WEAK/dn-distrib/
-    # dn-exhaust). Trend = price-vs-MA structural trend (a different read from VolTrend).
+    # 2. MULTI-TIMEFRAME TABLE — column decode is printed at runtime (legend below). Trend = the
+    # price-vs-MA structural trend, a different read from VolTrend (which is ΔPrc% vs ΔVol%).
     print(f"\n  MULTI-TIMEFRAME  (longest → shortest)")
+    dim = _DIM if color else ""
+    rst = _RESET if color else ""
+    print(f"  {dim}RVOL = latest bar vs 20-bar avg (1.0 = normal)  ·  ΔPrc% = price move over last 10 bars{rst}")
+    print(f"  {dim}ΔVol% = 10-bar change in the 20-bar AVG volume (trend, not raw volume)  →  VolTrend{rst}")
+    has_partial = any(reads[tf].get("_partial") for tf in reads)
+    if has_partial:
+        print(f"  {dim}* in-progress bar — RVOL/ΔVol%/VolTrend use the last completed bar "
+              f"(price/RSI/ΔPrc% stay live){rst}")
     print(f"  {'TF':<4}{'Trend':<7}{'RSI':<8}{'Stoch':<6}{'MACD':<8}"
           f"{'RVOL':<6}{'ΔPrc%':>7}{'ΔVol%':>8}   {'VolTrend':<13}")
     # per-column ranges for the heatmap (red = column min, green = max) on ΔPrc% / ΔVol% / RVOL
@@ -456,7 +474,8 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         rvol_c = _wrap(f"{rvol:<6}", _heat(v.get("rvol"), rv_lo, rv_hi))
         dp_c = _wrap(f"{dp:>7}", _heat(v.get("price_chg_10"), dp_lo, dp_hi))
         dv_c = _wrap(f"{dv:>8}", _heat(v.get("vol_trend_10"), dv_lo, dv_hi))
-        print(f"  {tf:<4}{_ARROW.get(r['trend'], '?'):<7}{rsi_c}{_ob(r['stoch_state']):<6}"
+        tf_lbl = f"{tf}*" if r.get("_partial") else tf
+        print(f"  {tf_lbl:<4}{_ARROW.get(r['trend'], '?'):<7}{rsi_c}{_ob(r['stoch_state']):<6}"
               f"{r['macd_state']:<8}{rvol_c}{dp_c}{dv_c}   {vt:<13}")
     print(f"  → {summary['synthesis']}")
     if summary.get("rsi_conflict"):
@@ -510,10 +529,25 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         for g in ctx["gauges"]:
             if g["group"] in ("OPTIONS", "VOL", "MARKET"):
                 val = g["fmt"].format(g["value"])
-                pct = f"  [{int(round(g['pct']*100))}%ile]" if g.get("pct") is not None else ""
+                pct = f"  [{int(round(g['pct']*100))} percentile]" if g.get("pct") is not None else ""
                 lab = f"  {g['label']}" if g.get("label") else ""
                 print(f"    {g['name']:<20}{val:>9}{lab}{pct}")
         print(f"    NET: {ctx['net']}")
+
+    # 6b. GEOPOLITICAL / CROSS-ASSET BACKDROP (--geo; context, not a prediction)
+    if geo and geo.get("gauges"):
+        print(f"\n  GEOPOLITICAL / CROSS-ASSET BACKDROP  (context, not a prediction)")
+        last_grp = None
+        for g in geo["gauges"]:
+            if g["group"] != last_grp:
+                print(f"    {g['group']}:")
+                last_grp = g["group"]
+            tag = f"  {g['label']}" if g.get("label") else ""
+            pct = f"  [{int(round(g['pct']*100))} percentile]" if g.get("pct") is not None else ""
+            print(f"      {g['name']:<18}{g['fmt'].format(g['value']):>9}{tag}{pct}")
+        print(f"    NET: {geo['composite']}")
+        for n in geo.get("notes", []):
+            print(f"      · {n}")
 
     # 7. MACRO
     if next_event_per_series:
@@ -577,10 +611,11 @@ if __name__ == "__main__":
     ap.add_argument("--level", type=float, help="A key level you're watching (annotates the thesis check).")
     ap.add_argument("--no-intraday", action="store_true", help="Skip 1h/4h (offline / fast).")
     ap.add_argument("--no-vix", action="store_true", help="Skip the options/vol + VIX context block.")
+    ap.add_argument("--geo", action="store_true", help="Add a cross-asset / geopolitical stress backdrop (oil/OVX/gold/DXY, credit & rates, geo-sensitive sectors, EPU/GPR). Network; cached ~6h.")
     ap.add_argument("--no-color", action="store_true", help="Disable ANSI colour on the candle (auto-off when piped/redirected).")
-    ap.add_argument("--candle", choices=["box", "braille", "sixel"], default="box", help="Candle style: box (default), braille, or sixel true-pixel image (Sixel-capable terminal only).")
+    ap.add_argument("--candle", choices=["box", "braille", "sixel"], default="sixel", help="Candle style: sixel true-pixel image (default; Sixel-capable terminal only, falls back to braille when piped/--no-color), box, or braille.")
     ap.add_argument("--candle-px", type=int, default=128, help="Sixel candle pixel height — the resolution knob (default 128; taller = finer).")
-    ap.add_argument("--prev", type=int, default=0, help="Previous candles to show beside today's (default 0 = single detailed candle).")
+    ap.add_argument("--prev", type=int, default=10, help="Previous candles to show beside today's (default 10).")
     ap.add_argument("--data-dir", default="data")
     args = ap.parse_args()
 
@@ -619,6 +654,13 @@ if __name__ == "__main__":
         if ctx and ctx.get("regime") and ctx["regime"] != "n/a" and backdrop:
             backdrop = f"{backdrop_base}  |  VIX regime: {ctx['regime']}"
 
+        geo = None
+        if args.geo and gather_geo_context is not None:
+            try:
+                geo = gather_geo_context(data_dir=args.data_dir)
+            except Exception as e:
+                notes.append(f"geopolitical backdrop unavailable ({type(e).__name__}).")
+
         last_bar, as_of, panel_bars = None, None, None
         if "1D" in frames:
             d = frames["1D"]
@@ -629,9 +671,12 @@ if __name__ == "__main__":
                         "prev_close": prev_close}
             as_of = d.index[-1].date().isoformat()
             tail = d.iloc[-(max(0, args.prev) + 1):]
+            pcs = d["Close"].shift(1)                  # prior close per bar → hollow-candle colour
             panel_bars = [(idx.date().isoformat(), float(rw["Open"]), float(rw["High"]),
-                           float(rw["Low"]), float(rw["Close"])) for idx, rw in tail.iterrows()]
+                           float(rw["Low"]), float(rw["Close"]),
+                           float(pcs.loc[idx]) if pd.notna(pcs.loc[idx]) else float(rw["Open"]))
+                          for idx, rw in tail.iterrows()]
 
         print_report(ticker, reads, divs, summary, profile, notes, last_bar=last_bar, as_of=as_of,
                      ctx=ctx, backdrop=backdrop, thesis=args.thesis, level=args.level, color=use_color,
-                     candle_style=args.candle, panel_bars=panel_bars, candle_px=args.candle_px)
+                     candle_style=args.candle, panel_bars=panel_bars, candle_px=args.candle_px, geo=geo)

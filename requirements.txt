@@ -6,3 +6,4 @@ scikit-learn
 lxml
 numpy
 pytest
+xlrd>=2.0.1  # read the GPR .xls (geopolitical-risk index) in modules/geocontext.py

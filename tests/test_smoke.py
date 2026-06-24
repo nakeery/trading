@@ -1,7 +1,7 @@
 """
 Smoke tests for the options trading ML pipeline.
 
-14 regression guards:
+15 regression guards:
   1. Signal hierarchy (backtest CSV) — STRONG ENTRY > CAUTION > STAY OUT by avg return
   2. STRONG ENTRY baseline sanity (backtest CSV) — count/return/win-rate loose bounds
   3. Vol thresholds range (QQQ indicators CSV) — positive values in expected ranges
@@ -17,6 +17,7 @@ Smoke tests for the options trading ML pipeline.
  12. next_event_per_series shape — returned dict has all 9 series, future dates correct
  13. upcoming_events window filter — within_days arg correctly bounds the result set
  14. sentiment labelers — IV/HV, skew, term, P/C, IV-regime bands + percentile_of behavior
+ 15. geocontext helpers — cross-asset stress-tail detection + composite level (offline)
 """
 
 
@@ -490,3 +491,28 @@ def test_sentiment_labels():
     assert percentile_of(pd.Series([1.0, 2.0, 3.0]), 2.0) is None
     # NaN value → None
     assert percentile_of(s, float("nan")) is None
+
+
+# ─── Test 15: geocontext composite + stress (offline) ─────────────────────────
+def test_geocontext_composite_and_stress():
+    """modules/geocontext.py pure helpers: stress-tail detection per direction + the composite
+    level/read from how many gauges fire. No network (the fetch path is not smoke-tested)."""
+    from modules.geocontext import _stressed, _composite
+
+    # stress-tail detection (high = top tail; low = bottom tail)
+    assert _stressed("high", 0.85) is True
+    assert _stressed("high", 0.50) is False
+    assert _stressed("low", 0.10) is True
+    assert _stressed("low", 0.50) is False
+    assert _stressed("high", None) is False        # missing percentile is never "stress"
+
+    # composite level by count of firing gauges
+    assert _composite([{"name": "WTI crude", "stress": False}])[0] == "LOW"
+
+    two = [{"name": "WTI crude", "stress": True}, {"name": "Gold", "stress": True},
+           {"name": "Semis (SOX)", "stress": False}]
+    level2, comp2 = _composite(two)
+    assert level2 == "ELEVATED"
+    assert "WTI crude" in comp2 and "Gold" in comp2
+
+    assert _composite([{"name": f"g{i}", "stress": True} for i in range(4)])[0] == "HIGH"

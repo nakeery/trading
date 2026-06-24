@@ -54,9 +54,11 @@ python econ_calendar_view.py
 # Consolidated market-context surface — fear/positioning gauges + trailing percentiles (S29)
 python market_context.py            # add --graphical for a matplotlib panel + PNG
 
-# Multi-timeframe market-structure & risk LENS (S34) — wide-angle context for chart-based decisions
-python lens.py                      # 1h/4h/D/W/M trend+momentum+volume, vol profile, risk scorecard
+# Multi-timeframe market-structure & risk LENS (S34) — the project's PRIMARY tool now: wide-angle
+# CONTEXT for your own chart-based entries (state characterization, NOT prediction/alpha).
+python lens.py                      # 1h/4h/D/W/M trend+momentum+volume, divergences, vol profile, risk scorecard
 python lens.py --thesis bullish --level 700   # confirm/contradict overlay vs your bias
+python lens.py --geo                # + cross-asset / geopolitical stress backdrop (oil/OVX/gold/DXY, credit, sectors, EPU/GPR)
 ```
 
 Install dependencies:
@@ -70,7 +72,7 @@ Run smoke tests:
 
 ```powershell
 .\trade\Scripts\python.exe -m pytest tests/ -v
-# 14 tests, ~2-3s. Requires data/QQQ_indicators.csv + data/QQQ_backtest_results.csv.
+# 15 tests, ~2-3s. Requires data/QQQ_indicators.csv + data/QQQ_backtest_results.csv.
 ```
 
 ### Prompt counts per script (for piped input via Claude Code)
@@ -87,7 +89,7 @@ Run smoke tests:
 | pc_oi.py | 2 (ticker, optional expiry filter — blank = all) |
 | econ_calendar_view.py | 0 (argparse flags only — no prompts) |
 | market_context.py | 1 (ticker) + argparse flags (--graphical / --save-only / --no-vix) |
-| lens.py | 1 (ticker) + argparse flags (--thesis / --level / --no-intraday / --no-vix / --no-color / --candle box\|braille\|sixel / --candle-px N / --prev N) |
+| lens.py | 1 (ticker; or `--ticker QQQ JPM …` to skip prompt) + argparse flags (--thesis / --level / --geo / --no-intraday / --no-vix / --no-color / --candle box\|braille\|sixel / --candle-px N / --prev N) |
 
 ### Running scripts via Claude Code on Windows
 
@@ -120,18 +122,19 @@ cmd /c "(echo TICKER && echo.) | python -X utf8 script.py" 2>&1
 | `probability_diagnostics.py` | Investigate WHY a probability bucket under/over-performs. Runs 4-hypothesis tests (time clustering, walk-forward window, multi-phase filter, preceding 20d return). (S23) | Console only |
 | `econ_calendar_view.py` | Graphical economic-release calendar (matplotlib popup): month grid of tracked macro releases color-coded by tier, today highlighted; TTL refresh-if-stale + coverage footnotes + PNG export (S27) | `data/econ_calendar.png` + popup window |
 | `market_context.py` | Consolidated fear/positioning surface — IV/HV, 25Δ skew, term structure, P/C OI, HV/IV-rank, VIX complex + regime, each with trailing-1y percentile + net read; console always, optional `--graphical` panel (S29). Human-context (S22), not a feature/signal | Console + optional `data/{ticker}_market_context.png` |
-| `lens.py` | **Multi-timeframe market-structure & risk LENS (S34)** — the framework's reoriented role: wide-angle CONTEXT for the user's own chart-based entries (NOT a signal, NO predicted edge). Reads trend/momentum/RSI-OB-OS/volume across 1h/4h/1D/1W/1M (confluence vs conflict — e.g. oversold daily but overbought weekly), divergences, volume profile (POC/value-area/HVN-LVN), a transparent two-sided rally/drawdown risk scorecard, options/vol context (reuses `gather_context`), macro proximity, an always-on SPY+VIX backdrop, and an optional `--thesis` confirm/contradict overlay | Console |
+| `lens.py` | **PRIMARY TOOL — Multi-timeframe market-structure & risk LENS (S34, hardened S35).** Wide-angle CONTEXT for the user's own chart-based entries (NOT a signal, NO predicted edge). Reads trend/momentum/RSI-OB-OS/volume across 1h/4h/1D/1W/1M (confluence vs conflict — e.g. oversold daily but overbought weekly), divergences, volume profile (POC/value-area/HVN-LVN), a transparent two-sided rally/drawdown risk scorecard, options/vol context (reuses `gather_context`), macro proximity, an always-on SPY+VIX backdrop, an optional `--thesis` confirm/contradict overlay, TradingView-style hollow candles (box/braille/sixel) + a multi-TF column legend, and (S35) an opt-in `--geo` cross-asset/geopolitical stress backdrop | Console |
 | `modules/features.py` | Shared feature engineering (HV, VIX, earnings, normalize, vol thresholds, IV imputation, P4 drawdown threshold + target, trend-break features) + constants | Imported by direction/volatility/exit/entry/backtest |
 | `modules/benchmarks.py` | Sector benchmarks, macro features, catalyst proximity | Imported by direction/entry/backtest/volatility |
 | `modules/massive.py` | Massive.com API client + `get_chain_summary()` + `get_historical_iv_snapshot()`; exports `IV_COLS`, `IV_FEATURE_COLS`, `IV_META_COLS` | Imported by `indicators.py` (harvest), `backfill_iv.py` (history), and 5 ML scripts (exclude from features) |
 | `modules/econ_calendar.py` | FRED client + `add_macro_event_proximity()` proximity features; display/GUI helpers `next_event_per_series`/`upcoming_events`/`events_in_range`/`coverage_end_per_series`/`refresh_if_stale` (S22/S27). Cache: `data/econ_calendar.csv`. CLI: `--refresh` (weekly) / `--upcoming` | Imported by entry/direction/volatility/exit/backtest/calibrate_multipliers (gated by `--econ-features`, default OFF) + `econ_calendar_view.py` |
 | `modules/sentiment.py` | Band-labelers (IV/HV, skew, term, P/C, IV-regime) + `gather_context()` — per-ticker fear/positioning gauges with trailing percentiles, reusing `compute_hv_features`/`add_vix`/`classify_regime` (S29) | Imported by `market_context.py` + `lens.py` |
-| `modules/timeframes.py` | (S34) `build_timeframes()` → per-timeframe OHLCV {1h,4h,1D,1W,1M}: resamples daily (indicators CSV or yfinance fallback) for D/W/M; yfinance 60m (~3yr, cached `data/intraday/`) + 1h→4h resample for intraday | Imported by `lens.py` |
-| `modules/structure.py` | (S34) transparent per-timeframe reads — `read_timeframe` (trend/RSI/Stoch/MACD), `read_volume` (RVOL/up-down/price-volume confirmation), `detect_divergence` (price vs RSI/OBV), `multi_timeframe_summary` (confluence/conflict), `rally_drawdown_risk` (two-sided scorecard). No ML, no prediction | Imported by `lens.py` |
+| `modules/timeframes.py` | (S34) `build_timeframes()` → per-timeframe OHLCV {1h,4h,1D,1W,1M}: resamples daily (indicators CSV or yfinance fallback) for D/W/M; yfinance 60m (~2yr/730d, cached `data/intraday/`) + 1h→4h resample for intraday. (S35) `last_bar_partial()` flags an in-progress (or stale mid-period) W/M bar via source-bar count | Imported by `lens.py` |
+| `modules/structure.py` | (S34) transparent per-timeframe reads — `read_timeframe` (trend/RSI/Stoch/MACD), `read_volume` (RVOL/up-down/price-volume confirmation; S35 `exclude_last` drops an in-progress bar so partial-bar volume doesn't read artificially low), `detect_divergence` (price vs RSI/OBV), `multi_timeframe_summary` (confluence/conflict), `rally_drawdown_risk` (two-sided scorecard). No ML, no prediction | Imported by `lens.py` |
 | `modules/volume_profile.py` | (S34) `volume_profile()` → volume-at-price: POC, value area (70%), HVN/LVN levels + price location | Imported by `lens.py` |
+| `modules/geocontext.py` | **(S35)** `gather_geo_context()` → opt-in cross-asset / geopolitical stress backdrop for `lens.py --geo` (CONTEXT only, never a model feature). Gauges: oil (WTI/Brent/OVX), gold, DXY, HY-OAS credit, MOVE, defense/semis/wheat/natgas, EPU + GPR — each level · trailing-252-obs percentile · stress tag, + a composite read. yfinance (batched) + FRED (reuses `econ_calendar` key) + best-effort GPR `.xls` (needs `xlrd`); reuses `sentiment.percentile_of`; cached `data/geo_cache.json` (~6h TTL); never raises | Imported by `lens.py` |
 | `modules/bs_invert.py` | Black-Scholes implied-vol solver (Newton-Raphson + bisection fallback) — used by `backfill_iv.py` | Imported by `modules/massive.py` |
 | `modules/tradier.py` | Tradier API client + `get_atm_iv()`; S30 adds `get_daily_quote()` (post-close OHLCV latch) + `get_daily_history()` (unadjusted daily bars) | Imported by `sizing.py`, `pc_oi.py`, and `indicators.py` (same-day close stamp) |
-| `tests/test_smoke.py` | 14 pytest regression guards (signal hierarchy, STRONG ENTRY baseline, vol thresholds, signal logic, S16 threshold-sensitivity, econ_calendar loads, Days_to_* bounds, days-to-specific-event, regime thresholds/gate/NaN, next_event/upcoming shape, sentiment labelers) | Run manually; requires `data/QQQ_*.csv` |
+| `tests/test_smoke.py` | 15 pytest regression guards (signal hierarchy, STRONG ENTRY baseline, vol thresholds, signal logic, S16 threshold-sensitivity, econ_calendar loads, Days_to_* bounds, days-to-specific-event, regime thresholds/gate/NaN, next_event/upcoming shape, sentiment labelers, S35 geocontext stress/composite) | Run manually; requires `data/QQQ_*.csv` |
 
 All CSVs and PNGs are written to the `data/` subdirectory (must exist — create manually if missing).
 
@@ -488,7 +491,7 @@ See `memory/context.md` "Geopolitical Risk Limitation" for proposed mitigations 
 
 ## Tech Stack
 
-`yfinance`, `pandas`, `numpy`, `ta`, `matplotlib`, `scikit-learn` (LogisticRegression, StandardScaler, precision_score, CalibratedClassifierCV, brier_score_loss), `lxml` (earnings dates), `requests` (Tradier API via `modules/tradier.py` + Massive API via `modules/massive.py`), `pytest` (smoke tests — dev only, not in requirements.txt)
+`yfinance`, `pandas`, `numpy`, `ta`, `matplotlib`, `scikit-learn` (LogisticRegression, StandardScaler, precision_score, CalibratedClassifierCV, brier_score_loss), `lxml` (earnings dates), `requests` (Tradier via `modules/tradier.py`, Massive via `modules/massive.py`, FRED via `modules/econ_calendar.py` + `modules/geocontext.py`), `xlrd>=2.0.1` (read the GPR `.xls` in `modules/geocontext.py`), `pytest` (smoke tests — dev only)
 
 ## Ticker Suitability Notes
 

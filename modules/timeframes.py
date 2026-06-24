@@ -91,6 +91,27 @@ def build_timeframes(ticker, data_dir=DATA_DIR, include_intraday=True, intraday_
     return {tf: frames[tf] for tf in present}, notes
 
 
+# Rules mirror the resample bins in build_timeframes — used to spot an in-progress final bar.
+_PARTIAL_RULES = {"1W": "W-FRI", "1M": "ME"}
+
+
+def last_bar_partial(daily, tf, frac=0.7):
+    """True when the most recent resampled bar for `tf` is still forming — it holds fewer source
+    (daily) bars than a typical complete period. Counts daily bars per period from the daily frame,
+    so it catches BOTH an in-progress current period AND a dataset that simply ends mid-period (stale
+    data), without relying on the wall clock. Only the D→W/M timeframes can be partial here; intraday
+    and 1D return False (their freshness is handled upstream)."""
+    rule = _PARTIAL_RULES.get(tf)
+    if rule is None or daily is None or len(daily) < 60:
+        return False
+    counts = daily["Close"].resample(rule).count()
+    counts = counts[counts > 0]
+    if len(counts) < 4:
+        return False
+    typical = counts.iloc[:-1].median()
+    return bool(typical and counts.iloc[-1] < frac * typical)
+
+
 if __name__ == "__main__":
     import sys
     t = (sys.argv[1] if len(sys.argv) > 1 else "QQQ").upper()
