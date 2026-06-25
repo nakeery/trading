@@ -60,19 +60,49 @@ def _ramp(t):
     return f"\033[38;2;{rgb[0]};{rgb[1]};{rgb[2]}m"
 
 
-def _heat(val, lo, hi):
-    """Per-column heatmap escape: red at the column min, green at the max, amber between. '' if flat."""
-    if val is None or lo is None or hi is None or hi - lo < 1e-12:
-        return ""
-    return _ramp((val - lo) / (hi - lo))
+# Heatmap dead-zone per column: |value − neutral| within this band is treated as noise and shown
+# UNCOLORED — the single tuning spot for the three heatmap columns. Set an entry to 0.0 to disable.
+HEAT_DEAD = {
+    "rvol":         0.10,   # 0.90x–1.10x ≈ normal volume → uncolored
+    "price_chg_10": 0.01,   # |10-bar price move| < 1% → uncolored
+    "vol_trend_10": 0.05,   # |10-bar volume-trend change| < 5% → uncolored
+}
+
+
+def _heat(val, neutral, half_scale, dead=0.0):
+    """Heatmap escape anchored at `neutral` (amber): above → green, below → red. Values within
+    ±`dead` of neutral — or a column with no spread beyond the band — are flattened to AMBER (the
+    neutral point of the scale), NOT left white. Sign relative to neutral is ABSOLUTE (a value above
+    neutral is never red). Returns '' only when `val` itself is missing (white = no data)."""
+    if val is None:
+        return ""                              # genuinely missing → uncolored (white)
+    d = val - neutral
+    if (half_scale is None or half_scale < 1e-12
+            or (dead > 0.0 and abs(d) <= dead + 1e-9)):  # epsilon → boundary inclusive despite FP
+        return _ramp(0.5)                      # neutral / inside dead-zone / no spread → amber
+    d = d - dead if d > 0 else d + dead          # ramp from the band edge (amber → full)
+    return _ramp(0.5 + 0.5 * d / half_scale)
+
+
+# RSI tint thresholds (absolute 0–100 scale). 50 = neutral (amber); oversold (≤30) → full green,
+# overbought (≥70) → full red. Within ±RSI_DEAD of 50 (the 40–60 neutral zone) reads flat amber —
+# the same dead-zone idea as HEAT_DEAD, sized in RSI points. Tune RSI_DEAD to widen/narrow the band.
+RSI_NEUTRAL = 50.0    # textbook RSI midpoint → amber
+RSI_FULL = 20.0       # ±20 from 50 = the classic 30 / 70 OB–OS lines → full green / red
+RSI_DEAD = 10.0       # ±10 around 50 (40–60) → flat amber (neutral zone); set 0.0 to disable
 
 
 def _rsi_tint(rsi):
-    """Absolute RSI tint: oversold (<=30) green, overbought (>=70) red, amber across the neutral band."""
+    """Absolute RSI tint anchored at 50 (amber): oversold (<50) → green, overbought (>50) → red
+    (contrarian read — a washout is bullish). Within ±RSI_DEAD of 50 (the 40–60 neutral zone) reads
+    flat amber; full green/red by the 30/70 OB–OS lines. Returns '' only when rsi is missing."""
     if rsi is None:
         return ""
-    t = (rsi - 30) / 40.0
-    return _ramp(1 - (0.0 if t < 0 else 1.0 if t > 1 else t))
+    d = rsi - RSI_NEUTRAL
+    if abs(d) <= RSI_DEAD + 1e-9:                       # epsilon → boundary inclusive despite FP
+        return _ramp(0.5)                              # neutral zone → amber
+    d = d - RSI_DEAD if d > 0 else d + RSI_DEAD          # ramp from the band edge
+    return _ramp(0.5 - 0.5 * d / max(RSI_FULL - RSI_DEAD, 1e-9))  # oversold→green, overbought→red
 
 
 def _ob(state):
@@ -451,13 +481,16 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
               f"(price/RSI/ΔPrc% stay live){rst}")
     print(f"  {'TF':<4}{'Trend':<7}{'RSI':<8}{'Stoch':<6}{'MACD':<8}"
           f"{'RVOL':<6}{'ΔPrc%':>7}{'ΔVol%':>8}   {'VolTrend':<13}")
-    # per-column ranges for the heatmap (red = column min, green = max) on ΔPrc% / ΔVol% / RVOL
-    def _range(key):
+    # per-column half-scales for the heatmap, anchored at a fixed neutral (0 for the signed Δ%
+    # columns → +green/−red; 1.0 for RVOL since it is a ratio that is never negative). Measured from
+    # the dead-zone edge (HEAT_DEAD) so the largest beyond-band mover still reaches full saturation.
+    def _half_scale(key, neutral, dead):
         vals = [x for x in ((reads[tf].get("_vol") or {}).get(key) for tf in reads) if x is not None]
-        return (min(vals), max(vals)) if vals else (None, None)
-    dp_lo, dp_hi = _range("price_chg_10")
-    dv_lo, dv_hi = _range("vol_trend_10")
-    rv_lo, rv_hi = _range("rvol")
+        m = max((abs(x - neutral) - dead for x in vals), default=None)
+        return m if (m is not None and m > 1e-12) else None
+    dp_hs = _half_scale("price_chg_10", 0.0, HEAT_DEAD["price_chg_10"])
+    dv_hs = _half_scale("vol_trend_10", 0.0, HEAT_DEAD["vol_trend_10"])
+    rv_hs = _half_scale("rvol", 1.0, HEAT_DEAD["rvol"])
 
     def _wrap(cell, esc):
         return f"{esc}{cell}{_RESET}" if (color and esc) else cell
@@ -471,9 +504,9 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         dv = f"{v['vol_trend_10']:+.1%}" if v.get("vol_trend_10") is not None else "—"
         vt = v.get("tag", "—") if v.get("ok") else "—"
         rsi_c = _wrap(f"{rsi:<8}", _rsi_tint(r.get("rsi")))
-        rvol_c = _wrap(f"{rvol:<6}", _heat(v.get("rvol"), rv_lo, rv_hi))
-        dp_c = _wrap(f"{dp:>7}", _heat(v.get("price_chg_10"), dp_lo, dp_hi))
-        dv_c = _wrap(f"{dv:>8}", _heat(v.get("vol_trend_10"), dv_lo, dv_hi))
+        rvol_c = _wrap(f"{rvol:<6}", _heat(v.get("rvol"), 1.0, rv_hs, HEAT_DEAD["rvol"]))
+        dp_c = _wrap(f"{dp:>7}", _heat(v.get("price_chg_10"), 0.0, dp_hs, HEAT_DEAD["price_chg_10"]))
+        dv_c = _wrap(f"{dv:>8}", _heat(v.get("vol_trend_10"), 0.0, dv_hs, HEAT_DEAD["vol_trend_10"]))
         tf_lbl = f"{tf}*" if r.get("_partial") else tf
         print(f"  {tf_lbl:<4}{_ARROW.get(r['trend'], '?'):<7}{rsi_c}{_ob(r['stoch_state']):<6}"
               f"{r['macd_state']:<8}{rvol_c}{dp_c}{dv_c}   {vt:<13}")
