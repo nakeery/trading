@@ -59,6 +59,12 @@ python market_context.py            # add --graphical for a matplotlib panel + P
 python lens.py                      # 1h/4h/D/W/M trend+momentum+volume, divergences, vol profile, risk scorecard
 python lens.py --thesis bullish --level 700   # confirm/contradict overlay vs your bias
 python lens.py --geo                # + cross-asset / geopolitical stress backdrop (oil/OVX/gold/DXY, credit, sectors, EPU/GPR)
+# Auto-refresh (S36): lens.py is now the daily driver — if a ticker's indicators CSV is missing the
+# latest completed session (weekday past 4 PM ET, else prior weekday; mtime-guarded against holiday
+# re-runs), it transparently runs `indicators.py --ticker SYM --no-chart` first, then renders. Best-
+# effort: a refresh failure prints a one-line note and the lens proceeds on existing data.
+#   --no-refresh  skip the auto-refresh (render whatever is on disk)
+#   --refresh     force a refresh even if current; also builds a missing CSV on demand
 ```
 
 Install dependencies:
@@ -79,7 +85,7 @@ Run smoke tests:
 
 | Script | Prompts |
 |---|---|
-| indicators.py | 3 (ticker, start date, end date) + trailing chart prompt |
+| indicators.py | 3 (ticker, start date, end date) + trailing chart prompt — OR fully non-interactive via `--ticker SYM` (+ optional `--start` / `--end` / `--no-chart` / `--data-dir`), which skips all prompts. `lens.py` uses this for its auto-refresh. |
 | direction.py | 2 (ticker, benchmarks — blank = default) |
 | volatility.py | 1 (ticker) |
 | exit.py | 2 (ticker, benchmarks — blank = default) |
@@ -89,7 +95,7 @@ Run smoke tests:
 | pc_oi.py | 2 (ticker, optional expiry filter — blank = all) |
 | econ_calendar_view.py | 0 (argparse flags only — no prompts) |
 | market_context.py | 1 (ticker) + argparse flags (--graphical / --save-only / --no-vix) |
-| lens.py | 1 (ticker; or `--ticker QQQ JPM …` to skip prompt) + argparse flags (--thesis / --level / --geo / --no-intraday / --no-vix / --no-color / --candle box\|braille\|sixel / --candle-px N / --prev N) |
+| lens.py | 1 (ticker; or `--ticker QQQ JPM …` to skip prompt) + argparse flags (--thesis / --level / --geo / --no-intraday / --no-vix / --no-color / --candle box\|braille\|sixel / --candle-px N / --prev N / --no-refresh / --refresh) |
 
 ### Running scripts via Claude Code on Windows
 

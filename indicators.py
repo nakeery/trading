@@ -17,6 +17,7 @@ Usage:
 """
 
 import sys
+import argparse
 import datetime
 import os
 import yfinance as yf
@@ -467,23 +468,40 @@ def harvest_iv_snapshot(df, ticker, csv_path):
 # MAIN
 # ─────────────────────────────────────────
 if __name__ == "__main__":
-    print("─" * 40)
-    while True:
-        try:
-            ticker_in = input("  Ticker        [XYZ]: ").strip().upper()
-            if ticker_in:
-                break
-            print("  Ticker cannot be empty.")
-        except KeyboardInterrupt:
-            print()
-            sys.exit(0)
-    start_in  = input(f"  Start date   [{START_DATE}]: ").strip()
-    end_in    = input(f"  End date     [{END_DATE}]: ").strip()
-    print("─" * 40)
+    ap = argparse.ArgumentParser(
+        description="Fetch OHLCV + indicators + IV harvest; writes data/{ticker}_indicators.csv.")
+    ap.add_argument("--ticker", help="Ticker symbol (skips the interactive prompts).")
+    ap.add_argument("--start", help=f"Start date YYYY-MM-DD (default {START_DATE}).")
+    ap.add_argument("--end", help="End date YYYY-MM-DD (default today; yfinance end is exclusive).")
+    ap.add_argument("--no-chart", action="store_true",
+                    help="Skip the matplotlib dashboard (no figure / PNG / 'Show chart?' prompt) — for headless / driver use.")
+    ap.add_argument("--data-dir", help=f"Output directory (default {DATA_DIR}).")
+    args = ap.parse_args()
 
-    TICKER     = ticker_in
-    START_DATE = start_in or START_DATE
-    END_DATE   = end_in   or END_DATE
+    if args.ticker:
+        TICKER     = args.ticker.strip().upper()
+        START_DATE = args.start or START_DATE
+        END_DATE   = args.end   or END_DATE
+    else:
+        print("─" * 40)
+        while True:
+            try:
+                ticker_in = input("  Ticker        [XYZ]: ").strip().upper()
+                if ticker_in:
+                    break
+                print("  Ticker cannot be empty.")
+            except KeyboardInterrupt:
+                print()
+                sys.exit(0)
+        start_in  = input(f"  Start date   [{START_DATE}]: ").strip()
+        end_in    = input(f"  End date     [{END_DATE}]: ").strip()
+        print("─" * 40)
+        TICKER     = ticker_in
+        START_DATE = start_in or START_DATE
+        END_DATE   = end_in   or END_DATE
+
+    if args.data_dir:
+        DATA_DIR = args.data_dir
 
     try:
         df = fetch_data(TICKER, START_DATE, END_DATE)
@@ -498,7 +516,8 @@ if __name__ == "__main__":
 
     df = add_indicators(df)
     print_signal_summary(df)
-    plot_dashboard(df)
+    if not args.no_chart:
+        plot_dashboard(df)
 
     csv_path = os.path.join(DATA_DIR, f"{TICKER.lower()}_indicators.csv")
     df = harvest_iv_snapshot(df, TICKER, csv_path)

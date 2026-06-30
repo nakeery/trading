@@ -130,6 +130,11 @@ Operational notes
   stdout from cmd /c subprocesses; PowerShell native `|` prepends a BOM). For lens.py prefer
   `--ticker` to skip the prompt entirely.
 - `data/` must exist. Env vars (add to `$PROFILE`): MASSIVE_API_KEY, FRED_API_KEY, TRADIER_TOKEN.
+- lens.py is now the daily DRIVER (S36): on launch it auto-runs `indicators.py --ticker SYM --no-chart`
+  for any ticker whose CSV is missing the latest completed session (weekday past 4 PM ET, else prior
+  weekday; file-mtime-guarded so market holidays don't re-trigger every run). Best-effort/non-fatal.
+  `--no-refresh` opts out; `--refresh` forces (and builds a missing CSV). indicators.py gained a
+  non-interactive CLI (`--ticker/--start/--end/--no-chart/--data-dir`) to support this.
 - Smoke: `.\trade\Scripts\python.exe -m pytest tests/ -q` (15 tests, offline, ~2s).
 - Harmless: `Select-Object -First N` truncating a lens pipe gives exit 255 (SIGPIPE), not a crash.
 

@@ -19,6 +19,7 @@ Piped (Windows):
 
 import argparse
 import os
+import subprocess
 import sys
 
 import pandas as pd
@@ -637,6 +638,60 @@ def market_backdrop(data_dir="data"):
         return None
 
 
+def _expected_last_session():
+    """Most recent COMPLETED daily session (naive date): today if a weekday past 4 PM ET, else the
+    prior weekday. Holidays are approximated as weekdays — the data source simply returns no bar for
+    them (same convention as augment_recent_prices_from_tradier in indicators.py)."""
+    now_et = pd.Timestamp.now(tz="America/New_York")
+    d = pd.Timestamp(now_et.date())
+    if not (now_et.weekday() < 5 and now_et.hour >= 16):
+        d -= pd.Timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= pd.Timedelta(days=1)
+    return d
+
+
+def _indicators_stale(ticker, data_dir):
+    """True when the indicators CSV exists but is missing the latest completed session AND has not
+    been refreshed since that session closed. Missing CSV -> False (build_timeframes' yfinance
+    fallback handles unknown tickers). Never raises — any error returns False so a freshness-check
+    glitch never blocks the lens."""
+    path = os.path.join(data_dir, f"{ticker.lower()}_indicators.csv")
+    if not os.path.exists(path):
+        return False
+    try:
+        expected = _expected_last_session()
+        df = pd.read_csv(path, index_col=0, parse_dates=True)
+        last = df["Close"].dropna().index.max()              # last REAL bar (skips NaN today-row)
+        if last is not None and pd.Timestamp(last).normalize() >= expected:
+            return False
+        mtime_et = pd.Timestamp(os.path.getmtime(path), unit="s", tz="UTC").tz_convert("America/New_York")
+        session_close = (expected + pd.Timedelta(hours=16)).tz_localize("America/New_York")
+        return mtime_et < session_close                      # holiday guard: don't re-refresh post-close
+    except Exception:
+        return False
+
+
+def _refresh_indicators(ticker, data_dir):
+    """Run indicators.py for `ticker` to rewrite its CSV (quiet, headless). Best-effort: on any
+    failure print a short note and return False so the lens proceeds on whatever data exists."""
+    script = os.path.join(os.path.dirname(os.path.abspath(__file__)), "indicators.py")
+    cmd = [sys.executable, "-X", "utf8", script,
+           "--ticker", ticker, "--no-chart", "--data-dir", data_dir]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace",     # child runs -X utf8; decode UTF-8
+                           cwd=os.path.dirname(script), timeout=600)  # (not the cp1252 locale default)
+        if r.returncode != 0:
+            tail = ((r.stderr or r.stdout or "").strip().splitlines() or [""])[-1]
+            print(f"    refresh failed for {ticker} — using existing data ({tail})")
+            return False
+        return True
+    except Exception as e:
+        print(f"    refresh skipped for {ticker} ({type(e).__name__}) — using existing data")
+        return False
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Multi-timeframe market-structure & risk lens.")
     ap.add_argument("--ticker", nargs="+", help="One or more tickers (skips the prompt; e.g. --ticker QQQ JPM F).")
@@ -650,6 +705,10 @@ if __name__ == "__main__":
     ap.add_argument("--candle-px", type=int, default=128, help="Sixel candle pixel height — the resolution knob (default 128; taller = finer).")
     ap.add_argument("--prev", type=int, default=10, help="Previous candles to show beside today's (default 10).")
     ap.add_argument("--data-dir", default="data")
+    ap.add_argument("--no-refresh", action="store_true",
+                    help="Skip the auto-refresh of stale indicators CSVs (render whatever is on disk).")
+    ap.add_argument("--refresh", action="store_true",
+                    help="Force a data refresh (run indicators.py) even if the CSV looks current; builds a missing CSV too.")
     args = ap.parse_args()
 
     _enable_windows_ansi()
@@ -669,6 +728,9 @@ if __name__ == "__main__":
     backdrop_base = market_backdrop(args.data_dir)   # SPY tide — same for all tickers, computed once
 
     for ticker in tickers:
+        if not args.no_refresh and (args.refresh or _indicators_stale(ticker, args.data_dir)):
+            print(f"  ↻ {ticker}: refreshing indicators data…")
+            _refresh_indicators(ticker, args.data_dir)
         try:
             frames, reads, divs, summary, profile, notes = analyze(
                 ticker, include_intraday=not args.no_intraday, data_dir=args.data_dir)
