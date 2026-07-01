@@ -229,6 +229,50 @@ def add_earnings_proximity(df, ticker):
     return df
 
 
+def next_earnings(ticker, daily=None):
+    """Next scheduled earnings for `ticker` via yfinance + the typical historical earnings move.
+    Returns {date: 'YYYY-MM-DD'|None, days: int|None, hist_move: float|None} or None (ETF / no data).
+    `hist_move` = median |close-to-close| % around the last few past earnings (needs `daily` OHLCV).
+    Best-effort: never raises (mirrors add_earnings_proximity's yfinance access)."""
+    try:
+        dates = yf.Ticker(ticker).get_earnings_dates(limit=16)
+        if dates is None or len(dates) == 0:
+            return None
+        idx = pd.DatetimeIndex(dates.index)
+        if idx.tz is not None:
+            idx = idx.tz_convert(None)
+        ed = sorted(idx.normalize().unique())
+    except Exception:
+        return None
+    if not ed:
+        return None
+
+    today = pd.Timestamp.today().normalize()
+    future = [e for e in ed if e >= today]
+    past   = [e for e in ed if e < today]
+    nxt = future[0] if future else None
+
+    hist = None
+    if daily is not None and "Close" in getattr(daily, "columns", []) and len(past) >= 2:
+        ret = daily["Close"].pct_change()
+        moves = []
+        for e in past[-6:]:
+            try:
+                # the reaction lands on E (before-market report) or E+1 (after-market) — take the
+                # larger of the two 1-day moves so the estimate is robust to BMO/AMC timing.
+                w = ret.loc[e:].iloc[:2]
+                if len(w):
+                    moves.append(float(w.abs().max()))
+            except Exception:
+                continue
+        if moves:
+            hist = float(pd.Series(moves).median())
+
+    if nxt is None:
+        return {"date": None, "days": None, "hist_move": hist}
+    return {"date": nxt.date().isoformat(), "days": int((nxt - today).days), "hist_move": hist}
+
+
 def normalize_features(df):
     """Replace absolute price-level indicators with scale-invariant ratios.
 

@@ -46,7 +46,7 @@ python exit.py
 python backtest.py
 
 # Put/call OI + volume by expiry off the live Tradier chain (positioning vs flow; ad-hoc)
-python pc_oi.py
+python -m modules.pc_oi          # moved into modules/ (S36); also available inside lens.py via --pc-oi
 
 # Graphical economic calendar — popup month grid of tracked macro release dates (S27)
 python econ_calendar_view.py
@@ -59,12 +59,13 @@ python market_context.py            # add --graphical for a matplotlib panel + P
 python lens.py                      # 1h/4h/D/W/M trend+momentum+volume, divergences, vol profile, risk scorecard
 python lens.py --thesis bullish --level 700   # confirm/contradict overlay vs your bias
 python lens.py --geo                # + cross-asset / geopolitical stress backdrop (oil/OVX/gold/DXY, credit, sectors, EPU/GPR)
-# Auto-refresh (S36): lens.py is now the daily driver — if a ticker's indicators CSV is missing the
-# latest completed session (weekday past 4 PM ET, else prior weekday; mtime-guarded against holiday
-# re-runs), it transparently runs `indicators.py --ticker SYM --no-chart` first, then renders. Best-
-# effort: a refresh failure prints a one-line note and the lens proceeds on existing data.
-#   --no-refresh  skip the auto-refresh (render whatever is on disk)
-#   --refresh     force a refresh even if current; also builds a missing CSV on demand
+# Auto-refresh (S36): lens.py is now the daily driver — if a ticker's indicators CSV is absent, OR is
+# missing the latest completed session (weekday past 4 PM ET, else prior weekday; mtime-guarded against
+# holiday re-runs), it transparently runs `indicators.py --ticker SYM --no-chart` first (building the
+# CSV from scratch when absent, S37), then renders. Best-effort: a failure prints a one-line note and
+# the lens proceeds on whatever data exists (yfinance fallback if there's still no CSV).
+#   --no-refresh  skip the auto-refresh/build (render whatever is on disk)
+#   --refresh     force a refresh even if current
 ```
 
 Install dependencies:
@@ -92,10 +93,10 @@ Run smoke tests:
 | entry.py | 2 (ticker, benchmarks — blank = default) |
 | backtest.py | 2 (ticker, benchmarks) + trailing chart prompt |
 | sizing.py | interactive (ticker, budget, strikes) |
-| pc_oi.py | 2 (ticker, optional expiry filter — blank = all) |
+| modules/pc_oi.py | 2 (ticker, optional expiry filter — blank = all); run as `python -m modules.pc_oi`. Also surfaced in `lens.py --pc-oi`. |
 | econ_calendar_view.py | 0 (argparse flags only — no prompts) |
 | market_context.py | 1 (ticker) + argparse flags (--graphical / --save-only / --no-vix) |
-| lens.py | 1 (ticker; or `--ticker QQQ JPM …` to skip prompt) + argparse flags (--thesis / --level / --geo / --no-intraday / --no-vix / --no-color / --candle box\|braille\|sixel / --candle-px N / --prev N / --no-refresh / --refresh) |
+| lens.py | 1 (ticker; or `--ticker QQQ JPM …` to skip prompt) + argparse flags (--thesis / --level / --geo / --no-intraday / --no-vix / --no-color / --candle box\|braille\|sixel / --candle-px N / --prev N / --no-refresh / --refresh / --pc-oi [all\|near\|leaps\|monthly …] / --vol) |
 
 ### Running scripts via Claude Code on Windows
 
@@ -122,13 +123,13 @@ cmd /c "(echo TICKER && echo.) | python -X utf8 script.py" 2>&1
 | `entry.py` | Combines all models → SIGNAL + POSITION SIZING (reads IV from CSV — no live API) | Console + `data/{ticker}_signal_ledger.csv` (S30 forward ledger — one row per as-of date; same-day re-run overwrites that date's row) |
 | `backtest.py` | Walk-forward backtest + 6-month forward return table (53 windows QQQ; 91 AMD; 53 NVDA; 31y SPY; 17 CRSP) | `data/{ticker}_backtest.png`, `data/{ticker}_backtest_results.csv` |
 | `sizing.py` | Live options chain sizing via Tradier API | Console only |
-| `pc_oi.py` | Ad-hoc put/call OI + volume by future expiry off the live Tradier chain (positioning vs flow); optional date filter, LEAPS-tenor flag (S26) | Console only |
+| `modules/pc_oi.py` | Put/call OI + volume by future expiry off the live Tradier chain (positioning vs flow); date filter + DTE/monthly narrowing + LEAPS-tenor flag; **per-(ticker,scope) cache** `data/pc_oi_cache/` (S37) — session-stale (a new market close → re-fetch) since OI only settles once/day; refreshes via an interactive prompt in a terminal, piped runs use the cache + a stale note. **Standalone CLI** (`python -m modules.pc_oi`) **and** imported by `lens.py --pc-oi` (S36) via `gather_pc_oi`/`pc_by_expiry` | Console / lens block |
 | `backfill_iv.py` | Standalone 2-year historical IV backfill via BS-inversion (one-off per ticker) | Updates `data/{ticker}_indicators.csv` in place; checkpointed |
 | `probability_deciles.py` | Bucket STRONG ENTRY signals by Phase 2 probability; reports 15d + 6mo edge per bucket. Pure analysis on existing `data/{ticker}_backtest_results.csv` — no model retrain. (S23) | Console only |
 | `probability_diagnostics.py` | Investigate WHY a probability bucket under/over-performs. Runs 4-hypothesis tests (time clustering, walk-forward window, multi-phase filter, preceding 20d return). (S23) | Console only |
 | `econ_calendar_view.py` | Graphical economic-release calendar (matplotlib popup): month grid of tracked macro releases color-coded by tier, today highlighted; TTL refresh-if-stale + coverage footnotes + PNG export (S27) | `data/econ_calendar.png` + popup window |
 | `market_context.py` | Consolidated fear/positioning surface — IV/HV, 25Δ skew, term structure, P/C OI, HV/IV-rank, VIX complex + regime, each with trailing-1y percentile + net read; console always, optional `--graphical` panel (S29). Human-context (S22), not a feature/signal | Console + optional `data/{ticker}_market_context.png` |
-| `lens.py` | **PRIMARY TOOL — Multi-timeframe market-structure & risk LENS (S34, hardened S35).** Wide-angle CONTEXT for the user's own chart-based entries (NOT a signal, NO predicted edge). Reads trend/momentum/RSI-OB-OS/volume across 1h/4h/1D/1W/1M (confluence vs conflict — e.g. oversold daily but overbought weekly), divergences, volume profile (POC/value-area/HVN-LVN), a transparent two-sided rally/drawdown risk scorecard, options/vol context (reuses `gather_context`), macro proximity, an always-on SPY+VIX backdrop, an optional `--thesis` confirm/contradict overlay, TradingView-style hollow candles (box/braille/sixel) + a multi-TF column legend, and (S35) an opt-in `--geo` cross-asset/geopolitical stress backdrop | Console |
+| `lens.py` | **PRIMARY TOOL — Multi-timeframe market-structure & risk LENS (S34, hardened S35).** Wide-angle CONTEXT for the user's own chart-based entries (NOT a signal, NO predicted edge). Reads trend/momentum/RSI-OB-OS/volume across 1h/4h/1D/1W/1M (confluence vs conflict — e.g. oversold daily but overbought weekly), divergences, volume profile (POC/value-area/HVN-LVN), a transparent two-sided rally/drawdown risk scorecard, options/vol context (reuses `gather_context`), macro proximity, an always-on SPY+VIX backdrop, an optional `--thesis` confirm/contradict overlay, TradingView-style hollow candles (box/braille/sixel) + a multi-TF column legend, and (S35) an opt-in `--geo` cross-asset/geopolitical stress backdrop, plus (S36) an opt-in `--pc-oi` live put/call OI by expiry (Tradier; combinable `near`/`leaps`/`monthly` scope tokens, bare = all), and (S37) an opt-in `--vol` VOLATILITY SETUP block (Bollinger-Keltner squeeze, expected move + breakevens, earnings catalyst, two-sided long-vol-vs-short-vol straddle/strangle scorecard, and a live ATM-straddle + auto-strangle pricer (near-MONTHLY expiry; the strangle auto-widens to ±the expected move (= straddle/spot) so it adapts to each name's vol — CRSP ±11%, NVDA ±6%; per-leg OI + bid/ask) with breakevens + move-needed; `modules/volsetup.py` + `structure.read_squeeze` + `features.next_earnings` + `modules/volquote.py` (Tradier, cached like pc-oi)) | Console |
 | `modules/features.py` | Shared feature engineering (HV, VIX, earnings, normalize, vol thresholds, IV imputation, P4 drawdown threshold + target, trend-break features) + constants | Imported by direction/volatility/exit/entry/backtest |
 | `modules/benchmarks.py` | Sector benchmarks, macro features, catalyst proximity | Imported by direction/entry/backtest/volatility |
 | `modules/massive.py` | Massive.com API client + `get_chain_summary()` + `get_historical_iv_snapshot()`; exports `IV_COLS`, `IV_FEATURE_COLS`, `IV_META_COLS` | Imported by `indicators.py` (harvest), `backfill_iv.py` (history), and 5 ML scripts (exclude from features) |
@@ -139,7 +140,7 @@ cmd /c "(echo TICKER && echo.) | python -X utf8 script.py" 2>&1
 | `modules/volume_profile.py` | (S34) `volume_profile()` → volume-at-price: POC, value area (70%), HVN/LVN levels + price location | Imported by `lens.py` |
 | `modules/geocontext.py` | **(S35)** `gather_geo_context()` → opt-in cross-asset / geopolitical stress backdrop for `lens.py --geo` (CONTEXT only, never a model feature). Gauges: oil (WTI/Brent/OVX), gold, DXY, HY-OAS credit, MOVE, defense/semis/wheat/natgas, EPU + GPR — each level · trailing-252-obs percentile · stress tag, + a composite read. yfinance (batched) + FRED (reuses `econ_calendar` key) + best-effort GPR `.xls` (needs `xlrd`); reuses `sentiment.percentile_of`; cached `data/geo_cache.json` (~6h TTL); never raises | Imported by `lens.py` |
 | `modules/bs_invert.py` | Black-Scholes implied-vol solver (Newton-Raphson + bisection fallback) — used by `backfill_iv.py` | Imported by `modules/massive.py` |
-| `modules/tradier.py` | Tradier API client + `get_atm_iv()`; S30 adds `get_daily_quote()` (post-close OHLCV latch) + `get_daily_history()` (unadjusted daily bars) | Imported by `sizing.py`, `pc_oi.py`, and `indicators.py` (same-day close stamp) |
+| `modules/tradier.py` | Tradier API client + `get_atm_iv()`; S30 adds `get_daily_quote()` (post-close OHLCV latch) + `get_daily_history()` (unadjusted daily bars) | Imported by `sizing.py`, `modules/pc_oi.py`, and `indicators.py` (same-day close stamp) |
 | `tests/test_smoke.py` | 15 pytest regression guards (signal hierarchy, STRONG ENTRY baseline, vol thresholds, signal logic, S16 threshold-sensitivity, econ_calendar loads, Days_to_* bounds, days-to-specific-event, regime thresholds/gate/NaN, next_event/upcoming shape, sentiment labelers, S35 geocontext stress/composite) | Run manually; requires `data/QQQ_*.csv` |
 
 All CSVs and PNGs are written to the `data/` subdirectory (must exist — create manually if missing).

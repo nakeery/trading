@@ -60,7 +60,42 @@ The Lens — what it prints (all CONTEXT, none a prediction)
 
 Modules: `timeframes.py` (per-TF OHLCV; `last_bar_partial`), `structure.py` (reads; `read_volume`
 `exclude_last`; no ML), `volume_profile.py`, `sentiment.py` (`gather_context` + `percentile_of`),
-`geocontext.py` (S35; `--geo`).
+`geocontext.py` (S35; `--geo`), `pc_oi.py` (S36; `gather_pc_oi`/`pc_by_expiry`; `--pc-oi`).
+
+S36 also moved `pc_oi.py` → `modules/pc_oi.py` (one file = library + CLI, run `python -m modules.pc_oi`)
+and added `lens.py --pc-oi [near|leaps|monthly …]` (bare = all; tokens combine, e.g. `--pc-oi leaps monthly`):
+a live Tradier put/call-OI-by-expiry block (opt-in, best-effort, quiet). Bare scope = all expiries; the
+`near`/`leaps`/`monthly` tokens narrow it (and cut the 1-call-per-expiry latency). NB bare `--pc-oi` parses
+to `[]` (falsy) so the lens gate tests `is not None`. Distinct from the OPTIONS gauge's Massive-harvested blended ~30d P/C number.
+NOTE the lens candle code already uses a local `pc` (prior close) — the new param is `pcoi` to avoid the clash.
+
+S37: pc-oi data is now CACHED per (ticker, scope) to `data/pc_oi_cache/{ticker}_{scope}.json` (`gather_pc_oi`).
+Staleness is SESSION-based — stale once a new market close has passed since the cache (`_most_recent_close`
+= last weekday 16:00 ET), because OI settles once/day at the close (volume is the only intraday-changing
+column; a post-close refresh still updates it). On stale: prompts to refresh **only if a TTY** (`sys.stdin.isatty()`);
+piped/`--ticker` runs reuse the cache + a "stale" note (never hang on `input()`). Fresh hit = zero network.
+Standalone caches the blank-filter "all" path; a single-date filter stays a direct live call. Modeled on
+`geocontext.py`'s JSON cache. `gather_pc_oi` now returns `as_of`/`as_of_str`/`age_str`/`stale`/`cached` too.
+
+S37: `lens.py --vol` adds a VOLATILITY SETUP block for straddle/strangle (long-vol) context — descriptive,
+no prediction. Stage A (done): `structure.read_squeeze` (per-TF Bollinger-Keltner squeeze = price-action
+compression), `volsetup.expected_move` (1σ = spot·iv·√(dte/365), vs realized HV move), `features.next_earnings`
+(next date + median |reaction| over E/E+1 of last ~6, robust to BMO/AMC), and `volsetup.vol_setup` — a
+two-sided long-vol-vs-short-vol scorecard (IV/HV, IV-rank as a vol-LEVEL/regime read not a price read,
+squeeze, term, skew, earnings, implied-vs-realized move) mirroring `rally_drawdown_risk`. Pulls IV gauges
+from `gather_context` by name (so `--vol` is best with the vol block, i.e. not `--no-vix`). Stage B (DONE):
+`modules/volquote.straddle_quote` — live options pricer folded into `--vol`, tuned for LIQUIDITY (all three
+liquidity levers): (1) picks the near **MONTHLY** expiry (3rd Friday via `is_monthly_expiry`, falls back to
+closest-to-30d) since OI concentrates there — this alone fixed CRSP (weekly straddle OI 5/29 → monthly 153/749);
+(2) an **"auto" strangle** — wings at ±the EXPECTED MOVE (= ATM straddle price / spot; `EM_MULT` tunes it,
+1.0 = at the exp move), so the width auto-normalizes to each name's vol/DTE (CRSP ±11%, NVDA ±6%), NO delta
+(sidesteps unreliable far-OTM greeks; the earlier fixed ±5/10/15% ladder was replaced by this single auto row
+at the user's request, Webull-style); (3) both legs (straddle + strangle) show **OI + bid/ask** so thin/wide
+strikes are obvious. Key lesson surfaced: liquidity = OI/volume/SPREAD, NOT legs-equal-in-price (that's a
+*balanced* strangle, a different thing). CRSP's OTM puts barely trade (OI ~1, wide) while calls are deep; NVDA
+all deep/tight. Cached per ticker session-stale (`data/pc_oi_cache/{ticker}_straddle4.json`; SCOPEKEY bumped
+`straddle → … → straddle4` as the payload shape evolved: legs, then monthly+ladder, then the auto strangle).
+NB option PRICES move intraday → a cached quote is a snapshot 'as of HH:MM' (TTY refresh like pc-oi).
 
 --geo cross-asset / geopolitical backdrop (S35)
 -----------------------------------------------
@@ -131,10 +166,11 @@ Operational notes
   `--ticker` to skip the prompt entirely.
 - `data/` must exist. Env vars (add to `$PROFILE`): MASSIVE_API_KEY, FRED_API_KEY, TRADIER_TOKEN.
 - lens.py is now the daily DRIVER (S36): on launch it auto-runs `indicators.py --ticker SYM --no-chart`
-  for any ticker whose CSV is missing the latest completed session (weekday past 4 PM ET, else prior
-  weekday; file-mtime-guarded so market holidays don't re-trigger every run). Best-effort/non-fatal.
-  `--no-refresh` opts out; `--refresh` forces (and builds a missing CSV). indicators.py gained a
-  non-interactive CLI (`--ticker/--start/--end/--no-chart/--data-dir`) to support this.
+  for any ticker whose CSV is ABSENT (builds it from scratch, S37) or is missing the latest completed
+  session (weekday past 4 PM ET, else prior weekday; file-mtime-guarded so market holidays don't
+  re-trigger every run). Best-effort/non-fatal — on failure it proceeds on whatever exists (yfinance
+  fallback if still no CSV). `--no-refresh` opts out (skips build+refresh); `--refresh` forces even if
+  current. indicators.py gained a non-interactive CLI (`--ticker/--start/--end/--no-chart/--data-dir`).
 - Smoke: `.\trade\Scripts\python.exe -m pytest tests/ -q` (15 tests, offline, ~2s).
 - Harmless: `Select-Object -First N` truncating a lens pipe gives exit 255 (SIGPIPE), not a crash.
 

@@ -27,7 +27,7 @@ import pandas as pd
 from modules.timeframes import build_timeframes, last_bar_partial
 from modules.structure import (
     read_timeframe, read_volume, detect_divergence,
-    multi_timeframe_summary, rally_drawdown_risk,
+    multi_timeframe_summary, rally_drawdown_risk, read_squeeze,
 )
 from modules.volume_profile import volume_profile
 
@@ -39,6 +39,19 @@ try:
     from modules.geocontext import gather_geo_context
 except Exception:
     gather_geo_context = None
+try:
+    from modules.pc_oi import gather_pc_oi, pc_label, LEAPS_MIN_DTE, LEAPS_MAX_DTE
+except Exception:
+    gather_pc_oi = pc_label = LEAPS_MIN_DTE = LEAPS_MAX_DTE = None
+try:
+    from modules.volsetup import expected_move, vol_setup, gauge_val
+    from modules.features import next_earnings
+except Exception:
+    expected_move = vol_setup = gauge_val = next_earnings = None
+try:
+    from modules.volquote import straddle_quote
+except Exception:
+    straddle_quote = None
 try:
     from modules.econ_calendar import next_event_per_series, ALL_SERIES
 except Exception:
@@ -417,7 +430,7 @@ def _fmt_vol(v):
 
 def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as_of=None,
                  ctx=None, backdrop=None, thesis=None, level=None, color=True, candle_style="box",
-                 panel_bars=None, candle_px=128, geo=None):
+                 panel_bars=None, candle_px=128, geo=None, pcoi=None, vol=None):
     w = 78
     print(f"\n{'═'*w}")
     hdr = f"  LENS — {ticker}"
@@ -568,6 +581,81 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
                 print(f"    {g['name']:<20}{val:>9}{lab}{pct}")
         print(f"    NET: {ctx['net']}")
 
+    # PUT/CALL OI — live Tradier chain, by expiry (--pc-oi; positioning, not a prediction).
+    # Distinct from the OPTIONS "Put/Call OI" gauge above (Massive-harvested ~30d blended snapshot).
+    if pcoi and pcoi.get("rows"):
+        _hdr = f"({pcoi['scope']})"
+        if pcoi.get("as_of_str"):
+            _hdr += f" · as of {pcoi['as_of_str']}" + ("  (stale)" if pcoi.get("stale") else "")
+        print(f"\n  PUT/CALL OI — live Tradier chain, by expiry  {_hdr}")
+        print(f"    {'Expiry':>10}  {'DTE':>4}  {'P/C OI':>6}  {'P/C Vol':>7}   Positioning")
+        for r in pcoi["rows"]:
+            pco = f"{r['pc']:.2f}"     if r["pc"]     is not None else "n/a"
+            pcv = f"{r['pc_vol']:.2f}" if r["pc_vol"] is not None else "n/a"
+            leaps = " *" if LEAPS_MIN_DTE <= r["dte"] <= LEAPS_MAX_DTE else ""
+            print(f"    {r['expiry']:>10}  {r['dte']:>4}  {pco:>6}  {pcv:>7}   {pc_label(r['pc'])}{leaps}")
+        if len(pcoi["rows"]) > 1:
+            t = pcoi["total"]
+            tpc  = f"{t['pc']:.2f}"     if t["pc"]     is not None else "n/a"
+            tpcv = f"{t['pc_vol']:.2f}" if t["pc_vol"] is not None else "n/a"
+            print(f"    {'TOTAL':>10}  {'':>4}  {tpc:>6}  {tpcv:>7}   {pc_label(t['pc'])}  ({pcoi['scope']})")
+        print(f"    P/C OI = put OI / call OI (positioning) · P/C Vol = latest-session flow · * = LEAPS tenor")
+
+    # VOLATILITY SETUP — long-vol (straddle/strangle) context (--vol; descriptive, not a prediction).
+    if vol and vol.get("setup"):
+        s = vol["setup"]; em = vol.get("em"); eg = vol.get("earnings"); sq = vol.get("squeeze") or {}
+        print(f"\n  VOLATILITY SETUP — straddle/strangle context  (not a prediction)")
+        on = [tf for tf in ("1M", "1W", "1D", "4h", "1h") if sq.get(tf, {}).get("squeeze_on")]
+        print(f"    compression: squeeze ON on {', '.join(on)}" if on
+              else "    compression: no active squeeze")
+        if em:
+            line = (f"    expected move (~{em['dte']}d): ±{em['pct']:.1%}  "
+                    f"(±${em['dollars']:.2f} → {em['lo']:.2f} / {em['hi']:.2f})")
+            if em.get("hv_pct"):
+                line += f"   vs realized ±{em['hv_pct']:.1%}"
+            print(line)
+        if eg and eg.get("date"):
+            hm = f", typ. ±{eg['hist_move']:.1%}" if eg.get("hist_move") else ""
+            print(f"    earnings: {eg['date']} ({eg['days']}d{hm})")
+        print(f"    NET: {s['net']}")
+        if s["long_vol"]:
+            print(f"    favors BUYING vol (straddle/strangle):")
+            for f in s["long_vol"]:
+                print(f"      • {f}")
+        if s["short_vol"]:
+            print(f"    favors SELLING premium:")
+            for f in s["short_vol"]:
+                print(f"      • {f}")
+        print(f"    {s['hint']}")
+        q = vol.get("quote")
+        if q and q.get("straddle"):
+            stq = q["straddle"]; sg = q.get("strangle")
+            tag = "  (stale)" if q.get("stale") else ""
+            kind = q.get("expiry_kind", "")
+            print(f"    live quote — exp {q['expiry']} ({kind + ', ' if kind else ''}{q['dte']}d), "
+                  f"spot {q['spot']:.2f}, as of {q['as_of_str']}{tag}:")
+
+            def _legln(cb):
+                lg = cb.get("legs")
+                if not lg:
+                    return None
+                def one(o, cp):
+                    oi = f"{int(o['oi']):,}" if o.get("oi") is not None else "—"
+                    return f"{o['strike']:g}{cp}  OI {oi}  bid/ask {o['bid']:.2f}/{o['ask']:.2f}"
+                return f"          {one(lg['put'], 'p')}   ·   {one(lg['call'], 'c')}"
+
+            print(f"      ATM straddle  {stq['call_strike']:g}: ${stq['cost']:.2f}/sh  "
+                  f"BE {stq['lo']:.2f} / {stq['hi']:.2f}  (need −{stq['dn_move']:.1%} / +{stq['up_move']:.1%})")
+            sl = _legln(stq)
+            if sl:
+                print(sl)
+            if sg:
+                print(f"      auto strangle (±{sg['width']:.0%} exp-move)  {sg['put_strike']:g} / {sg['call_strike']:g}: "
+                      f"${sg['cost']:.2f}/sh  BE {sg['lo']:.2f} / {sg['hi']:.2f}  (need −{sg['dn_move']:.1%} / +{sg['up_move']:.1%})")
+                gl = _legln(sg)
+                if gl:
+                    print(gl)
+
     # 6b. GEOPOLITICAL / CROSS-ASSET BACKDROP (--geo; context, not a prediction)
     if geo and geo.get("gauges"):
         print(f"\n  GEOPOLITICAL / CROSS-ASSET BACKDROP  (context, not a prediction)")
@@ -709,6 +797,13 @@ if __name__ == "__main__":
                     help="Skip the auto-refresh of stale indicators CSVs (render whatever is on disk).")
     ap.add_argument("--refresh", action="store_true",
                     help="Force a data refresh (run indicators.py) even if the CSV looks current; builds a missing CSV too.")
+    ap.add_argument("--pc-oi", nargs="*", choices=["all", "near", "leaps", "monthly"],
+                    help="Add a live Tradier put/call OI block by expiry. Bare = all expiries; combine any of "
+                         "near (≤45 DTE) / leaps (180–365 DTE) / monthly (3rd-Friday only), e.g. `--pc-oi leaps monthly`. "
+                         "Network; needs TRADIER_TOKEN.")
+    ap.add_argument("--vol", action="store_true",
+                    help="Add a VOLATILITY SETUP block — Bollinger-Keltner squeeze, expected move + breakevens, "
+                         "earnings catalyst, and a two-sided long-vol (straddle/strangle) vs short-vol scorecard.")
     args = ap.parse_args()
 
     _enable_windows_ansi()
@@ -728,9 +823,12 @@ if __name__ == "__main__":
     backdrop_base = market_backdrop(args.data_dir)   # SPY tide — same for all tickers, computed once
 
     for ticker in tickers:
-        if not args.no_refresh and (args.refresh or _indicators_stale(ticker, args.data_dir)):
-            print(f"  ↻ {ticker}: refreshing indicators data…")
-            _refresh_indicators(ticker, args.data_dir)
+        if not args.no_refresh:
+            csv_missing = not os.path.exists(
+                os.path.join(args.data_dir, f"{ticker.lower()}_indicators.csv"))
+            if args.refresh or csv_missing or _indicators_stale(ticker, args.data_dir):
+                print(f"  ↻ {ticker}: {'building' if csv_missing else 'refreshing'} indicators data…")
+                _refresh_indicators(ticker, args.data_dir)
         try:
             frames, reads, divs, summary, profile, notes = analyze(
                 ticker, include_intraday=not args.no_intraday, data_dir=args.data_dir)
@@ -756,6 +854,37 @@ if __name__ == "__main__":
             except Exception as e:
                 notes.append(f"geopolitical backdrop unavailable ({type(e).__name__}).")
 
+        pc = None
+        if args.pc_oi is not None and gather_pc_oi is not None:   # [] (bare = all) is falsy → test is-not-None
+            toks = set(args.pc_oi)
+            monthly = "monthly" in toks
+            tenor = "near" if "near" in toks else "leaps" if "leaps" in toks else "all"
+            try:
+                pc = gather_pc_oi(ticker, preset=tenor, monthly=monthly,
+                                  interactive=sys.stdin.isatty(), data_dir=args.data_dir)
+            except Exception as e:
+                notes.append(f"put/call OI unavailable ({type(e).__name__}).")
+            else:
+                if pc is None:
+                    notes.append("put/call OI unavailable (no Tradier token or no chain data).")
+                elif pc.get("cached") and pc.get("stale"):
+                    notes.append(f"put/call OI cached {pc['age_str']} and stale — run in a terminal to refresh.")
+
+        vol = None
+        if args.vol and vol_setup is not None:
+            try:
+                spot = float(frames["1D"]["Close"].iloc[-1]) if "1D" in frames else None
+                squeeze = {tf: read_squeeze(frames[tf]) for tf in frames}
+                em = expected_move(spot, gauge_val(ctx, "ATM IV (30d)"), dte=30,
+                                   hv=gauge_val(ctx, "HV-20 (annualized)"))
+                earn = next_earnings(ticker, daily=frames.get("1D")) if next_earnings else None
+                vol = {"squeeze": squeeze, "em": em, "earnings": earn,
+                       "setup": vol_setup(reads, squeeze, ctx, earnings=earn, em=em),
+                       "quote": (straddle_quote(ticker, interactive=sys.stdin.isatty(),
+                                                data_dir=args.data_dir) if straddle_quote else None)}
+            except Exception as e:
+                notes.append(f"vol setup unavailable ({type(e).__name__}).")
+
         last_bar, as_of, panel_bars = None, None, None
         if "1D" in frames:
             d = frames["1D"]
@@ -774,4 +903,4 @@ if __name__ == "__main__":
 
         print_report(ticker, reads, divs, summary, profile, notes, last_bar=last_bar, as_of=as_of,
                      ctx=ctx, backdrop=backdrop, thesis=args.thesis, level=args.level, color=use_color,
-                     candle_style=args.candle, panel_bars=panel_bars, candle_px=args.candle_px, geo=geo)
+                     candle_style=args.candle, panel_bars=panel_bars, candle_px=args.candle_px, geo=geo, pcoi=pc, vol=vol)

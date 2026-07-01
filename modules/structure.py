@@ -68,6 +68,30 @@ def read_timeframe(ohlcv):
     }
 
 
+def read_squeeze(ohlcv, window=20, kc_mult=1.5, lookback=126):
+    """Bollinger–Keltner squeeze (volatility COMPRESSION) for ONE timeframe — the classic 'coiled,
+    expansion-prone' state behind long-straddle timing. `squeeze_on` = the Bollinger(window, 2σ) band
+    sits INSIDE the Keltner(window, kc_mult×ATR) channel. `bb_width_pctile` = where the current
+    Bollinger width sits in its trailing `lookback` window (0 = tightest → most compressed). The
+    price-action complement to IV/HV-rank compression. Descriptive — no prediction."""
+    c, h, l = ohlcv["Close"], ohlcv["High"], ohlcv["Low"]
+    if len(c.dropna()) < window + 5:
+        return {"ok": False}
+    bb = ta.volatility.BollingerBands(c, window=window, window_dev=2)
+    kc = ta.volatility.KeltnerChannel(h, l, c, window=window, window_atr=window, multiplier=kc_mult)
+    bbh, bbl = bb.bollinger_hband(), bb.bollinger_lband()
+    kch, kcl = kc.keltner_channel_hband(), kc.keltner_channel_lband()
+    bbh0, bbl0, kch0, kcl0 = _safe(bbh), _safe(bbl), _safe(kch), _safe(kcl)
+    if None in (bbh0, bbl0, kch0, kcl0):
+        return {"ok": False}
+    squeeze_on = bbh0 < kch0 and bbl0 > kcl0          # BB inside KC → compressed
+    width = ((bbh - bbl) / c).dropna()
+    w0 = _safe(width)
+    win = width.iloc[-min(len(width), lookback):]
+    pctile = float((win < w0).mean()) if (w0 is not None and len(win)) else None
+    return {"ok": True, "squeeze_on": bool(squeeze_on), "bb_width": w0, "bb_width_pctile": pctile}
+
+
 def read_volume(ohlcv, exclude_last=False):
     """Volume = trend strength. RVOL, up/down balance, price-volume confirmation/divergence, OBV slope.
 
