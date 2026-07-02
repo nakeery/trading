@@ -53,6 +53,10 @@ try:
 except Exception:
     straddle_quote = None
 try:
+    from modules.vol_history import pre_earnings_vol_study
+except Exception:
+    pre_earnings_vol_study = None
+try:
     from modules.econ_calendar import next_event_per_series, ALL_SERIES
 except Exception:
     next_event_per_series, ALL_SERIES = None, []
@@ -617,6 +621,11 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         if eg and eg.get("date"):
             hm = f", typ. ±{eg['hist_move']:.1%}" if eg.get("hist_move") else ""
             print(f"    earnings: {eg['date']} ({eg['days']}d{hm})")
+        hist = vol.get("history")
+        if hist and hist.get("status") == "ok":
+            print(f"    history ({hist['usable']} earnings): {hist['summary']}")
+        elif hist and hist.get("status") == "insufficient_iv":
+            print(f"    history: IV history thin — run `backfill_iv.py` ({hist['ticker']})")
         print(f"    NET: {s['net']}")
         if s["long_vol"]:
             print(f"    favors BUYING vol (straddle/strangle):")
@@ -628,12 +637,13 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
                 print(f"      • {f}")
         print(f"    {s['hint']}")
         q = vol.get("quote")
-        if q and q.get("straddle"):
-            stq = q["straddle"]; sg = q.get("strangle")
+        if q and q.get("quotes"):
             tag = "  (stale)" if q.get("stale") else ""
-            kind = q.get("expiry_kind", "")
-            print(f"    live quote — exp {q['expiry']} ({kind + ', ' if kind else ''}{q['dte']}d), "
-                  f"spot {q['spot']:.2f}, as of {q['as_of_str']}{tag}:")
+            print(f"    live quote — spot {q['spot']:.2f}, as of {q['as_of_str']}{tag}:")
+            for note in q.get("notes", []):
+                print(f"      · {note}")
+            if len(q["quotes"]) > 1:
+                print("      two vehicles — nearest post-earnings (steepest ramp) vs nearest monthly (more liquid):")
 
             def _legln(cb):
                 lg = cb.get("legs")
@@ -644,17 +654,29 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
                     return f"{o['strike']:g}{cp}  OI {oi}  bid/ask {o['bid']:.2f}/{o['ask']:.2f}"
                 return f"          {one(lg['put'], 'p')}   ·   {one(lg['call'], 'c')}"
 
-            print(f"      ATM straddle  {stq['call_strike']:g}: ${stq['cost']:.2f}/sh  "
-                  f"BE {stq['lo']:.2f} / {stq['hi']:.2f}  (need −{stq['dn_move']:.1%} / +{stq['up_move']:.1%})")
-            sl = _legln(stq)
-            if sl:
-                print(sl)
-            if sg:
-                print(f"      auto strangle (±{sg['width']:.0%} exp-move)  {sg['put_strike']:g} / {sg['call_strike']:g}: "
-                      f"${sg['cost']:.2f}/sh  BE {sg['lo']:.2f} / {sg['hi']:.2f}  (need −{sg['dn_move']:.1%} / +{sg['up_move']:.1%})")
-                gl = _legln(sg)
-                if gl:
-                    print(gl)
+            for blk in q["quotes"]:
+                kind = blk.get("expiry_kind", "")
+                dae = blk.get("days_after_earn")
+                after = f"; {dae}d after earnings" if dae is not None else ""
+                print(f"      exp {blk['expiry']} ({kind + ', ' if kind else ''}{blk['dte']}d{after}):")
+                stq = blk.get("straddle"); sg = blk.get("strangle")
+                if stq:
+                    print(f"        ATM straddle  {stq['call_strike']:g}: ${stq['cost']:.2f}/sh  "
+                          f"BE {stq['lo']:.2f} / {stq['hi']:.2f}  (need −{stq['dn_move']:.1%} / +{stq['up_move']:.1%})")
+                    sl = _legln(stq)
+                    if sl:
+                        print(sl)
+                if sg:
+                    tw = sg.get("target_width")
+                    drift = (f", target ±{tw:.0%}"
+                             if tw is not None and round(tw * 100) != round(sg["width"] * 100) else "")
+                    print(f"        auto strangle (≈±{sg['width']:.0%}{drift})  {sg['put_strike']:g} / {sg['call_strike']:g}: "
+                          f"${sg['cost']:.2f}/sh  BE {sg['lo']:.2f} / {sg['hi']:.2f}  (need −{sg['dn_move']:.1%} / +{sg['up_move']:.1%})")
+                    gl = _legln(sg)
+                    if gl:
+                        print(gl)
+            print("      vega: straddle = max vega (enter close to the print); "
+                  "strangle = cheaper + lower theta (enter earlier / run more names / vega convexity)")
 
     # 6b. GEOPOLITICAL / CROSS-ASSET BACKDROP (--geo; context, not a prediction)
     if geo and geo.get("gauges"):
@@ -880,8 +902,12 @@ if __name__ == "__main__":
                 earn = next_earnings(ticker, daily=frames.get("1D")) if next_earnings else None
                 vol = {"squeeze": squeeze, "em": em, "earnings": earn,
                        "setup": vol_setup(reads, squeeze, ctx, earnings=earn, em=em),
-                       "quote": (straddle_quote(ticker, interactive=sys.stdin.isatty(),
-                                                data_dir=args.data_dir) if straddle_quote else None)}
+                       "quote": (straddle_quote(ticker, earnings_date=(earn or {}).get("date"),
+                                                interactive=sys.stdin.isatty(),
+                                                data_dir=args.data_dir) if straddle_quote else None),
+                       "history": (pre_earnings_vol_study(ticker, interactive=sys.stdin.isatty(),
+                                                          data_dir=args.data_dir)
+                                   if pre_earnings_vol_study else None)}
             except Exception as e:
                 notes.append(f"vol setup unavailable ({type(e).__name__}).")
 

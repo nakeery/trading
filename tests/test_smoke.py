@@ -1,7 +1,7 @@
 """
 Smoke tests for the options trading ML pipeline.
 
-15 regression guards:
+18 regression guards:
   1. Signal hierarchy (backtest CSV) — STRONG ENTRY > CAUTION > STAY OUT by avg return
   2. STRONG ENTRY baseline sanity (backtest CSV) — count/return/win-rate loose bounds
   3. Vol thresholds range (QQQ indicators CSV) — positive values in expected ranges
@@ -18,6 +18,12 @@ Smoke tests for the options trading ML pipeline.
  13. upcoming_events window filter — within_days arg correctly bounds the result set
  14. sentiment labelers — IV/HV, skew, term, P/C, IV-regime bands + percentile_of behavior
  15. geocontext helpers — cross-asset stress-tail detection + composite level (offline)
+ 16. volquote _liquid_strike — snaps a strangle wing to the most-liquid nearby OTM strike
+     (min-leg OI, tighter-spread tiebreak, tradeable filter, OTM-side + fallback)
+ 17. volquote _select_expiries — earnings-aware expiry choice: two post-earnings blocks when
+     nearest != nearest-monthly, one when they coincide, fallback + note when earnings far/None
+ 18. vol_history pre_earnings_vol_study — synthetic IV ramp → status ok (ramp>0, crush<0, P&L>0),
+     all-NaN IV → insufficient_iv; backfill_iv.backfill → no_massive_key when key unset (offline)
 """
 
 
@@ -516,3 +522,132 @@ def test_geocontext_composite_and_stress():
     assert "WTI crude" in comp2 and "Gold" in comp2
 
     assert _composite([{"name": f"g{i}", "stress": True} for i in range(4)])[0] == "HIGH"
+
+
+# ─── Test 16: volquote _liquid_strike (offline) ───────────────────────────────
+def test_liquid_strike_snap():
+    """modules/volquote._liquid_strike snaps a strangle wing to the most-liquid of the nearest
+    SNAP_K OTM strikes (rank by OI, tie-break tighter spread), prefers tradeable strikes, respects
+    the OTM side, and falls back to the plain nearest strike when no OTM strikes exist. Pure logic,
+    no network — this is the fix for landing on a dead strike (the documented CRSP OTM-put case)."""
+    from modules.volquote import _liquid_strike, SNAP_K
+
+    def opt(strike, oi, bid, ask, typ="call"):
+        return {"type": typ, "strike": strike, "bid": bid, "ask": ask, "oi": oi}
+
+    spot = 100.0
+    # Calls just OTM: 101 is closest to the target but nearly dead; 102 is the liquid neighbor.
+    calls = [opt(101, 1, 0.02, 2.00), opt(102, 500, 1.00, 1.10), opt(103, 50, 0.50, 0.60)]
+    picked = _liquid_strike(calls, target=101.5, spot=spot, side="call")
+    assert picked["strike"] == 102, f"expected the liquid 102 strike, got {picked['strike']}"
+
+    # A near strike with huge OI but no live market (bid/ask 0) must be skipped for a tradeable one.
+    calls2 = [opt(110, 9999, 0.0, 0.0), opt(109, 200, 1.00, 1.10), opt(108, 100, 0.80, 0.95)]
+    picked2 = _liquid_strike(calls2, target=110.0, spot=spot, side="call")
+    assert picked2["strike"] == 109, f"untradeable 110 should be skipped, got {picked2['strike']}"
+
+    # OTM side is respected: for a put wing, only strikes < spot are eligible (never the 101 call-side).
+    puts = [opt(99, 100, 1.0, 1.1, "put"), opt(98, 200, 0.9, 1.0, "put"), opt(101, 999, 1.0, 1.1, "put")]
+    picked3 = _liquid_strike(puts, target=98.5, spot=spot, side="put")
+    assert picked3["strike"] == 98 and picked3["strike"] < spot
+
+    # Fallback: no OTM strikes on that side → plain nearest (closest to target regardless of side).
+    below = [opt(95, 10, 0.5, 0.6), opt(96, 10, 0.5, 0.6)]
+    picked4 = _liquid_strike(below, target=105.0, spot=spot, side="call")
+    assert picked4["strike"] == 96, "fallback should return the strike nearest the target"
+
+    assert SNAP_K >= 2  # the snap window must span more than the single closest strike
+
+
+# ─── Test 17: volquote _select_expiries (offline) ─────────────────────────────
+def test_select_expiries_earnings_aware():
+    """modules/volquote._select_expiries: when earnings is near, anchor to POST-earnings expiries —
+    the nearest one plus the nearest post-earnings monthly when they differ (two blocks), one when
+    they coincide; and fall back to the near-monthly ~target_dte with a note when earnings is far or
+    unknown. Pure logic, no network."""
+    import datetime
+    from modules.volquote import _select_expiries, EARN_WINDOW
+
+    # July 2026 3rd Friday = 17th; Aug 2026 3rd Friday = 21st (both monthlies).
+    future = [("2026-07-17", 16), ("2026-07-24", 23), ("2026-07-31", 30), ("2026-08-21", 51)]
+
+    # (a) Earnings 2026-07-20 (19d out): nearest post = 07-24 (weekly), nearest post monthly = 08-21.
+    selected, notes = _select_expiries(future, 30, datetime.date(2026, 7, 20), 19)
+    assert notes == []
+    assert len(selected) == 2, f"expected two post-earnings blocks, got {len(selected)}"
+    assert selected[0][0] == "2026-07-24" and selected[0][2] == "post-earnings weekly"
+    assert selected[0][3] == 4, f"days_after_earn expected 4, got {selected[0][3]}"
+    assert selected[1][0] == "2026-08-21" and selected[1][2] == "post-earnings monthly"
+    assert selected[1][3] == 32
+
+    # (b) Earnings 2026-07-10 (9d out): nearest post IS the 07-17 monthly → one block, no dup.
+    selected_b, notes_b = _select_expiries(future, 30, datetime.date(2026, 7, 10), 9)
+    assert len(selected_b) == 1 and selected_b[0][0] == "2026-07-17"
+    assert selected_b[0][2] == "post-earnings monthly"
+
+    # (c) Earnings beyond the window → fallback near-monthly ~target_dte + an explanatory note.
+    selected_c, notes_c = _select_expiries(future, 30, datetime.date(2026, 9, 1), EARN_WINDOW + 15)
+    assert len(selected_c) == 1 and selected_c[0][2] == "monthly" and selected_c[0][3] is None
+    assert selected_c[0][0] == "2026-07-17"  # closest monthly to target_dte=30
+    assert notes_c and "beyond" in notes_c[0]
+
+    # (d) No earnings date → fallback + note.
+    selected_d, notes_d = _select_expiries(future, 30, None, None)
+    assert len(selected_d) == 1 and selected_d[0][2] == "monthly"
+    assert notes_d and "no earnings date" in notes_d[0]
+
+
+# ─── Test 18: pre-earnings vol study + backfill graceful (offline) ────────────
+def test_pre_earnings_vol_study(tmp_path, monkeypatch):
+    """modules/vol_history.pre_earnings_vol_study measures the pre-earnings IV ramp / crush /
+    straddle P&L off atm_iv_30d with INJECTED earnings (no network): a synthetic ramp → status
+    'ok' with ramp>0, crush<0, straddle P&L>0 (flat spot, so the ramp must beat theta); all-NaN IV
+    → 'insufficient_iv'. And the refactored backfill_iv.backfill degrades to 'no_massive_key'
+    (no network) when the key is unset — the graceful path for an unpaid/absent Massive subscription."""
+    import numpy as np
+    import pandas as pd
+    from modules.vol_history import pre_earnings_vol_study
+
+    idx = pd.bdate_range("2025-01-02", periods=150)
+    earn_pos = [30, 70, 110]
+    earnings = [idx[p] for p in earn_pos]
+
+    def iv_at(pos):
+        nxt = min((e for e in earn_pos if e >= pos), default=None)
+        if nxt is not None and nxt - pos <= 15:
+            return 0.30 + 0.40 * (1 - (nxt - pos) / 15.0)    # ramp UP into the report
+        prev = max((e for e in earn_pos if e < pos), default=None)
+        if prev is not None and pos - prev <= 3:
+            return 0.35                                       # crushed just after
+        return 0.30
+
+    df = pd.DataFrame({"Close": 100.0,
+                       "atm_iv_30d": [iv_at(i) for i in range(len(idx))]}, index=idx)
+    csv = tmp_path / "testx_indicators.csv"
+    df.to_csv(csv)
+
+    study = pre_earnings_vol_study("TESTX", data_dir=str(tmp_path), earnings=earnings)
+    assert study["status"] == "ok", study
+    agg = study["agg"]
+    assert agg["n"] == 3, f"expected 3 usable earnings, got {agg['n']}"
+    assert agg["ramp_median"] > 0.10, f"expected a clear IV ramp, got {agg['ramp_median']}"
+    assert agg["crush_median"] < 0, f"expected a post-earnings crush, got {agg['crush_median']}"
+    assert agg["pnl_median"] is not None and agg["pnl_median"] > 0, (
+        f"a strong ramp with flat spot should net a positive straddle P&L, got {agg['pnl_median']}"
+    )
+    assert "IV ramped" in study["summary"]
+
+    # All-NaN IV → insufficient (this is what drives the backfill offer / the lens note).
+    df_na = df.copy(); df_na["atm_iv_30d"] = np.nan
+    df_na.to_csv(csv)
+    study_na = pre_earnings_vol_study("TESTX", data_dir=str(tmp_path), earnings=earnings)
+    assert study_na["status"] == "insufficient_iv", study_na
+
+    # backfill_iv.backfill degrades cleanly with no Massive key (no network reached).
+    import backfill_iv
+    monkeypatch.delenv("MASSIVE_API_KEY", raising=False)
+    recent = pd.bdate_range(end=pd.Timestamp.today().normalize(), periods=20)
+    pd.DataFrame({"Close": 100.0, "atm_iv_30d": np.nan}, index=recent).to_csv(
+        tmp_path / "testy_indicators.csv")
+    res = backfill_iv.backfill("TESTY", data_dir=str(tmp_path))
+    assert res["status"] == "no_massive_key", res

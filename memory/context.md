@@ -97,6 +97,38 @@ all deep/tight. Cached per ticker session-stale (`data/pc_oi_cache/{ticker}_stra
 `straddle → … → straddle4` as the payload shape evolved: legs, then monthly+ladder, then the auto strangle).
 NB option PRICES move intraday → a cached quote is a snapshot 'as of HH:MM' (TTY refresh like pc-oi).
 
+S38: `--vol` reoriented toward PRE-EARNINGS long-vol (buy vol into the IV ramp, sell BEFORE the report
+to sidestep IV crush). Two `volquote` changes: (1) the quote is now EARNINGS-AWARE — when
+`features.next_earnings` is ≤`EARN_WINDOW=45`d out it anchors to POST-earnings expiries (an expiry ending
+before earnings carries no event premium, so it can't ramp): the nearest one (steepest ramp / most
+concentrated premium) AND the nearest post-earnings monthly when they differ (more liquid) — BOTH shown;
+else it falls back to the near-monthly ~30d with an explanatory note. (2) each auto-strangle wing now SNAPS
+to the most-liquid of the nearest `SNAP_K=3` OTM strikes (rank OI, tie-break tighter spread, prefer
+tradeable bid/ask>0), not the mathematically nearest — fixes landing on a dead strike (the CRSP OTM-put
+case). New PURE helpers `_select_expiries`/`_liquid_strike` (+ per-expiry `_build_block`), unit-tested
+offline (17 smoke tests now). `--vol` also prints a one-line straddle-vs-strangle guide (straddle = max
+vega, enter close to the print; strangle = cheaper + lower theta, enter earlier / run more names / vega
+convexity). Quote payload is now `{spot, earn_days, quotes:[block,…], notes}`; SCOPEKEY straddle4→straddle5.
+The strangle label shows the realized ≈±width plus a `target ±EM` clause when the snap drifted the width
+off the expected-move target (e.g. CRSP `≈±25%, target ±19%` — lumpy round-number OI pulled the wings out);
+hidden when they match (NVDA/QQQ), so evenly-liquid names stay clean.
+
+S39: `modules/vol_history.py` — a pre-earnings VOL STUDY that gives `--vol` an EVIDENCE base (does the
+IV ramp it assumes actually show up for this name?). For the last ~8 earnings, off on-disk `atm_iv_30d`
++ `Close` (no new API load): the IV RAMP (pre-print vs ~entry_td sessions earlier), the post-earnings
+CRUSH, and a buy-early/sell-before-print ATM straddle P&L via `bs_invert.black_scholes_call` (IV gain −
+theta − spot drift), plus a 5/10/15-session entry-timing sweep. Descriptive only. **HV was rejected**:
+the ramp is IMPLIED-vol; realized/HV is flat-to-down pre-earnings and spikes AFTER → an HV-priced sim
+bakes in theta but misses the ramp (systematic false-negative). Surfaced two ways: standalone `python -m
+modules.vol_history` (full table + sweep + verdict + caveats) and a one-line inline verdict in `--vol`
+(`history (N earnings): …`). When IV history is thin (`status insufficient_iv`, `MIN_USABLE`=3) it OFFERS
+the Massive backfill — TTY-gated in BOTH the CLI and `lens --vol` (`interactive=sys.stdin.isatty()`),
+never in piped runs. `backfill_iv.py` refactored into a reusable `backfill(ticker)` (returns a status
+dict, no `sys.exit`) that degrades cleanly when Massive is unavailable (no key / 401 → clear message,
+never crashes). Shared `features.earnings_dates` helper. Caveats printed: ~8-earnings sample (2yr IV cap)
+is indicative not proof; `atm_iv_30d` is a constant-maturity 30d proxy (blunts the true front-expiry
+ramp — AMD reads a weak/inconsistent ramp partly for this reason); BS r=q=0, no fills. 18 smoke tests.
+
 --geo cross-asset / geopolitical backdrop (S35)
 -----------------------------------------------
 Opt-in (`--geo`, default off). Surfaces the assets that move on geopolitical/macro shocks — the

@@ -229,21 +229,28 @@ def add_earnings_proximity(df, ticker):
     return df
 
 
+def earnings_dates(ticker, limit=16):
+    """Sorted, tz-naive, normalized earnings dates (past + future) from yfinance.
+    Returns a list of pd.Timestamp, or [] on any failure/empty. Best-effort: never raises.
+    Shared by next_earnings and modules/vol_history.py."""
+    try:
+        dates = yf.Ticker(ticker).get_earnings_dates(limit=limit)
+        if dates is None or len(dates) == 0:
+            return []
+        idx = pd.DatetimeIndex(dates.index)
+        if idx.tz is not None:
+            idx = idx.tz_convert(None)
+        return sorted(idx.normalize().unique())
+    except Exception:
+        return []
+
+
 def next_earnings(ticker, daily=None):
     """Next scheduled earnings for `ticker` via yfinance + the typical historical earnings move.
     Returns {date: 'YYYY-MM-DD'|None, days: int|None, hist_move: float|None} or None (ETF / no data).
     `hist_move` = median |close-to-close| % around the last few past earnings (needs `daily` OHLCV).
     Best-effort: never raises (mirrors add_earnings_proximity's yfinance access)."""
-    try:
-        dates = yf.Ticker(ticker).get_earnings_dates(limit=16)
-        if dates is None or len(dates) == 0:
-            return None
-        idx = pd.DatetimeIndex(dates.index)
-        if idx.tz is not None:
-            idx = idx.tz_convert(None)
-        ed = sorted(idx.normalize().unique())
-    except Exception:
-        return None
+    ed = earnings_dates(ticker)
     if not ed:
         return None
 

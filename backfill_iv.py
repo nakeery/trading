@@ -77,25 +77,22 @@ def get_rate(irx, date):
 
 
 # ─────────────────────────────────────────
-# MAIN
+# BACKFILL
 # ─────────────────────────────────────────
-def main():
-    # Ticker prompt
-    while True:
-        try:
-            ticker = input("  Ticker [XYZ]: ").strip().upper()
-            if ticker:
-                break
-        except (KeyboardInterrupt, EOFError):
-            print()
-            sys.exit(0)
+def backfill(ticker, data_dir=DATA_DIR):
+    """Backfill atm_iv_30d / iv_skew_25d / term_structure into data/{ticker}_indicators.csv via
+    Massive BS-inversion. Reusable + best-effort: returns a status dict and NEVER calls sys.exit,
+    so callers (e.g. modules/vol_history.py) aren't killed. Graceful Massive handling — a missing
+    MASSIVE_API_KEY, or an error on the very first date (auth / lapsed subscription), aborts cleanly
+    rather than crashing or hammering the API for every date.
 
-    csv_path = os.path.join(DATA_DIR, f"{ticker.lower()}_indicators.csv")
+    Returns {"status", "filled", "failed", "skipped"} where status is one of:
+        "ok" | "no_csv" | "nothing_to_do" | "no_massive_key" | "massive_error"
+    """
+    csv_path = os.path.join(data_dir, f"{ticker.lower()}_indicators.csv")
     if not os.path.exists(csv_path):
-        print(f"\nERROR: {csv_path} not found. Run indicators.py for {ticker} first.")
-        sys.exit(1)
+        return {"status": "no_csv", "filled": 0, "failed": 0, "skipped": 0}
 
-    # Load indicators CSV
     print(f"\nLoading {csv_path}...")
     df = pd.read_csv(csv_path, index_col=0, parse_dates=True).sort_index()
     print(f"  -> {len(df)} rows, index {df.index[0].date()} to {df.index[-1].date()}")
@@ -106,7 +103,7 @@ def main():
             df[col] = pd.NA
 
     # Determine which dates need backfilling
-    cutoff = pd.Timestamp.today().normalize() - pd.DateOffset(years=2)
+    cutoff = pd.Timestamp.today().normalize() - pd.DateOffset(years=BACKFILL_YEARS)
     mask   = (df.index >= cutoff) & (df["atm_iv_30d"].isna() | df["term_structure"].isna())
     dates  = df.index[mask].sort_values(ascending=False)   # newest -> oldest
 
@@ -115,7 +112,12 @@ def main():
 
     if len(dates) == 0:
         print("  Nothing to backfill — atm_iv_30d and term_structure are already populated for all dates in range.")
-        sys.exit(0)
+        return {"status": "nothing_to_do", "filled": 0, "failed": 0, "skipped": 0}
+
+    # Massive is required from here — fail clearly rather than raising deep in the client.
+    if not os.environ.get("MASSIVE_API_KEY"):
+        print("  Massive API key not set ($env:MASSIVE_API_KEY) — cannot backfill IV.")
+        return {"status": "no_massive_key", "filled": 0, "failed": 0, "skipped": 0}
 
     # Load risk-free rates
     irx = load_irx()
@@ -142,7 +144,19 @@ def main():
         spot = float(spot_raw)
         r    = get_rate(irx, date)
 
-        result = get_historical_iv_snapshot(ticker, date, spot, r)
+        try:
+            result = get_historical_iv_snapshot(ticker, date, spot, r)
+        except Exception as e:
+            failed += 1
+            print(f"  {date}  ERROR — {type(e).__name__}: {e}  ({i+1}/{total})")
+            if filled == 0:
+                # Errored before any date filled → systemic (auth / subscription / endpoint).
+                # Abort cleanly instead of retrying the same failure for every remaining date.
+                df.to_csv(csv_path)
+                print("\n  Aborting: Massive errored before any date filled "
+                      "(check MASSIVE_API_KEY / subscription).")
+                return {"status": "massive_error", "filled": filled, "failed": failed, "skipped": skipped}
+            continue
 
         if result is not None:
             for key, val in result.items():
@@ -181,10 +195,39 @@ def main():
     print(f"  Fill rate       : {fill_rate:.0f}%")
     print(f"  CSV updated     : {csv_path}")
     print(f"{'='*52}\n")
-    print("Next steps:")
-    print("  1. python volatility.py --iv-features   # retrain Phase 3 with real IV")
-    print("  2. python backtest.py  --iv-features    # walk-forward validation")
-    print("  3. python entry.py     --iv-features    # live signal with real IV features\n")
+    return {"status": "ok", "filled": filled, "failed": failed, "skipped": skipped}
+
+
+# ─────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────
+def main():
+    # Ticker prompt
+    while True:
+        try:
+            ticker = input("  Ticker [XYZ]: ").strip().upper()
+            if ticker:
+                break
+        except (KeyboardInterrupt, EOFError):
+            print()
+            sys.exit(0)
+
+    res = backfill(ticker)
+    status = res.get("status")
+
+    if status == "no_csv":
+        print(f"\nERROR: data/{ticker.lower()}_indicators.csv not found. "
+              f"Run indicators.py for {ticker} first.")
+        sys.exit(1)
+    if status == "no_massive_key":
+        print("\nERROR: MASSIVE_API_KEY not set — set $env:MASSIVE_API_KEY (add to $PROFILE for persistence).")
+        sys.exit(1)
+
+    if res.get("filled"):
+        print("Next steps:")
+        print("  1. python volatility.py --iv-features   # retrain Phase 3 with real IV")
+        print("  2. python backtest.py  --iv-features    # walk-forward validation")
+        print("  3. python entry.py     --iv-features    # live signal with real IV features\n")
 
 
 if __name__ == "__main__":
