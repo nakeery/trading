@@ -175,11 +175,13 @@ def gather_context(ticker, data_dir="data", with_vix=True):
     if hv_20 is not None:
         gauges.append({"group": "VOL", "name": "HV-20 (annualized)", "value": hv_20, "fmt": "{:.1%}",
                        "label": "", "pct": percentile_of(df["HV_20"], hv_20)})
+    # NOTE: IV_rank/IV_pct are the HV-20 PROXY (features.py) — realized vol's position in its own
+    # 1y range, NOT the harvested ATM IV's. Named accordingly so they can't be read as real IV (S40).
     if iv_rank is not None:
-        gauges.append({"group": "VOL", "name": "IV Rank (1y)", "value": iv_rank, "fmt": "{:.2f}",
+        gauges.append({"group": "VOL", "name": "IV Rank (HV-proxy)", "value": iv_rank, "fmt": "{:.2f}",
                        "label": iv_regime_label(iv_rank), "pct": None})
     if iv_pct is not None:
-        gauges.append({"group": "VOL", "name": "IV Percentile (1y)", "value": iv_pct, "fmt": "{:.0%}",
+        gauges.append({"group": "VOL", "name": "IV Pctile (HV-proxy)", "value": iv_pct, "fmt": "{:.0%}",
                        "label": "", "pct": None})
 
     # ── MARKET (VIX complex, live) ──

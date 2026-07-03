@@ -264,12 +264,14 @@ def totals(rows):
     }
 
 
-def gather_pc_oi(ticker, preset="all", monthly=False, interactive=False, data_dir="data", quiet=True):
+def gather_pc_oi(ticker, preset="all", monthly=False, interactive=False, data_dir="data", quiet=True,
+                 force=False):
     """Resolve a tenor preset and return {ticker, price, rows, total, scope, as_of, as_of_str,
     age_str, stale, cached} — or None on no token / no data. Cached per (ticker, scope) under
     data/pc_oi_cache/; re-fetches only when a market close has occurred since the cache
     (session-stale). When stale: prompts to refresh if `interactive` (a TTY), else serves the cached
-    rows with stale=True. Best-effort: never raises; a fetch failure falls back to any cache."""
+    rows with stale=True. `force=True` (lens --live) skips the cache/prompt and fetches fresh —
+    option volume moves intraday. Best-effort: never raises; a fetch failure falls back to any cache."""
     if not TRADIER_TOKEN or TRADIER_TOKEN == "YOUR_TOKEN_HERE":
         return None
     scope    = " · ".join([preset] + (["monthly"] if monthly else []))
@@ -282,8 +284,8 @@ def gather_pc_oi(ticker, preset="all", monthly=False, interactive=False, data_di
                 "scope": scope, "as_of": as_of, "as_of_str": _hhmm(as_of),
                 "age_str": _cache_age(as_of), "stale": is_stale, "cached": cached}
 
-    refresh = cache is None                                # first time → must fetch (no prompt)
-    if cache is not None and stale:
+    refresh = cache is None or force                       # first time / forced → fetch (no prompt)
+    if not force and cache is not None and stale:
         if interactive:
             try:
                 ans = input(f"  {ticker} put/call OI cached {_cache_age(cache['as_of'])}; a market "

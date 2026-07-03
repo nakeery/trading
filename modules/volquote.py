@@ -20,9 +20,10 @@ import datetime
 from modules.tradier import TRADIER_TOKEN, get_current_price, get_expirations, get_chain
 from modules.pc_oi import _cache_path, cache_stale, _cache_age, _hhmm, is_monthly_expiry
 
-SCOPEKEY = "straddle5"       # bumped when the cached payload shape changes (earnings-anchored blocks)
+SCOPEKEY = "straddle6"       # bumped when the cached payload shape changes (per-wing widths + ask-side cost)
 EM_MULT = 1.0                # "auto" strangle wings at ±(EM_MULT × expected move); exp move = straddle/spot
-SNAP_K = 3                   # a wing snaps to the most-liquid of the K nearest OTM strikes to its target
+SNAP_K = 3                   # a wing snaps within the K nearest OTM strikes to its target
+SNAP_OI_FRAC = 0.5           # a wing takes the NEAREST candidate holding ≥ this fraction of the best candidate's OI
 EARN_WINDOW = 45             # anchor to a post-earnings expiry only when earnings is ≤ this many days out
 
 
@@ -51,7 +52,9 @@ def _mid(o):
 
 def _combo(call, put, spot):
     """A two-leg long-vol position (straddle if same strike, else strangle). Returns cost, breakevens
-    and the move from spot needed to reach each breakeven."""
+    and the move from spot needed to reach each breakeven — at the leg MIDS, plus the same at the
+    ASKS (`cost_ask`/`lo_ask`/`hi_ask`/`*_move_ask`, S40) so wide-spread names show the executable
+    numbers, not the optimistic mid."""
     if not call or not put:
         return None
     cm, pm = _mid(call), _mid(put)
@@ -61,9 +64,15 @@ def _combo(call, put, spot):
     lo = put["strike"] - cost                       # downside breakeven
     hi = call["strike"] + cost                      # upside breakeven
     leg = lambda o: {"strike": o["strike"], "bid": o["bid"], "ask": o["ask"], "oi": o.get("oi")}
-    return {"call_strike": call["strike"], "put_strike": put["strike"], "cost": cost,
-            "lo": lo, "hi": hi, "up_move": (hi - spot) / spot, "dn_move": (spot - lo) / spot,
-            "legs": {"call": leg(call), "put": leg(put)}}
+    out = {"call_strike": call["strike"], "put_strike": put["strike"], "cost": cost,
+           "lo": lo, "hi": hi, "up_move": (hi - spot) / spot, "dn_move": (spot - lo) / spot,
+           "legs": {"call": leg(call), "put": leg(put)}}
+    if call["ask"] > 0 and put["ask"] > 0:
+        ca = call["ask"] + put["ask"]
+        lo_a, hi_a = put["strike"] - ca, call["strike"] + ca
+        out.update({"cost_ask": ca, "lo_ask": lo_a, "hi_ask": hi_a,
+                    "up_move_ask": (hi_a - spot) / spot, "dn_move_ask": (spot - lo_a) / spot})
+    return out
 
 
 def _parse(chain):
@@ -83,18 +92,24 @@ def _nearest_strike(opts, target):
 
 
 def _liquid_strike(opts, target, spot, side):
-    """Snap a strangle wing to the most-LIQUID of the nearest SNAP_K OTM strikes to `target`, rather
-    than the merely-closest one. `side` is 'call' (keep strikes > spot) or 'put' (keep strikes <
-    spot) so the result stays a genuine OTM strangle. Prefer tradeable strikes (bid>0 and ask>0),
-    then rank by open interest (desc), breaking ties on the tighter bid-ask. Falls back to the plain
-    nearest strike when there are no OTM strikes on that side."""
+    """Snap a strangle wing to the nearest LIQUID-ENOUGH of the SNAP_K OTM strikes closest to
+    `target`. `side` is 'call' (keep strikes > spot) or 'put' (keep strikes < spot) so the result
+    stays a genuine OTM strangle. Prefer tradeable strikes (bid>0 and ask>0); among those, take the
+    candidate CLOSEST to the target whose open interest is ≥ SNAP_OI_FRAC × the busiest candidate's
+    — a dead strike next to a busy one is still skipped, but lumpy round-number OI can no longer
+    drag the wing off target when the nearest strike is perfectly liquid (S40; previously pure
+    max-OI, which pulled NVDA's put wing 190-vs-185 and decided CRSP's on 47-vs-42 OI noise). The
+    busiest candidate always qualifies, so the pick never fails. Falls back to the plain nearest
+    strike when there are no OTM strikes on that side."""
     otm = [o for o in opts if (o["strike"] > spot if side == "call" else o["strike"] < spot)]
     if not otm:
         return _nearest_strike(opts, target)
     candidates = sorted(otm, key=lambda o: abs(o["strike"] - target))[:SNAP_K]
     tradeable = [o for o in candidates if o["bid"] > 0 and o["ask"] > 0]
     pool = tradeable or candidates
-    return max(pool, key=lambda o: (o["oi"], -(o["ask"] - o["bid"])))
+    best_oi = max(o["oi"] for o in pool)
+    liquid = [o for o in pool if o["oi"] >= SNAP_OI_FRAC * best_oi]
+    return min(liquid, key=lambda o: (abs(o["strike"] - target), -o["oi"]))
 
 
 def _select_expiries(future, target_dte, earn, earn_days):
@@ -160,6 +175,8 @@ def _build_block(ticker, spot, expiry, dte, expiry_kind, days_after_earn=None):
     if strangle:
         strangle["width"] = ((spot - pw["strike"]) + (cw["strike"] - spot)) / (2 * spot)
         strangle["target_width"] = em_pct
+        strangle["dn_width"] = (spot - pw["strike"]) / spot    # per-wing (S40) — a tilted strangle
+        strangle["up_width"] = (cw["strike"] - spot) / spot    # must show as tilted, not averaged
 
     return {"expiry": expiry, "dte": dte, "expiry_kind": expiry_kind,
             "days_after_earn": days_after_earn, "atm_strike": atm_strike,
@@ -201,20 +218,22 @@ def _wrap(quote, as_of, stale, cached):
     return out
 
 
-def straddle_quote(ticker, target_dte=30, earnings_date=None, interactive=False, data_dir="data"):
+def straddle_quote(ticker, target_dte=30, earnings_date=None, interactive=False, data_dir="data",
+                   force=False):
     """ATM straddle + auto ±expected-move strangle off the live Tradier chain. When `earnings_date`
     (ISO 'YYYY-MM-DD') is within EARN_WINDOW days, anchors to POST-earnings expiries — the nearest
     one and the nearest post-earnings monthly when they differ — for a pre-earnings long-vol setup;
     otherwise the near ~target_dte expiry. Cached per ticker (session-stale, TTY-gated refresh) like
-    pc-oi. Returns the quote dict (spot/earn_days/quotes[…]/notes + as_of/as_of_str/age_str/stale/
+    pc-oi; `force=True` (lens --live) skips the cache/prompt and quotes fresh — option prices move
+    intraday. Returns the quote dict (spot/earn_days/quotes[…]/notes + as_of/as_of_str/age_str/stale/
     cached) or None (no token / no data). Best-effort: never raises."""
     if not TRADIER_TOKEN or TRADIER_TOKEN == "YOUR_TOKEN_HERE":
         return None
     cache = _load(ticker, data_dir)
     stale = cache is not None and cache_stale(cache)
 
-    refresh = cache is None
-    if cache is not None and stale:
+    refresh = cache is None or force
+    if not force and cache is not None and stale:
         if interactive:
             try:
                 ans = input(f"  {ticker} straddle quote cached {_cache_age(cache['as_of'])}; a market "

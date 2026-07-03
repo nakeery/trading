@@ -23,6 +23,11 @@ def expected_move(spot, iv, dte=30, hv=None):
             "dte": dte, "hv_pct": (hv * frac if (hv and hv > 0) else None)}
 
 
+SQUEEZE_TFS = ("1M", "1W", "1D")   # only daily+ squeezes speak to a multi-week vol position (S40)
+IV_PCT_LOW  = 0.30                 # real-IV percentile bands for the cheap/rich factor
+IV_PCT_HIGH = 0.70
+
+
 def gauge_val(ctx, name):
     """Pull a gauge value by name out of a gather_context() result. None if absent."""
     if not ctx:
@@ -33,30 +38,53 @@ def gauge_val(ctx, name):
     return None
 
 
+def gauge_pct(ctx, name):
+    """Pull a gauge's trailing percentile (0-1) by name out of a gather_context() result.
+    None if the gauge is absent or its percentile was omitted (thin history)."""
+    if not ctx:
+        return None
+    for g in ctx.get("gauges", []):
+        if g.get("name") == name:
+            return g.get("pct")
+    return None
+
+
 def vol_setup(reads, squeeze, ctx, earnings=None, em=None, macro_days=None):
     """Two-sided long-vol vs short-vol scorecard. `squeeze` = {tf: read_squeeze(...)}. Returns
-    {long_vol: [factor strings], short_vol: [...], net, hint}. Descriptive context, not advice."""
-    long_v, short_v = [], []
+    {long_vol: [factor strings], short_vol: [...], notes: [...], net, hint}. Descriptive context,
+    not advice."""
+    long_v, short_v, notes = [], [], []
 
-    iv_rank = gauge_val(ctx, "IV Rank (1y)")
+    iv_pct  = gauge_pct(ctx, "ATM IV (30d)")             # real harvested-IV percentile (S40)
+    hv_rank = gauge_val(ctx, "IV Rank (HV-proxy)")       # HV-20 proxy fallback
     iv_hv   = gauge_val(ctx, "IV/HV ratio")
     term    = gauge_val(ctx, "Term structure")
     skew    = gauge_val(ctx, "25Δ skew (P-C)")
 
-    # IV cheap vs rich
-    if iv_rank is not None:
-        if iv_rank <= 0.30:
-            long_v.append(f"IV rank low ({iv_rank:.2f}) — vol compressed, expansion-prone")
-        elif iv_rank >= 0.70:
-            short_v.append(f"IV rank high ({iv_rank:.2f}) — vol elevated, contraction-prone")
+    # IV cheap vs rich — real ATM-IV percentile when harvested history exists (the price of what
+    # you'd actually buy); HV-20 proxy only as a labeled fallback. Pre-catalyst these diverge:
+    # IV ramps while the stock stays quiet, and the proxy misses it (the CRSP 97%ile-vs-"mid" case).
+    if iv_pct is not None:
+        if iv_pct <= IV_PCT_LOW:
+            long_v.append(f"ATM IV at {iv_pct:.0%}ile of its history — vol cheap, expansion-prone")
+        elif iv_pct >= IV_PCT_HIGH:
+            short_v.append(f"ATM IV at {iv_pct:.0%}ile of its history — vol elevated, contraction-prone")
+    elif hv_rank is not None:
+        if hv_rank <= IV_PCT_LOW:
+            long_v.append(f"vol rank low ({hv_rank:.2f}, HV-proxy) — vol compressed, expansion-prone")
+        elif hv_rank >= IV_PCT_HIGH:
+            short_v.append(f"vol rank high ({hv_rank:.2f}, HV-proxy) — vol elevated, contraction-prone")
     if iv_hv is not None:
         if iv_hv <= 1.05:
             long_v.append(f"IV/HV {iv_hv:.2f} — implied ≈/< realized (move cheaply priced)")
         elif iv_hv >= 1.40:
             short_v.append(f"IV/HV {iv_hv:.2f} — implied ≫ realized (premium rich)")
 
-    # compression (squeeze)
-    sq_on = [tf for tf, s in (squeeze or {}).items() if s.get("ok") and s.get("squeeze_on")]
+    # compression (squeeze) — intraday (1h/4h) squeezes resolve in hours-to-days and say nothing
+    # about a multi-week option's price, so only daily+ squeezes count as a factor (S40); the
+    # lens compression line still lists every timeframe.
+    sq_on = [tf for tf in SQUEEZE_TFS
+             if (squeeze or {}).get(tf, {}).get("ok") and (squeeze or {}).get(tf, {}).get("squeeze_on")]
     if sq_on:
         long_v.append(f"squeeze ON ({', '.join(sq_on)}) — compressed range, expansion-prone")
     else:
@@ -75,10 +103,15 @@ def vol_setup(reads, squeeze, ctx, earnings=None, em=None, macro_days=None):
     if skew is not None and skew >= 0.05:
         short_v.append(f"heavy put skew ({skew:+.3f}) — downside premium rich")
 
-    # catalysts
+    # catalysts — an upcoming print is only a reason to BUY vol while it's still cheap; once IV
+    # already ranks high the event premium is priced, so it becomes a note, not a factor (S40).
     if earnings and earnings.get("days") is not None and 0 <= earnings["days"] <= 45:
         hm = f", typ. ±{earnings['hist_move']:.1%}" if earnings.get("hist_move") else ""
-        long_v.append(f"earnings in {earnings['days']}d ({earnings['date']}{hm}) — known vol catalyst")
+        if iv_pct is not None and iv_pct >= IV_PCT_HIGH:
+            notes.append(f"earnings in {earnings['days']}d ({earnings['date']}{hm}) but ATM IV already "
+                         f"{iv_pct:.0%}ile — event premium likely priced; ramp mostly done")
+        else:
+            long_v.append(f"earnings in {earnings['days']}d ({earnings['date']}{hm}) — known vol catalyst")
     if macro_days is not None and 0 <= macro_days <= 10:
         long_v.append(f"macro event in {macro_days}d — event vol ahead")
 
@@ -90,7 +123,7 @@ def vol_setup(reads, squeeze, ctx, earnings=None, em=None, macro_days=None):
             short_v.append(f"implied move {em['pct']:.1%} > realized {em['hv_pct']:.1%} — move rich")
 
     net, hint = _synthesize(long_v, short_v, earnings)
-    return {"long_vol": long_v, "short_vol": short_v, "net": net, "hint": hint}
+    return {"long_vol": long_v, "short_vol": short_v, "notes": notes, "net": net, "hint": hint}
 
 
 def _synthesize(long_v, short_v, earnings):
@@ -99,7 +132,7 @@ def _synthesize(long_v, short_v, earnings):
     if nl >= ns + 2:
         net = (f"conditions favor BUYING vol (long straddle/strangle): "
                f"{nl} long-vol vs {ns} short-vol factors")
-        hint = ("→ long straddle/strangle into the catalyst — size for the IV crush after the event"
+        hint = ("→ long straddle/strangle into the catalyst — exit BEFORE the print; IV crush erases the ramp"
                 if catalyst else
                 "→ long straddle/strangle for a breakout; theta is the cost if it stays coiled")
     elif ns >= nl + 2:

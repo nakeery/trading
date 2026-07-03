@@ -15,8 +15,10 @@ stress backdrop the single-ticker price lens can't see).
 
 Run: `python -X utf8 lens.py` (1 prompt) or `--ticker QQQ`. Works on any ticker (yfinance daily
 fallback if no indicators CSV). Flags: `--thesis bullish --level 700` (confirm/contradict), `--geo`
-(cross-asset/geopolitical backdrop), `--no-intraday`, `--candle box|braille|sixel`, `--prev N`.
-Full operational reference: CLAUDE.md.
+(cross-asset/geopolitical backdrop), `--no-intraday`, `--candle box|braille|sixel`, `--prev N`,
+`--vol` (straddle/strangle context), `--pc-oi`, `--live` (S40 intraday mode), `--squeeze` (S41
+short positioning), `--insider` (S42 EDGAR Form 4 cluster buys). SETUP CHECK checklist + F&G
+backdrop segment are default-on (S41). Full operational reference: CLAUDE.md.
 
 How the project got here (the journey)
 --------------------------------------
@@ -129,6 +131,120 @@ never crashes). Shared `features.earnings_dates` helper. Caveats printed: ~8-ear
 is indicative not proof; `atm_iv_30d` is a constant-maturity 30d proxy (blunts the true front-expiry
 ramp — AMD reads a weak/inconsistent ramp partly for this reason); BS r=q=0, no fills. 18 smoke tests.
 
+S40: `--vol` HONESTY PASS — a CRSP run (validated on NVDA/QQQ) exposed three defects that made the
+scorecard's verdict dishonest exactly when it matters, all fixed:
+(1) **The IV cheap/rich factor used the HV-20 proxy, not real IV.** `features.IV_rank`/`IV_pct` are
+HV-20's position in its own 1y range (the pre-Massive proxy) — pre-catalyst, implied ramps while the
+stock stays quiet, and the proxy misses it. Live CRSP: real ATM IV at the 97%ile of its 178-row
+history while the proxy read 0.44 "Mid" → no counterweight → "favor BUYING vol (2–0)" at the top of
+the IV range. Fix: `volsetup.gauge_pct(ctx,"ATM IV (30d)")` — the factor now uses the REAL harvested
+percentile (bands `IV_PCT_LOW/HIGH` = 0.30/0.70); HV-proxy only as an explicitly-labeled fallback
+when IV history is thin (<63 obs → pct None; QQQ exercises this path until its backfill is redone).
+Gauges renamed `IV Rank (HV-proxy)` / `IV Pctile (HV-proxy)` so they can't be read as real IV
+(fits the ≤20-char gauge column; volsetup lookup updated).
+(2) **Wing snap was pure max-OI within the nearest 3 — a moth to round numbers.** Reproduced live:
+NVDA put target 185.1 picked 190 (OI 39k) over the perfectly liquid 185 (OI 21k, 5¢ spread), tilting
+the strangle −3.5%/+6.6% while the averaged "≈±5%" label hid it; CRSP decided 42.5-vs-45 on 47-vs-42
+OI noise. Fix: `SNAP_OI_FRAC=0.5` — nearest tradeable candidate holding ≥half the busiest candidate's
+OI (dead strikes still skipped; busiest always qualifies so the pick can't fail; OI tie-break on
+equidistant strikes). Labels now PER-WING (`−a% / +b%`, `target ±EM` clause when ≥1pp off), and an
+`at ask:` cost/BE line prints when mid understates executable cost by >3% (CRSP straddle $11.10 mid
+vs $14.00 ask on an OI-0 fresh weekly — visible; NVDA/QQQ tight spreads — hidden). `_combo` gains
+ask-side fields; SCOPEKEY straddle5→straddle6.
+(3) **Off-horizon/unconditional factors.** Intraday (1h/4h) squeezes no longer count as long-vol
+factors (`SQUEEZE_TFS = 1M/1W/1D`; the compression line still lists all TFs) — a 4h squeeze says
+nothing about a 51-DTE option. And the earnings catalyst demotes to a `notes` line ("event premium
+likely priced; ramp mostly done") when real ATM IV already ≥70%ile — an upcoming print is only a
+reason to buy vol while it's still cheap. Hint copy aligned to S38: "exit BEFORE the print; IV crush
+erases the ramp" (was "size for the IV crush"). Post-fix CRSP reads "no clear vol edge" with the
+97%ile short factor + priced-event note — the honest read. 19 smoke tests (test 16 rewritten for the
+new snap rule + new test 19 for the factor logic, both offline).
+
+S40 (cont.): **CRSP IV backfill = DEAD END — do not re-attempt.** User ran it (~26% "fill rate", but
+the work list was 447 dates = 329 missing IV + 118 missing only term_structure; most fills were
+term-refills → only +23 net new atm_iv_30d rows, 172/501 sessions = 34% coverage). Vol study still
+0/8 earnings usable: it needs IV at three exact sessions (entry −10 / pre −1 / post +1) and EVERY
+CRSP earnings is missing pre and/or post with nothing within ±3 sessions (measured — a tolerance
+patch rescues zero). Root cause is structural, not tunable: (1) pre-print option flow migrates into
+short-dated event expiries (7–21 DTE), so the backfill's 23–37 DTE window has literally zero ATM
+trades on the sessions the study needs; (2) CRSP is so thin that even its event expiries printed
+vol=5/trades=4 max the day before a report — below the ≥5/≥5 artifact gates, and rightly so. Massive
+history on this plan is TRADES-only; an IV nobody traded can't be reconstructed (quote/NBBO history
+= higher tier). **Forward path**: the daily harvest is QUOTE-based and fills reliably — run the
+daily refresh through earnings windows (for 2026-08-10: especially Aug 7 pre + Aug 11 post) and each
+print becomes a usable study row; MIN_USABLE=3 ⇒ study unlocks ~mid-2027. Until then the Aug-10 play
+rests on live `--vol` context only. Known-but-deferred (user skipped): backfill overwrites
+quote-based harvest IV on term-refill dates (docstring "never overwritten" is wrong — fix = write
+only NaN keys); lens `--vol` history line still suggests backfill_iv.py for CRSP where it can't help.
+
+S40 (cont.): `lens.py --live` — INTRADAY mode. Motivated by measured source freshness (2026-07-02,
+market open): **Tradier brokerage-token market data is REAL-TIME (~4s delay on trades AND quotes)**;
+Massive Options Starter snapshots are 15-min-delayed values with NO last_quote/last_trade fields
+(IV/greeks/OI/day only — gauge engine, not a live feed); yfinance daily structurally excludes today
++ its intraday endpoint gets throttled intermittently (measured: worked 11:50, refused 12:37 same
+day). `--live` (all Tradier, all display-only, non-live runs byte-identical):
+(1) provisional today-bar from `get_daily_quote` (`timeframes.fetch_live_bar`/`apply_live_bar`) —
+header "LIVE HH:MM ET", today's forming candle, 1D marked `*` (partial → volume reads use last
+completed bar), 1W/1M re-derived so the forming week/month absorb it; skipped when the CSV already
+covers today; NEVER written to disk (Tradier is unadjusted — same convention as the S30 stamp).
+(2) 1h frame topped up to the current session via NEW `tradier.get_timesales` (15min→60m resample
+onto yfinance's :30-anchored grid; `merge_intraday_topup` replaces overlapping cached hours);
+forming 1h/4h bars now marked partial in live mode — fixes the misleading `RVOL 0.0x` a
+2-minute-old hour used to print (CRSP verify: 1h 0.0x → `1h* 1.4x`, the honest read on a +5.5% day).
+(3) live ATM IV gauge (`tradier.get_atm_iv`, smv) printed beside the harvested one — CRSP verify
+showed 67.0% live vs 63.8% harvested [97%ile], i.e. IV pumping intraday — and used for the expected
+move; the scorecard's percentile stays harvest-based (history needs the harvested series).
+(4) `--pc-oi`/`--vol` quote caches force-refreshed (`force=` param on `gather_pc_oi`/
+`straddle_quote`). Also hardened independently of --live: `_load_intraday` falls back to a stale
+cache with a note instead of dropping 1h/4h when Yahoo refuses the download. 21 smoke tests
+(test 20 live-bar append, test 21 top-up merge, both offline).
+
+S41 (same working day as S40): squeeze block + setup checklist + Fear & Greed. Three additions,
+all CONTEXT (transparent factor lists, no prediction), all sources probed live before building:
+(1) **`--squeeze` SHORT POSITIONING block** (`modules/shortint.py`): bi-monthly short interest +
+days-to-cover from the NASDAQ API (unofficial, UA-gated, session-stale cache; **NASDAQ-LISTED
+NAMES ONLY** — NYSE tickers like JPM/F return an explicit no-data message, rendered honestly as
+n/a; FINRA Query API is the future fix for NYSE coverage) + daily short-volume ratio from FINRA
+Reg SHO files (official CDN, no auth; per-ticker incremental cache — first run ~90 small files,
+then 1/day; percentile via `sentiment.percentile_of`) + a pure two-sided fuel-vs-counter
+scorecard (`squeeze_read`: DTC ≥8/≥15, SI ±10% settlement-over-settlement, SVR ≥80%ile,
+shorting-into-a-rally "underwater" read, +3%/1.5x covering thrust, call-flow surge off `--pc-oi`
+totals when present, LVN air ≤+8% overhead from the lens' own volume profile). Verified live:
+CRSP read "SQUEEZE CONDITIONS PRESENT" on DTC 16.3 EXTREME + SI +23% + call-heavy flow + LVN air
+— while its 57% SVR day correctly did NOT fire (only 42%ile of CRSP's ~50% baseline — the
+percentile-not-level design working); JPM read partial/absent. Caveats always printed (bi-monthly
+lag, MM baseline, fuel ≠ ignition).
+(2) **SETUP CHECK** (`modules/setupcheck.py`, default-on): ✓/✗/– completeness checklist — HTF
+alignment, momentum room, volume confirmation, NEW relative-strength-vs-benchmark row
+(`TICKER_BENCHMARK` first entry / SPY fallback, one yf fetch, series aligned to common last
+date), value-area location, vol regime (very-rich IV ✗; VIX stress → S21 contrarian note, not a
+fail), catalyst timing (earnings ≤7d / Tier-1 macro ≤1d = flagged `–`, never failed — may be
+intentional). Explicit footer: completeness, not probability. Blind-spot catcher per the S34
+ethos — the S32 lesson (no free-data edge) stands.
+(3) **CNN Fear & Greed** (`modules/fng.py`): unofficial endpoint (418 without browser UA +
+Referer), ~6h cache, percentile off the payload's own ~1y history; on the lens MARKET BACKDROP
+line (`F&G 31 fear [24%ile]`) + a market_context.py gauge with the S21 contrarian note.
+24 smoke tests (22 shortint parsers/scorecard, 23 setupcheck, 24 fng — all offline fixtures).
+Rejected/deferred for sentiment: earnings-call transcripts (no reliable free source), Reddit/
+StockTwits mention counts (noisy; possible later), Ortex borrow/utilization (paid; the free
+NASDAQ+FINRA combo is the legitimate substitute).
+
+S42 (same working day): **`--insider` EDGAR block — BUILT** (`modules/insider.py`), per the S41
+sketch. Data path all official/free: `company_tickers.json` ticker→CIK (cached 7d) →
+`data.sec.gov/submissions/CIK{cik}.json` recent Form 4 accessions → per-filing raw XML (the
+`primaryDocument` xsl-prefix is stripped to reach the raw file). SEC fair-access respected:
+User-Agent carries a contact email (`$env:SEC_CONTACT` overrides the default), 0.12s sleep between
+requests, ≤25 filings/run, per-ticker summary cached session-stale under `data/insider_cache/`.
+Scoring: NON-DERIVATIVE open-market P/S only (M/A/G/F excluded — not conviction trades);
+trailing-90d net $ flow + **cluster-buy detection** (≥2 DISTINCT insiders buying inside any 30d
+window — Lakonishok-Lee; best window reported with owners/$/dates). Read is two-sided house
+style; caveats always printed (sales = diversification/comp noise — never a short thesis; Form 4
+files ≤2 business days after the trade; 10b5-1 planned sales not separated). Verified live:
+CRSP → "$-210,577, 0 buys / 1 sell — sales only, weakly informative"; NVDA → "$-410.6M, 7 sells /
+3 insiders" with the ⚑ broad-selling flag (the 10b5-1 caveat earning its keep); second run 2.7s
+(session cache). 25 smoke tests (test 25: Form 4 XML parse, code filtering, 30d-window/distinct-
+owner cluster logic, net-flow read — offline fixtures).
+
 --geo cross-asset / geopolitical backdrop (S35)
 -----------------------------------------------
 Opt-in (`--geo`, default off). Surfaces the assets that move on geopolitical/macro shocks — the
@@ -209,7 +325,9 @@ Operational notes
 Outstanding / backlog
 ---------------------
 - IV backfills wiped pre-S23 and not yet restored: SOFI, LYFT, QQQ (~15–25 min each, backfill_iv.py);
-  AAPL missing entirely. AMD (462 rows) + NVDA (452) intact.
+  AAPL missing entirely. AMD (462 rows) + NVDA (452) intact. CRSP sparse (178 rows, gaps around
+  earnings → `--vol` history line unavailable; backfill offered and declined in S40 — run before
+  trusting the CRSP pre-earnings ramp thesis).
 - Re-validate any NVDA-passed history (every pre-S31 cross-check used leaked features).
 - Optional `--geo` polish: normalize EPU/GPR to a ~365-obs window so all gauges are a true 1-year
   percentile (currently ~8mo for the calendar-daily indices).

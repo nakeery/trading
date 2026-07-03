@@ -144,6 +144,20 @@ if __name__ == "__main__":
         print(f"  No indicators CSV for {ticker} in {args.data_dir}/ — run indicators.py first.")
         sys.exit(1)
 
+    # CNN Fear & Greed (S41) — market-level sentiment gauge, cached ~6h; best-effort.
+    try:
+        from modules.fng import fetch_fng
+        fng = fetch_fng(data_dir=args.data_dir)
+        if fng and fng.get("score") is not None:
+            ctx["gauges"].append({"group": "MARKET", "name": "Fear & Greed (CNN)",
+                                  "value": fng["score"], "fmt": "{:.0f}",
+                                  "label": fng.get("rating", ""), "pct": fng.get("pct")})
+            if "fear" in (fng.get("rating") or ""):
+                ctx["notes"].append("F&G in fear territory — S21: for this framework's signals, "
+                                    "stress/fear has historically been a contrarian BUY, not a sell.")
+    except Exception:
+        pass
+
     print_console(ctx)
 
     if args.graphical:

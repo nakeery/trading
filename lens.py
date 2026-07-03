@@ -24,7 +24,7 @@ import sys
 
 import pandas as pd
 
-from modules.timeframes import build_timeframes, last_bar_partial
+from modules.timeframes import build_timeframes, last_bar_partial, fetch_live_bar, apply_live_bar
 from modules.structure import (
     read_timeframe, read_volume, detect_divergence,
     multi_timeframe_summary, rally_drawdown_risk, read_squeeze,
@@ -56,6 +56,27 @@ try:
     from modules.vol_history import pre_earnings_vol_study
 except Exception:
     pre_earnings_vol_study = None
+try:
+    from modules.tradier import get_atm_iv
+except Exception:
+    get_atm_iv = None
+try:
+    from modules.shortint import gather_squeeze
+except Exception:
+    gather_squeeze = None
+try:
+    from modules.setupcheck import setup_check, fetch_rs, TIER1_MACRO
+except Exception:
+    setup_check = fetch_rs = None
+    TIER1_MACRO = set()
+try:
+    from modules.fng import fetch_fng
+except Exception:
+    fetch_fng = None
+try:
+    from modules.insider import gather_insider
+except Exception:
+    gather_insider = None
 try:
     from modules.econ_calendar import next_event_per_series, ALL_SERIES
 except Exception:
@@ -399,14 +420,31 @@ def sixel_candles(bars, color=True, cell_w=14, gap=8, height_px=128):
     return _to_sixel(grid, palette)
 
 
-def analyze(ticker, include_intraday=True, data_dir="data"):
-    frames, notes = build_timeframes(ticker, data_dir=data_dir, include_intraday=include_intraday)
+def analyze(ticker, include_intraday=True, data_dir="data", live=False):
+    frames, notes = build_timeframes(ticker, data_dir=data_dir, include_intraday=include_intraday,
+                                     intraday_ttl_hours=0 if live else 3, live=live)
+    live_bar = None
+    if live:
+        live_bar = fetch_live_bar(ticker)
+        if live_bar is None:
+            notes.append("live: no Tradier session data for today — showing last close.")
+        else:
+            # display-only provisional today-bar; skipped when the frame already covers today
+            # (post-close refresh already ran). 1W/1M re-derived so the forming period absorbs it.
+            live_bar["applied"] = apply_live_bar(frames, live_bar)
+    live_partial = bool(live_bar and live_bar.get("applied") and live_bar.get("in_progress"))
+    now_naive = pd.Timestamp.now(tz="America/New_York").tz_localize(None)
     reads, divs = {}, {}
     for tf, df in frames.items():
         r = read_timeframe(df)
         if not r.get("ok"):
             continue
-        partial = last_bar_partial(frames.get("1D"), tf)
+        partial = last_bar_partial(frames.get("1D"), tf) or (live_partial and tf == "1D")
+        if live and tf in ("1h", "4h") and len(df):
+            # in live mode the last intraday bar can be the forming hour — treat it as partial so
+            # RVOL/ΔVol% use the last completed bar (same convention as the W/M/1D partial bars).
+            bar_min = 60 if tf == "1h" else 240
+            partial = partial or (now_naive < df.index[-1] + pd.Timedelta(minutes=bar_min))
         r["_vol"] = read_volume(df, exclude_last=partial)
         r["_partial"] = partial
         reads[tf] = r
@@ -419,7 +457,7 @@ def analyze(ticker, include_intraday=True, data_dir="data"):
     # structure, not year-old levels; daily fallback = 252 sessions ≈ 1y.
     lookback = 880 if "1h" in frames else 252
     profile = volume_profile(prof_src, lookback=lookback) if prof_src is not None else None
-    return frames, reads, divs, summary, profile, notes
+    return frames, reads, divs, summary, profile, notes, live_bar
 
 
 def _fmt_vol(v):
@@ -434,7 +472,8 @@ def _fmt_vol(v):
 
 def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as_of=None,
                  ctx=None, backdrop=None, thesis=None, level=None, color=True, candle_style="box",
-                 panel_bars=None, candle_px=128, geo=None, pcoi=None, vol=None):
+                 panel_bars=None, candle_px=128, geo=None, pcoi=None, vol=None, live=None,
+                 setup=None, squeeze=None, insider=None):
     w = 78
     print(f"\n{'═'*w}")
     hdr = f"  LENS — {ticker}"
@@ -443,7 +482,9 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         chg_pct = (chg / last_bar["prev_close"] * 100) if last_bar["prev_close"] else 0.0
         arrow = "▲" if chg >= 0 else "▼"
         hdr += f"   ${last_bar['close']:,.2f}  {arrow} {chg:+.2f} ({chg_pct:+.2f}%)"
-    if as_of:
+    if live and live.get("applied") and live.get("in_progress"):
+        hdr += f"  (LIVE {live['hhmm']} ET, session in progress)"
+    elif as_of:
         hdr += f"  (close {as_of})"
     print(f"{hdr}   ·   state characterization, NOT a prediction")
     print(f"{'═'*w}")
@@ -574,6 +615,13 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         for f in risk["rally"]:
             print(f"      • {f}")
 
+    # 5b. SETUP CHECK — transparent completeness checklist (S41; default-on, best-effort)
+    if setup and setup.get("rows"):
+        print(f"\n  SETUP CHECK  ({setup['net']})")
+        for label, mark, detail in setup["rows"]:
+            print(f"    {mark} {label:<18}{detail}")
+        print(f"    · {setup['footer']}")
+
     # 6. OPTIONS & VOL CONTEXT
     if ctx and ctx.get("gauges"):
         print(f"\n  OPTIONS & VOL CONTEXT  (regime: {ctx['regime']})")
@@ -584,6 +632,63 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
                 lab = f"  {g['label']}" if g.get("label") else ""
                 print(f"    {g['name']:<20}{val:>9}{lab}{pct}")
         print(f"    NET: {ctx['net']}")
+
+    # 6a. SHORT POSITIONING / SQUEEZE (--squeeze; S41 — fuel context, not an ignition forecast)
+    if squeeze:
+        print(f"\n  SHORT POSITIONING / SQUEEZE  (context, not a prediction)")
+        si = squeeze.get("si")
+        if si and si.get("interest"):
+            chg = f"   Δ vs prior settlement {si['chg']:+.1%}" if si.get("chg") is not None else ""
+            age = f", {si['settle_age']}d ago" if si.get("settle_age") is not None else ""
+            print(f"    short interest   {si['interest']/1e6:,.1f}M shares (settled {si.get('settle_date')}{age}){chg}")
+            if si.get("dtc") is not None:
+                adv = f"  (avg daily vol {si['adv']/1e6:,.1f}M)" if si.get("adv") else ""
+                print(f"    days-to-cover    {si['dtc']:.1f}{adv}")
+        else:
+            print(f"    short interest   n/a — source covers NASDAQ-listed names only "
+                  f"(NYSE tickers return no data)")
+        sv = squeeze.get("svr") or {}
+        if sv.get("now") is not None:
+            pct = f"  [{sv['pct']:.0%}ile of {sv['n']} sessions]" if sv.get("pct") is not None else ""
+            avgs = ""
+            if sv.get("avg5") is not None and sv.get("avg20") is not None:
+                avgs = f" · 5d avg {sv['avg5']:.0%} · 20d avg {sv['avg20']:.0%}"
+            print(f"    short-volume     {sv['now']:.0%} of volume (latest){avgs}{pct}")
+        read = squeeze.get("read") or {}
+        print(f"    NET: {read.get('net', 'n/a')}")
+        if read.get("fuel"):
+            print(f"    squeeze fuel:")
+            for f in read["fuel"]:
+                print(f"      • {f}")
+        if read.get("counter"):
+            print(f"    counter:")
+            for f in read["counter"]:
+                print(f"      • {f}")
+        for c in read.get("caveats", []):
+            print(f"    · {c}")
+
+    # 6b. INSIDER ACTIVITY (--insider; S42 — SEC Form 4 open-market flow, cluster-buy detection)
+    if insider:
+        rd = insider.get("read") or {}
+        print(f"\n  INSIDER ACTIVITY — SEC Form 4, trailing {insider.get('lookback_days', 90)}d  "
+              f"(context, not a prediction)")
+        usd = rd.get("net_usd")
+        usd_s = f"${usd:+,.0f}" if usd else "$0"
+        print(f"    net open-market flow  {usd_s}  ({rd.get('n_buys', 0)} buys / "
+              f"{rd.get('n_sells', 0)} sells, {rd.get('n_owners', 0)} distinct insiders)")
+        lb = rd.get("latest_buy")
+        if lb:
+            px = f" @ {lb['price']:,.2f}" if lb.get("price") else ""
+            usd_b = f"  (${lb['usd']:,.0f})" if lb.get("usd") else ""
+            print(f"    latest buy   {lb['date']}  {lb['owner']} ({lb['role']})  "
+                  f"{lb['shares']:,.0f} sh{px}{usd_b}")
+        print(f"    NET: {rd.get('net', 'n/a')}")
+        for f in rd.get("positive", []):
+            print(f"      • {f}")
+        for f in rd.get("flags", []):
+            print(f"      ⚑ {f}")
+        for c in rd.get("caveats", []):
+            print(f"    · {c}")
 
     # PUT/CALL OI — live Tradier chain, by expiry (--pc-oi; positioning, not a prediction).
     # Distinct from the OPTIONS "Put/Call OI" gauge above (Massive-harvested ~30d blended snapshot).
@@ -627,6 +732,8 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         elif hist and hist.get("status") == "insufficient_iv":
             print(f"    history: IV history thin — run `backfill_iv.py` ({hist['ticker']})")
         print(f"    NET: {s['net']}")
+        for n in s.get("notes", []):
+            print(f"      · {n}")
         if s["long_vol"]:
             print(f"    favors BUYING vol (straddle/strangle):")
             for f in s["long_vol"]:
@@ -654,6 +761,15 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
                     return f"{o['strike']:g}{cp}  OI {oi}  bid/ask {o['bid']:.2f}/{o['ask']:.2f}"
                 return f"          {one(lg['put'], 'p')}   ·   {one(lg['call'], 'c')}"
 
+            def _askln(cb):
+                # executable (ask-side) cost/BEs — shown only when the mid understates it by >3%,
+                # so tight-spread names stay clean and wide-spread ones stop flattering themselves
+                ca = cb.get("cost_ask")
+                if not ca or ca <= cb["cost"] * 1.03:
+                    return None
+                return (f"          at ask: ${ca:.2f}/sh → BE {cb['lo_ask']:.2f} / {cb['hi_ask']:.2f}  "
+                        f"(need −{cb['dn_move_ask']:.1%} / +{cb['up_move_ask']:.1%})")
+
             for blk in q["quotes"]:
                 kind = blk.get("expiry_kind", "")
                 dae = blk.get("days_after_earn")
@@ -663,18 +779,25 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
                 if stq:
                     print(f"        ATM straddle  {stq['call_strike']:g}: ${stq['cost']:.2f}/sh  "
                           f"BE {stq['lo']:.2f} / {stq['hi']:.2f}  (need −{stq['dn_move']:.1%} / +{stq['up_move']:.1%})")
-                    sl = _legln(stq)
-                    if sl:
-                        print(sl)
+                    for ln in (_legln(stq), _askln(stq)):
+                        if ln:
+                            print(ln)
                 if sg:
                     tw = sg.get("target_width")
-                    drift = (f", target ±{tw:.0%}"
-                             if tw is not None and round(tw * 100) != round(sg["width"] * 100) else "")
-                    print(f"        auto strangle (≈±{sg['width']:.0%}{drift})  {sg['put_strike']:g} / {sg['call_strike']:g}: "
+                    dnw, upw = sg.get("dn_width"), sg.get("up_width")
+                    if dnw is not None and upw is not None:
+                        # per-wing widths (S40) — a snapped/tilted strangle shows as e.g. −3.5% / +6.6%
+                        off = tw is not None and (abs(dnw - tw) >= 0.01 or abs(upw - tw) >= 0.01)
+                        wing = f"−{dnw:.1%} / +{upw:.1%}" + (f", target ±{tw:.0%}" if off else "")
+                    else:
+                        drift = (f", target ±{tw:.0%}"
+                                 if tw is not None and round(tw * 100) != round(sg["width"] * 100) else "")
+                        wing = f"≈±{sg['width']:.0%}{drift}"
+                    print(f"        auto strangle ({wing})  {sg['put_strike']:g} / {sg['call_strike']:g}: "
                           f"${sg['cost']:.2f}/sh  BE {sg['lo']:.2f} / {sg['hi']:.2f}  (need −{sg['dn_move']:.1%} / +{sg['up_move']:.1%})")
-                    gl = _legln(sg)
-                    if gl:
-                        print(gl)
+                    for ln in (_legln(sg), _askln(sg)):
+                        if ln:
+                            print(ln)
             print("      vega: straddle = max vega (enter close to the print); "
                   "strangle = cheaper + lower theta (enter earlier / run more names / vega convexity)")
 
@@ -823,6 +946,19 @@ if __name__ == "__main__":
                     help="Add a live Tradier put/call OI block by expiry. Bare = all expiries; combine any of "
                          "near (≤45 DTE) / leaps (180–365 DTE) / monthly (3rd-Friday only), e.g. `--pc-oi leaps monthly`. "
                          "Network; needs TRADIER_TOKEN.")
+    ap.add_argument("--insider", action="store_true",
+                    help="Add an INSIDER ACTIVITY block: trailing-90d open-market Form 4 flow from "
+                         "SEC EDGAR (official API) with cluster-buy detection. Network; cached; "
+                         "set $env:SEC_CONTACT to put your contact in the SEC User-Agent.")
+    ap.add_argument("--squeeze", action="store_true",
+                    help="Add a SHORT POSITIONING / SQUEEZE block: bi-monthly short interest + "
+                         "days-to-cover (NASDAQ), daily short-volume ratio with trailing percentile "
+                         "(FINRA Reg SHO), and a two-sided squeeze-fuel scorecard. Network; cached.")
+    ap.add_argument("--live", action="store_true",
+                    help="Intraday mode: append a live provisional today-bar from the Tradier quote "
+                         "(real-time; display-only, marked * while the session is open), force-refresh "
+                         "the intraday cache and the --pc-oi/--vol quote caches, and show a live "
+                         "Tradier ATM IV beside the harvested gauge.")
     ap.add_argument("--vol", action="store_true",
                     help="Add a VOLATILITY SETUP block — Bollinger-Keltner squeeze, expected move + breakevens, "
                          "earnings catalyst, and a two-sided long-vol (straddle/strangle) vs short-vol scorecard.")
@@ -843,6 +979,12 @@ if __name__ == "__main__":
         tickers = [t]
 
     backdrop_base = market_backdrop(args.data_dir)   # SPY tide — same for all tickers, computed once
+    if fetch_fng is not None:                        # CNN Fear & Greed (S41) — market-level, cached ~6h
+        fng = fetch_fng(data_dir=args.data_dir)
+        if fng and fng.get("score") is not None:
+            pct = f" [{fng['pct']:.0%}ile]" if fng.get("pct") is not None else ""
+            seg = f"F&G {fng['score']:.0f} {fng['rating']}{pct}"
+            backdrop_base = f"{backdrop_base}  |  {seg}" if backdrop_base else seg
 
     for ticker in tickers:
         if not args.no_refresh:
@@ -852,8 +994,9 @@ if __name__ == "__main__":
                 print(f"  ↻ {ticker}: {'building' if csv_missing else 'refreshing'} indicators data…")
                 _refresh_indicators(ticker, args.data_dir)
         try:
-            frames, reads, divs, summary, profile, notes = analyze(
-                ticker, include_intraday=not args.no_intraday, data_dir=args.data_dir)
+            frames, reads, divs, summary, profile, notes, live_bar = analyze(
+                ticker, include_intraday=not args.no_intraday, data_dir=args.data_dir,
+                live=args.live)
         except FileNotFoundError as e:
             print(f"  Could not load data for {ticker}: {e}")
             continue
@@ -864,6 +1007,22 @@ if __name__ == "__main__":
                 ctx = gather_context(ticker, data_dir=args.data_dir, with_vix=True)
             except Exception as e:
                 notes.append(f"options/vol context unavailable ({type(e).__name__}).")
+
+        # --live: real-time ATM IV from Tradier (smv), shown beside the harvested gauge so
+        # "IV now" and "IV's place in its history" are both visible intraday.
+        live_iv = None
+        if args.live and get_atm_iv is not None:
+            try:
+                spot_now = float(frames["1D"]["Close"].iloc[-1]) if "1D" in frames else None
+                live_iv = get_atm_iv(ticker, current_price=spot_now)
+            except Exception:
+                live_iv = None
+            if live_iv and ctx and ctx.get("gauges"):
+                gs = ctx["gauges"]
+                pos = next((i + 1 for i, x in enumerate(gs) if x.get("name") == "ATM IV (30d)"), 0)
+                gs.insert(pos, {"group": "OPTIONS", "name": "ATM IV (live)", "value": live_iv["iv"],
+                                "fmt": "{:.1%}", "label": f"Tradier now, {live_iv['dte']}d",
+                                "pct": None})
 
         backdrop = backdrop_base
         if ctx and ctx.get("regime") and ctx["regime"] != "n/a" and backdrop:
@@ -883,7 +1042,8 @@ if __name__ == "__main__":
             tenor = "near" if "near" in toks else "leaps" if "leaps" in toks else "all"
             try:
                 pc = gather_pc_oi(ticker, preset=tenor, monthly=monthly,
-                                  interactive=sys.stdin.isatty(), data_dir=args.data_dir)
+                                  interactive=sys.stdin.isatty(), data_dir=args.data_dir,
+                                  force=args.live)
             except Exception as e:
                 notes.append(f"put/call OI unavailable ({type(e).__name__}).")
             else:
@@ -892,24 +1052,68 @@ if __name__ == "__main__":
                 elif pc.get("cached") and pc.get("stale"):
                     notes.append(f"put/call OI cached {pc['age_str']} and stale — run in a terminal to refresh.")
 
+        # earnings date — shared by the --vol block and the SETUP CHECK (S41)
+        earn = None
+        if next_earnings is not None:
+            try:
+                earn = next_earnings(ticker, daily=frames.get("1D"))
+            except Exception:
+                earn = None
+
         vol = None
         if args.vol and vol_setup is not None:
             try:
                 spot = float(frames["1D"]["Close"].iloc[-1]) if "1D" in frames else None
                 squeeze = {tf: read_squeeze(frames[tf]) for tf in frames}
-                em = expected_move(spot, gauge_val(ctx, "ATM IV (30d)"), dte=30,
+                # --live: prefer the real-time Tradier IV for the expected move (spot is already
+                # live via the provisional today-bar); the scorecard percentile stays harvest-based.
+                em_iv = (live_iv or {}).get("iv") or gauge_val(ctx, "ATM IV (30d)")
+                em = expected_move(spot, em_iv, dte=30,
                                    hv=gauge_val(ctx, "HV-20 (annualized)"))
-                earn = next_earnings(ticker, daily=frames.get("1D")) if next_earnings else None
                 vol = {"squeeze": squeeze, "em": em, "earnings": earn,
                        "setup": vol_setup(reads, squeeze, ctx, earnings=earn, em=em),
                        "quote": (straddle_quote(ticker, earnings_date=(earn or {}).get("date"),
                                                 interactive=sys.stdin.isatty(),
-                                                data_dir=args.data_dir) if straddle_quote else None),
+                                                data_dir=args.data_dir,
+                                                force=args.live) if straddle_quote else None),
                        "history": (pre_earnings_vol_study(ticker, interactive=sys.stdin.isatty(),
                                                           data_dir=args.data_dir)
                                    if pre_earnings_vol_study else None)}
             except Exception as e:
                 notes.append(f"vol setup unavailable ({type(e).__name__}).")
+
+        # SHORT POSITIONING / SQUEEZE (--squeeze; S41) — reuses the lens' own profile + pc flow.
+        sqz = None
+        if args.squeeze and gather_squeeze is not None:
+            rvol_1d = ((reads.get("1D") or {}).get("_vol") or {}).get("rvol")
+            sqz = gather_squeeze(ticker, daily=frames.get("1D"), rvol=rvol_1d, pc=pc,
+                                 profile=profile, data_dir=args.data_dir)
+            if sqz is None:
+                notes.append("short-positioning data unavailable (NASDAQ/FINRA fetch failed).")
+
+        # INSIDER ACTIVITY (--insider; S42) — SEC EDGAR Form 4 open-market flow, cached.
+        ins = None
+        if args.insider and gather_insider is not None:
+            ins = gather_insider(ticker, data_dir=args.data_dir)
+            if ins is None:
+                notes.append("insider activity unavailable (EDGAR fetch failed / unknown ticker).")
+
+        # SETUP CHECK (S41; default-on, best-effort) — pure synthesis + one RS benchmark fetch.
+        setup = None
+        if setup_check is not None and reads:
+            try:
+                macro_t1 = None
+                if next_event_per_series is not None:
+                    ev = next_event_per_series(data_dir=args.data_dir)
+                    t1 = [days for name, (d, days) in ev.items()
+                          if name in TIER1_MACRO and days is not None]
+                    macro_t1 = min(t1) if t1 else None
+                rs = (fetch_rs(ticker, frames["1D"], data_dir=args.data_dir)
+                      if (fetch_rs is not None and "1D" in frames) else None)
+                setup = setup_check(reads, profile=profile, ctx=ctx, earn=earn,
+                                    macro_tier1_days=macro_t1, rs=rs)
+            except Exception as e:
+                notes.append(f"setup check unavailable ({type(e).__name__}).")
 
         last_bar, as_of, panel_bars = None, None, None
         if "1D" in frames:
@@ -929,4 +1133,6 @@ if __name__ == "__main__":
 
         print_report(ticker, reads, divs, summary, profile, notes, last_bar=last_bar, as_of=as_of,
                      ctx=ctx, backdrop=backdrop, thesis=args.thesis, level=args.level, color=use_color,
-                     candle_style=args.candle, panel_bars=panel_bars, candle_px=args.candle_px, geo=geo, pcoi=pc, vol=vol)
+                     candle_style=args.candle, panel_bars=panel_bars, candle_px=args.candle_px,
+                     geo=geo, pcoi=pc, vol=vol, live=live_bar, setup=setup, squeeze=sqz,
+                     insider=ins)

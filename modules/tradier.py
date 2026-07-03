@@ -63,6 +63,24 @@ def get_daily_history(ticker, start, end):
         return []
 
 
+def get_timesales(ticker, interval="15min", start=None, end=None):
+    """Intraday bars from Tradier (real-time with a brokerage token). `interval` ∈ tick/1min/5min/
+    15min; start/end are 'YYYY-MM-DD HH:MM' (ET). session_filter=open → regular-hours bars only
+    (matches yfinance's 60m series). Availability: ~20 days back for 1min, ~40 days for 15min.
+    Returns a list of {time, timestamp, open, high, low, close, volume, ...} dicts; [] on failure."""
+    try:
+        params = {"symbol": ticker, "interval": interval, "session_filter": "open"}
+        if start:
+            params["start"] = start
+        if end:
+            params["end"] = end
+        data = _get("/markets/timesales", params)
+        bars = (data.get("series") or {}).get("data", [])
+        return [bars] if isinstance(bars, dict) else (bars or [])
+    except Exception:
+        return []
+
+
 def get_expirations(ticker):
     data = _get("/markets/options/expirations", {"symbol": ticker})
     return data["expirations"]["date"]

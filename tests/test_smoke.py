@@ -1,7 +1,7 @@
 """
 Smoke tests for the options trading ML pipeline.
 
-18 regression guards:
+25 regression guards:
   1. Signal hierarchy (backtest CSV) — STRONG ENTRY > CAUTION > STAY OUT by avg return
   2. STRONG ENTRY baseline sanity (backtest CSV) — count/return/win-rate loose bounds
   3. Vol thresholds range (QQQ indicators CSV) — positive values in expected ranges
@@ -18,12 +18,25 @@ Smoke tests for the options trading ML pipeline.
  13. upcoming_events window filter — within_days arg correctly bounds the result set
  14. sentiment labelers — IV/HV, skew, term, P/C, IV-regime bands + percentile_of behavior
  15. geocontext helpers — cross-asset stress-tail detection + composite level (offline)
- 16. volquote _liquid_strike — snaps a strangle wing to the most-liquid nearby OTM strike
-     (min-leg OI, tighter-spread tiebreak, tradeable filter, OTM-side + fallback)
+ 16. volquote _liquid_strike — snaps a strangle wing to the NEAREST liquid-enough OTM strike
+     (S40: OI ≥ SNAP_OI_FRAC × busiest candidate; tradeable filter, OTM-side + fallback)
  17. volquote _select_expiries — earnings-aware expiry choice: two post-earnings blocks when
      nearest != nearest-monthly, one when they coincide, fallback + note when earnings far/None
  18. vol_history pre_earnings_vol_study — synthetic IV ramp → status ok (ramp>0, crush<0, P&L>0),
      all-NaN IV → insufficient_iv; backfill_iv.backfill → no_massive_key when key unset (offline)
+ 19. volsetup vol_setup factors — real ATM-IV percentile drives cheap/rich (HV-proxy fallback
+     labeled), earnings demoted to a note when IV already high, intraday squeezes don't count (S40)
+ 20. timeframes live-bar append — provisional Tradier session bar appended once, skipped when the
+     date is already covered; apply_live_bar re-derives the forming 1W/1M (S40 --live, offline)
+ 21. timeframes intraday top-up merge — Tradier hourly bars replace overlapping cached hours and
+     extend the frame; empty top-up no-op (S40 --live, offline)
+ 22. shortint parsers + squeeze scorecard — FINRA/NASDAQ fixtures parse; CRSP-like → PRESENT,
+     JPM-like → ABSENT; call-flow factor gated on pc data; caveats always (S41, offline)
+ 23. setupcheck checklist — marks per row from fixture reads; earnings ≤7d flags not fails;
+     RS n/a degrade; rel_strength math (S41, offline)
+ 24. fng parser — score/rating/percentile from fixture payload; missing score → None (S41, offline)
+ 25. insider Form 4 — XML parse (P/S only), 30d cluster-buy detection (distinct owners), net-flow
+     read + sales-are-weak caveat (S42, offline)
 """
 
 
@@ -526,11 +539,12 @@ def test_geocontext_composite_and_stress():
 
 # ─── Test 16: volquote _liquid_strike (offline) ───────────────────────────────
 def test_liquid_strike_snap():
-    """modules/volquote._liquid_strike snaps a strangle wing to the most-liquid of the nearest
-    SNAP_K OTM strikes (rank by OI, tie-break tighter spread), prefers tradeable strikes, respects
-    the OTM side, and falls back to the plain nearest strike when no OTM strikes exist. Pure logic,
-    no network — this is the fix for landing on a dead strike (the documented CRSP OTM-put case)."""
-    from modules.volquote import _liquid_strike, SNAP_K
+    """modules/volquote._liquid_strike snaps a strangle wing to the NEAREST liquid-enough of the
+    SNAP_K OTM strikes closest to the target (S40 rule: OI ≥ SNAP_OI_FRAC × busiest candidate,
+    then closest-to-target, OI tie-break) — dead strikes are still skipped, but lumpy round-number
+    OI no longer drags the wing off target (the live NVDA 190-vs-185 case). Prefers tradeable
+    strikes, respects the OTM side, falls back to the plain nearest when no OTM strikes exist."""
+    from modules.volquote import _liquid_strike, SNAP_K, SNAP_OI_FRAC
 
     def opt(strike, oi, bid, ask, typ="call"):
         return {"type": typ, "strike": strike, "bid": bid, "ask": ask, "oi": oi}
@@ -556,7 +570,20 @@ def test_liquid_strike_snap():
     picked4 = _liquid_strike(below, target=105.0, spot=spot, side="call")
     assert picked4["strike"] == 96, "fallback should return the strike nearest the target"
 
-    assert SNAP_K >= 2  # the snap window must span more than the single closest strike
+    # S40: a nearest strike with ≥ SNAP_OI_FRAC of the busiest candidate's OI must WIN over a
+    # farther, busier one (the live NVDA case: 185/OI 21k lost to 190/OI 39k under pure max-OI).
+    calls3 = [opt(105, 300, 1.00, 1.05), opt(106, 500, 0.90, 0.95), opt(107, 100, 0.70, 0.80)]
+    picked5 = _liquid_strike(calls3, target=105.0, spot=spot, side="call")
+    assert picked5["strike"] == 105, f"liquid-enough nearest should win, got {picked5['strike']}"
+
+    # S40: on an all-thin chain, tiny OI differences are noise — the nearest tradeable wins
+    # (the live CRSP case: 45/OI 42 lost to 42.5/OI 47 under pure max-OI).
+    puts2 = [opt(97, 5, 0.5, 0.7, "put"), opt(96, 7, 0.4, 0.6, "put"), opt(95, 4, 0.3, 0.5, "put")]
+    picked6 = _liquid_strike(puts2, target=96.8, spot=spot, side="put")
+    assert picked6["strike"] == 97, f"nearest of comparably-thin strikes should win, got {picked6['strike']}"
+
+    assert SNAP_K >= 2            # the snap window must span more than the single closest strike
+    assert 0 < SNAP_OI_FRAC <= 1  # the busiest candidate must always qualify (pick can't fail)
 
 
 # ─── Test 17: volquote _select_expiries (offline) ─────────────────────────────
@@ -651,3 +678,276 @@ def test_pre_earnings_vol_study(tmp_path, monkeypatch):
         tmp_path / "testy_indicators.csv")
     res = backfill_iv.backfill("TESTY", data_dir=str(tmp_path))
     assert res["status"] == "no_massive_key", res
+
+
+# ─── Test 19: volsetup vol_setup factor logic (offline) ───────────────────────
+def test_vol_setup_factors():
+    """modules/volsetup.vol_setup (S40): the IV cheap/rich factor uses the REAL ATM-IV percentile
+    (gauge pct) when harvested history exists, falling back to the HV-20 proxy with an explicit
+    '(HV-proxy)' label; the earnings catalyst is demoted to a note when IV already ranks high
+    (event premium priced); intraday-only squeezes no longer count as a factor (daily+ do)."""
+    from modules.volsetup import vol_setup, IV_PCT_HIGH
+
+    def ctx(iv_pct=None, hv_rank=None):
+        gauges = [{"group": "OPTIONS", "name": "ATM IV (30d)", "value": 0.60,
+                   "fmt": "{:.1%}", "label": "", "pct": iv_pct}]
+        if hv_rank is not None:
+            gauges.append({"group": "VOL", "name": "IV Rank (HV-proxy)", "value": hv_rank,
+                           "fmt": "{:.2f}", "label": "", "pct": None})
+        return {"gauges": gauges}
+
+    earn = {"days": 40, "date": "2026-08-10", "hist_move": 0.076}
+    sq_4h = {"4h": {"ok": True, "squeeze_on": True}}
+    sq_1d = {"1D": {"ok": True, "squeeze_on": True}}
+
+    # (a) The CRSP case: real IV at its highs + 4h-only squeeze + earnings near → NO long-vol
+    # factors (squeeze off-horizon, earnings priced → note), one short-vol factor, no clear edge.
+    s = vol_setup(None, sq_4h, ctx(iv_pct=0.97), earnings=earn)
+    assert s["long_vol"] == [], f"expected no long-vol factors, got {s['long_vol']}"
+    assert len(s["short_vol"]) == 1 and "97%ile" in s["short_vol"][0]
+    assert s["notes"] and "premium likely priced" in s["notes"][0]
+    assert "no clear vol edge" in s["net"]
+
+    # (b) Cheap real IV + daily squeeze + earnings → three long-vol factors, BUY verdict,
+    # S38-aligned hint (exit before the print, not "size for the crush").
+    s = vol_setup(None, sq_1d, ctx(iv_pct=0.20), earnings=earn)
+    assert len(s["long_vol"]) == 3 and any("20%ile" in f for f in s["long_vol"])
+    assert any("squeeze ON (1D)" in f for f in s["long_vol"])
+    assert s["short_vol"] == [] and s["notes"] == []
+    assert "BUYING vol" in s["net"] and "exit BEFORE the print" in s["hint"]
+
+    # (c) No real-IV percentile (thin history) → HV-proxy fallback, explicitly labeled; the
+    # earnings factor stays unconditional when the real-IV read is unavailable.
+    s = vol_setup(None, {}, ctx(iv_pct=None, hv_rank=IV_PCT_HIGH + 0.05), earnings=earn)
+    assert len(s["short_vol"]) == 1 and "HV-proxy" in s["short_vol"][0]
+    assert any("known vol catalyst" in f for f in s["long_vol"])
+
+    # (d) Intraday-only squeeze produces no factor; the same squeeze on 1W does.
+    assert not any("squeeze ON" in f for f in vol_setup(None, sq_4h, ctx())["long_vol"])
+    on_1w = vol_setup(None, {"1W": {"ok": True, "squeeze_on": True}}, ctx())["long_vol"]
+    assert any("squeeze ON (1W)" in f for f in on_1w)
+
+
+# ─── Test 20: timeframes live-bar append (offline) ────────────────────────────
+def test_append_live_bar():
+    """modules/timeframes.append_live_bar (S40 --live): appends the provisional Tradier session bar
+    to a daily frame only when the frame doesn't already cover that date; apply_live_bar re-derives
+    1W/1M so the forming week/month absorb the live bar. Pure logic, no network."""
+    import pandas as pd
+    from modules.timeframes import append_live_bar, apply_live_bar, _resample
+
+    idx = pd.bdate_range("2026-06-01", "2026-06-30")            # daily frame ends Tue 06-30
+    daily = pd.DataFrame({"Open": 100.0, "High": 101.0, "Low": 99.0, "Close": 100.5,
+                          "Volume": 1e6}, index=idx)
+    bar = {"ts": pd.Timestamp("2026-07-01"), "Open": 101.0, "High": 103.0, "Low": 100.5,
+           "Close": 102.5, "Volume": 4e5, "in_progress": True, "hhmm": "12:41"}
+
+    d2, ok = append_live_bar(daily, bar)
+    assert ok and len(d2) == len(daily) + 1
+    assert d2.index[-1] == bar["ts"] and float(d2["Close"].iloc[-1]) == 102.5
+
+    # already covered (post-close stamp ran) → untouched
+    d3, ok3 = append_live_bar(d2, bar)
+    assert not ok3 and len(d3) == len(d2)
+    assert not append_live_bar(daily, None)[1]                  # no bar → no-op
+
+    # apply_live_bar re-derives W/M: the forming July month bar must appear with the live close.
+    frames = {"1D": daily, "1W": _resample(daily, "W-FRI"), "1M": _resample(daily, "ME")}
+    assert apply_live_bar(frames, bar)
+    assert frames["1D"].index[-1] == bar["ts"]
+    assert frames["1M"].index[-1].month == 7 and float(frames["1M"]["Close"].iloc[-1]) == 102.5
+    assert float(frames["1W"]["Close"].iloc[-1]) == 102.5
+
+
+# ─── Test 21: timeframes intraday top-up merge (offline) ──────────────────────
+def test_merge_intraday_topup():
+    """modules/timeframes.merge_intraday_topup (S40 --live): Tradier-derived hourly bars REPLACE
+    overlapping cached hours (the cached tail may be a partial hour) and extend past the cached
+    end; empty top-up is a no-op. Pure logic, no network."""
+    import pandas as pd
+    from modules.timeframes import merge_intraday_topup
+
+    def hourly(ts_list, closes, vols):
+        return pd.DataFrame({"Open": closes, "High": closes, "Low": closes,
+                             "Close": closes, "Volume": vols},
+                            index=pd.DatetimeIndex(ts_list))
+
+    cached = hourly(["2026-07-02 09:30", "2026-07-02 10:30", "2026-07-02 11:30"],
+                    [100.0, 101.0, 101.5], [1000, 900, 50])       # 11:30 = partial hour, tiny vol
+    topup = hourly(["2026-07-02 11:30", "2026-07-02 12:30"],
+                   [102.0, 103.0], [800, 700])                    # complete 11:30 + new 12:30
+
+    merged, n = merge_intraday_topup(cached, topup)
+    assert n == 2 and len(merged) == 4
+    assert float(merged.loc["2026-07-02 11:30", "Close"]) == 102.0    # replaced, not duplicated
+    assert float(merged.loc["2026-07-02 11:30", "Volume"]) == 800
+    assert merged.index[-1] == pd.Timestamp("2026-07-02 12:30")
+    assert merged.index.is_monotonic_increasing and not merged.index.duplicated().any()
+
+    same, n0 = merge_intraday_topup(cached, cached.iloc[0:0])         # empty top-up → no-op
+    assert n0 == 0 and same is cached
+
+
+# ─── Test 22: shortint parsers + squeeze scorecard (offline) ──────────────────
+def test_shortint_squeeze():
+    """modules/shortint (S41): the FINRA/NASDAQ parsers on literal fixtures, and the pure
+    squeeze_read scorecard — CRSP-like inputs → SQUEEZE CONDITIONS PRESENT with the expected fuel
+    factors; JPM-like inputs → ABSENT with counter factors; caveats always present."""
+    from modules.shortint import parse_finra_text, parse_si_payload, squeeze_read
+
+    finra = ("Date|Symbol|ShortVolume|ShortExemptVolume|TotalVolume|Market\n"
+             "20260701|CRSP|243764.846662|3373|426621.138652|B,Q,N\n"
+             "20260701|CRSQ|10|0|20|B\n")
+    row = parse_finra_text(finra, "CRSP")
+    assert row is not None and abs(row[0] / row[1] - 0.5714) < 0.001
+    assert parse_finra_text(finra, "ZZZZ") is None                # absent symbol → None
+
+    payload = {"data": {"shortInterestTable": {"rows": [
+        {"settlementDate": "06/15/2026", "interest": "26,572,400",
+         "avgDailyShareVolume": "1,625,617", "daysToCover": 16.34604},
+        {"settlementDate": "05/29/2026", "interest": "21,672,640",
+         "avgDailyShareVolume": "1,858,354", "daysToCover": 11.662265},
+    ]}}}
+    rows = parse_si_payload(payload)
+    assert len(rows) == 2 and rows[0]["settle_date"] == "2026-06-15"
+    assert rows[0]["dtc"] > 16 and rows[0]["interest"] == 26572400.0
+
+    # CRSP-like: extreme DTC + shorts adding + high SVR pctile into a rally + LVN overhead.
+    r = squeeze_read(dtc=16.3, si_chg=0.226, settle_date="2026-06-15", settle_age=17,
+                     svr_now=0.57, svr_pct=0.85, svr_n=90, chg_1d=0.055, chg_5d=0.08,
+                     rvol=2.0, lvn_above_pct=0.013)
+    assert "PRESENT" in r["net"], r["net"]
+    assert any("EXTREME" in f for f in r["fuel"])
+    assert any("ADDING" in f for f in r["fuel"])
+    assert any("underwater" in f for f in r["fuel"])
+    assert any("thin-volume air" in f for f in r["fuel"])
+    assert r["counter"] == [] and len(r["caveats"]) >= 3
+    assert any("bi-monthly" in c for c in r["caveats"])
+
+    # JPM-like: low DTC, covering, subdued short volume → ABSENT with counters.
+    r2 = squeeze_read(dtc=1.4, si_chg=-0.15, svr_now=0.42, svr_pct=0.15, svr_n=90,
+                      chg_1d=0.002, chg_5d=0.01, rvol=0.9)
+    assert "ABSENT" in r2["net"] and r2["fuel"] == [] and len(r2["counter"]) == 3
+
+    # call-flow factor only fires when pc data is present and vol is call-heavy vs OI.
+    r3 = squeeze_read(pc_oi=0.90, pc_vol=0.30)
+    assert any("call-heavy" in f for f in r3["fuel"])
+    assert not any("call-heavy" in f for f in squeeze_read(pc_oi=0.90, pc_vol=0.80)["fuel"])
+
+
+# ─── Test 23: setupcheck checklist (offline) ──────────────────────────────────
+def test_setup_check():
+    """modules/setupcheck.setup_check (S41): marks per row from fixture reads/profile/ctx —
+    aligned trends ✓, unconfirmed rally ✗, RS n/a degrade, earnings ≤7d flags (–) without
+    failing, very-rich IV ✗. Pure, no network."""
+    from modules.setupcheck import setup_check, rel_strength
+    import pandas as pd
+
+    def reads(trend="up", rsi=55, tag="up-confirmed"):
+        state = "overbought" if rsi >= 70 else "oversold" if rsi <= 30 else "neutral"
+        return {tf: {"trend": trend, "rsi": rsi, "rsi_state": state, "_vol": {"tag": tag}}
+                for tf in ("1D", "1W", "1M")}
+
+    profile = {"price_location": "in_value", "near_hvn_below": 55.2, "price": 58.7,
+               "lvns": [59.5]}
+    ctx = {"regime": "calm", "gauges": [{"name": "IV/HV ratio", "value": 1.1}]}
+
+    s = setup_check(reads(), profile=profile, ctx=ctx,
+                    earn={"days": 39, "date": "2026-08-10"}, macro_tier1_days=5,
+                    rs={"bench": "IBB", "rs": {20: 0.04, 63: 0.09}})
+    marks = {label: m for label, m, _ in s["rows"]}
+    assert marks["HTF alignment"] == "✓" and marks["Volume confirms"] == "✓"
+    assert marks["Relative strength"] == "✓" and marks["Catalyst timing"] == "✓"
+    assert s["n_bad"] == 0 and "7/7" in s["net"]
+
+    # unconfirmed rally + rich vol + imminent earnings + macro tomorrow
+    s2 = setup_check(reads(tag="up-WEAK"), profile=profile,
+                     ctx={"regime": "calm", "gauges": [{"name": "IV/HV ratio", "value": 1.55}]},
+                     earn={"days": 3, "date": "2026-07-05"}, macro_tier1_days=1, rs=None)
+    m2 = {label: m for label, m, _ in s2["rows"]}
+    assert m2["Volume confirms"] == "✗" and m2["Vol regime"] == "✗"
+    assert m2["Catalyst timing"] == "–"                       # flagged, NOT failed
+    assert m2["Relative strength"] == "–"                     # n/a degrade
+    assert s2["n_bad"] == 2
+
+    # rel_strength math
+    c = pd.Series(range(100, 200), dtype=float)               # steady climber
+    b = pd.Series([100.0] * 100)                              # flat benchmark
+    rs = rel_strength(c, b, horizons=(20,))
+    assert rs and rs[20] > 0
+
+
+# ─── Test 24: fng parser (offline) ────────────────────────────────────────────
+def test_fng_parse():
+    """modules/fng.parse_fng (S41): score/rating extracted, percentile computed off the payload's
+    own history (needs ≥63 points), missing score → None. Pure, no network."""
+    from modules.fng import parse_fng
+
+    hist = [{"x": i, "y": float(20 + (i % 60))} for i in range(200)]   # scores 20..79
+    payload = {"fear_and_greed": {"score": 75.0, "rating": "greed", "previous_close": 70.0},
+               "fear_and_greed_historical": {"data": hist}}
+    out = parse_fng(payload)
+    assert out and out["score"] == 75.0 and out["rating"] == "greed"
+    assert out["pct"] is not None and out["pct"] > 0.85                # 75 is high in 20..79
+
+    assert parse_fng({"fear_and_greed": {}}) is None
+    assert parse_fng(None) is None
+
+
+# ─── Test 25: insider Form 4 parse + cluster detection (offline) ──────────────
+def test_insider_form4():
+    """modules/insider (S42): parse_form4 extracts open-market P/S events from Form 4 XML (other
+    codes skipped); cluster_buys finds ≥2 distinct insiders inside 30d but not 60d apart;
+    insider_read nets flow, surfaces the cluster and keeps the sales-are-weak caveat."""
+    from modules.insider import parse_form4, cluster_buys, insider_read
+
+    def form4(owner, date, code, shares, price, extra_tx=""):
+        return f"""<?xml version="1.0"?>
+<ownershipDocument>
+  <reportingOwner>
+    <reportingOwnerId><rptOwnerName>{owner}</rptOwnerName></reportingOwnerId>
+    <reportingOwnerRelationship><isDirector>1</isDirector><isOfficer>0</isOfficer></reportingOwnerRelationship>
+  </reportingOwner>
+  <nonDerivativeTable>
+    <nonDerivativeTransaction>
+      <transactionDate><value>{date}</value></transactionDate>
+      <transactionCoding><transactionCode>{code}</transactionCode></transactionCoding>
+      <transactionAmounts>
+        <transactionShares><value>{shares}</value></transactionShares>
+        <transactionPricePerShare><value>{price}</value></transactionPricePerShare>
+        <transactionAcquiredDisposedCode><value>A</value></transactionAcquiredDisposedCode>
+      </transactionAmounts>
+    </nonDerivativeTransaction>{extra_tx}
+  </nonDerivativeTable>
+</ownershipDocument>"""
+
+    ev = parse_form4(form4("DOE JANE", "2026-06-20", "P", 12000, 51.20))
+    assert len(ev) == 1 and ev[0]["code"] == "P" and ev[0]["owner"] == "DOE JANE"
+    assert ev[0]["usd"] == 12000 * 51.20 and ev[0]["role"] == "Director"
+
+    # non-open-market codes (M = option exercise, A = grant) are excluded
+    assert parse_form4(form4("DOE JANE", "2026-06-20", "M", 5000, 10.0)) == []
+    assert parse_form4("<not-xml") == []
+
+    # cluster: two distinct owners within 30d fires; 60d apart doesn't; same owner twice doesn't.
+    def buy(owner, date, usd=100000.0):
+        return {"date": date, "code": "P", "shares": 1000, "price": usd / 1000,
+                "usd": usd, "owner": owner, "role": "Director"}
+
+    cl = cluster_buys([buy("A", "2026-05-12"), buy("B", "2026-06-02")])
+    assert cl and cl["n_owners"] == 2 and cl["start"] == "2026-05-12" and cl["end"] == "2026-06-02"
+    assert cluster_buys([buy("A", "2026-04-01"), buy("B", "2026-06-20")]) is None
+    assert cluster_buys([buy("A", "2026-05-12"), buy("A", "2026-06-02")]) is None
+
+    # read: cluster present → conviction NET; net flow arithmetic; caveats retained.
+    sell = {"date": "2026-06-25", "code": "S", "shares": 500, "price": 60.0,
+            "usd": 30000.0, "owner": "C", "role": "Officer"}
+    rd = insider_read([buy("A", "2026-05-12"), buy("B", "2026-06-02"), sell])
+    assert "PRESENT" in rd["net"] and rd["cluster"]["n_owners"] == 2
+    assert rd["net_usd"] == 100000.0 + 100000.0 - 30000.0
+    assert rd["n_buys"] == 2 and rd["n_sells"] == 1
+    assert any("Lakonishok" in c for c in rd["caveats"])
+
+    rd2 = insider_read([sell])
+    assert "sales only" in rd2["net"]
+    assert insider_read([])["net"].startswith("no open-market")
