@@ -158,6 +158,25 @@ if __name__ == "__main__":
     except Exception:
         pass
 
+    # Equal-weight breadth (S45) — RSP−SPY / QQQE−QQQ 20d spread, cached ~6h; best-effort.
+    # Context only (never a feature, not a risk factor) — narrow = fragility tell, not a sell.
+    try:
+        from modules.breadth import fetch_breadth
+        br = fetch_breadth(data_dir=args.data_dir)
+        narrow = []
+        for lbl, d in ((br or {}).get("pairs") or {}).items():
+            ctx["gauges"].append({"group": "MARKET", "name": f"Breadth {lbl} 20d",  # ≤20 chars (S40 convention)
+                                  "value": d["rel_20d"], "fmt": "{:+.1%}",
+                                  "label": d["tag"], "pct": d.get("pct")})
+            if d["tag"] == "narrow" and (d.get("pct") is None or d["pct"] <= 0.25):
+                narrow.append(lbl)
+        if narrow:
+            ctx["notes"].append(f"narrow breadth ({', '.join(narrow)}) — mega-cap-led tape; "
+                                "average-stock entries face a weaker tape than the headline "
+                                "index implies.")
+    except Exception:
+        pass
+
     print_console(ctx)
 
     if args.graphical:

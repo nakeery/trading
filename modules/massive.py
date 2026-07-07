@@ -22,7 +22,12 @@ MASSIVE_URL     = "https://api.massive.com"
 #                     requires months of daily accumulation to be useful as a feature).
 #   IV_COLS         — full list for CSV column management; kept for backward compat.
 IV_FEATURE_COLS = ["atm_iv_30d", "iv_skew_25d", "term_structure"]
-IV_META_COLS    = ["atm_strike", "atm_expiry", "atm_dte", "put_call_oi_ratio"]
+#   IV_EVENT_COLS — nearest POST-EARNINGS-expiry ATM IV, stamped by the daily harvest only when
+#                   earnings are ≤EVENT_EARN_WINDOW days out (S44). Study/display data for
+#                   modules/vol_history.py — the constant-maturity 30d gauge blunts the true
+#                   front-expiry pre-earnings ramp (S39 caveat). Never a model feature (meta).
+IV_EVENT_COLS   = ["atm_iv_event", "event_expiry", "event_dte"]
+IV_META_COLS    = ["atm_strike", "atm_expiry", "atm_dte", "put_call_oi_ratio"] + IV_EVENT_COLS
 IV_COLS         = IV_FEATURE_COLS + IV_META_COLS
 #   IV_INDICATOR_COLS — binary missing-indicators added by features.impute_iv_features()
 #                     (present only under --iv-features). Treated like IV_FEATURE_COLS:
@@ -32,6 +37,9 @@ IV_INDICATOR_COLS = ["iv_available", "term_available"]
 
 FRONT_MONTH_MIN_DTE = 25    # back-month term-structure pivot — anything < 25d counts as "near"
 BACK_MONTH_MIN_DTE  = 55    # back-month tenor for term-structure denominator
+EVENT_EARN_WINDOW   = 45    # stamp event-expiry IV only when earnings ≤ this many days out
+                            # (mirrors volquote.EARN_WINDOW — the pre-earnings long-vol horizon)
+EVENT_MAX_AFTER     = 21    # search window: expiries up to this many days past the report
 MAX_PAGES                = 5     # cap pagination — 5 × 250 = 1250 contracts per call
 PAGE_LIMIT               = 250
 # MAX_INVERT_PER_CATEGORY removed — all contracts are tried (no cap)
@@ -209,6 +217,62 @@ def get_chain_summary(ticker, underlying_price, target_dte=30):
         "term_structure":    term,
         "put_call_oi_ratio": pc_oi,
     }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# EVENT-EXPIRY IV  (S44 — pre-earnings ramp capture for modules/vol_history.py)
+# ─────────────────────────────────────────────────────────────────────────────
+def _parse_snapshot_rows(rows, today=None):
+    """Snapshot rows → [{type, strike, expiry, dte, iv}] (same fields get_chain_summary parses;
+    module-level so pick_event_atm can be unit-tested offline). Bad rows are dropped."""
+    today = today or datetime.date.today()
+    out = []
+    for r in rows or []:
+        d = r.get("details") or {}
+        try:
+            exp = datetime.date.fromisoformat(d.get("expiration_date"))
+            strike = float(d.get("strike_price"))
+        except (TypeError, ValueError):
+            continue
+        out.append({"type": d.get("contract_type"), "strike": strike, "expiry": exp,
+                    "dte": (exp - today).days, "iv": r.get("implied_volatility")})
+    return out
+
+
+def pick_event_atm(parsed, underlying_price):
+    """PURE: from parsed snapshot rows, the ATM call on the EARLIEST expiry present — the tenor
+    where the pre-earnings event premium concentrates (the caller has already restricted the
+    fetch to post-earnings expiries). Rejects the iv=20 placeholder like get_chain_summary.
+    Returns {"atm_iv_event", "event_expiry", "event_dte"} or None."""
+    calls = [p for p in parsed
+             if p["type"] == "call" and p["iv"] is not None and p["iv"] != 20]
+    if not calls:
+        return None
+    first_exp = min(p["expiry"] for p in calls)
+    at_exp = [p for p in calls if p["expiry"] == first_exp]
+    atm = min(at_exp, key=lambda p: abs(p["strike"] - underlying_price))
+    return {"atm_iv_event": float(atm["iv"]), "event_expiry": first_exp.isoformat(),
+            "event_dte": atm["dte"]}
+
+
+def get_event_iv(ticker, underlying_price, earn_days, max_after=EVENT_MAX_AFTER):
+    """ATM IV of the nearest POST-earnings expiry (live snapshot; quote-based, so it fills even
+    for thin names like CRSP whose options rarely trade). `earn_days` = calendar days until the
+    report; expiries strictly AFTER it are searched (an expiry ending on/before the print carries
+    no event premium — same convention as volquote's earnings-aware anchoring). Returns
+    {"atm_iv_event", "event_expiry", "event_dte"} or None. Never raises past the fetch guard."""
+    try:
+        rows = _fetch_chain(
+            ticker,
+            dte_min=earn_days + 1,
+            dte_max=earn_days + 1 + max_after,
+            strike_min=underlying_price * 0.94,
+            strike_max=underlying_price * 1.06,
+        )
+    except Exception as e:
+        print(f"  Massive event-expiry fetch failed: {e}")
+        return None
+    return pick_event_atm(_parse_snapshot_rows(rows), underlying_price)
 
 
 # ─────────────────────────────────────────────────────────────────────────────

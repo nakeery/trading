@@ -28,6 +28,11 @@ IV_HV_FAIR_LOW  = 0.85
 IV_HV_FAIR_HIGH = 1.20
 IV_HV_RICH      = 1.40
 
+# A harvested gauge whose last valid row lags the CSV end by more than this many sessions is
+# flagged "(stale Nd)" — gather_context uses last-non-NaN per column, so a stopped Massive
+# harvest would otherwise present weeks-old IV/skew/term as current (S43).
+STALE_GAUGE_SESSIONS = 5
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Band labelers (single source of truth; mirror entry.py OPTIONS-MARKET CHECK)
@@ -132,39 +137,62 @@ def gather_context(ticker, data_dir="data", with_vix=True):
     as_of = df.index[-1].date().isoformat()
 
     def last_valid(col):
+        """(value, index_date) of the column's last non-NaN row — (None, None) when absent/empty."""
         if col not in df.columns:
-            return None
+            return None, None
         s = df[col].dropna()
-        return float(s.iloc[-1]) if len(s) else None
+        return (float(s.iloc[-1]), s.index[-1]) if len(s) else (None, None)
 
-    atm_iv  = last_valid("atm_iv_30d")
-    skew    = last_valid("iv_skew_25d")
-    term    = last_valid("term_structure")
-    pc_oi   = last_valid("put_call_oi_ratio")
-    hv_20   = last_valid("HV_20")
-    iv_rank = last_valid("IV_rank")
-    iv_pct  = last_valid("IV_pct")
+    stale_ages = []
+
+    def _stale(d):
+        """' (stale Nd)' when a harvested gauge's last valid row lags the CSV end by more than
+        STALE_GAUGE_SESSIONS sessions — a stopped Massive harvest would otherwise present a
+        weeks-old IV/skew/term as current (S43). '' when fresh/unknown."""
+        if d is None:
+            return ""
+        age = int((df.index > d).sum())
+        if age <= STALE_GAUGE_SESSIONS:
+            return ""
+        stale_ages.append(age)
+        return f" (stale {age}d)"
+
+    atm_iv, atm_iv_d = last_valid("atm_iv_30d")
+    skew,   skew_d   = last_valid("iv_skew_25d")
+    term,   term_d   = last_valid("term_structure")
+    pc_oi,  pc_oi_d  = last_valid("put_call_oi_ratio")
+    hv_20,  _        = last_valid("HV_20")
+    iv_rank, _       = last_valid("IV_rank")
+    iv_pct,  _       = last_valid("IV_pct")
 
     # ── OPTIONS POSITIONING (per-ticker, harvested) ──
     if atm_iv is not None and hv_20:
         ratio = atm_iv / hv_20
         ratio_series = df["atm_iv_30d"] / df["HV_20"]
+        iv_stale = _stale(atm_iv_d)
         gauges.append({"group": "OPTIONS", "name": "IV/HV ratio", "value": ratio, "fmt": "{:.2f}",
-                       "label": iv_hv_label(ratio), "pct": percentile_of(ratio_series, ratio)})
+                       "label": iv_hv_label(ratio) + iv_stale,
+                       "pct": percentile_of(ratio_series, ratio)})
         gauges.append({"group": "OPTIONS", "name": "ATM IV (30d)", "value": atm_iv, "fmt": "{:.1%}",
-                       "label": "", "pct": percentile_of(df["atm_iv_30d"], atm_iv)})
+                       "label": iv_stale.strip(), "pct": percentile_of(df["atm_iv_30d"], atm_iv)})
     else:
         notes.append("atm_iv_30d NaN — options-IV block skipped (re-run indicators.py to harvest).")
 
     if skew is not None:
         gauges.append({"group": "OPTIONS", "name": "25Δ skew (P-C)", "value": skew, "fmt": "{:+.3f}",
-                       "label": skew_label(skew), "pct": percentile_of(df["iv_skew_25d"], skew)})
+                       "label": skew_label(skew) + _stale(skew_d),
+                       "pct": percentile_of(df["iv_skew_25d"], skew)})
     if term is not None:
         gauges.append({"group": "OPTIONS", "name": "Term structure", "value": term, "fmt": "{:.2f}",
-                       "label": term_label(term), "pct": percentile_of(df["term_structure"], term)})
+                       "label": term_label(term) + _stale(term_d),
+                       "pct": percentile_of(df["term_structure"], term)})
     if pc_oi is not None:
         gauges.append({"group": "OPTIONS", "name": "Put/Call OI", "value": pc_oi, "fmt": "{:.2f}",
-                       "label": pc_label(pc_oi), "pct": percentile_of(df["put_call_oi_ratio"], pc_oi)})
+                       "label": pc_label(pc_oi) + _stale(pc_oi_d),
+                       "pct": percentile_of(df["put_call_oi_ratio"], pc_oi)})
+    if stale_ages:
+        notes.append(f"harvested options gauges lag the CSV by up to {max(stale_ages)} sessions "
+                     f"(flagged 'stale') — re-run indicators.py to refresh the Massive harvest.")
 
     n_hist = int(df["iv_skew_25d"].dropna().shape[0]) if "iv_skew_25d" in df.columns else 0
     if 0 < n_hist < 63:

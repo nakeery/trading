@@ -176,6 +176,7 @@ print becomes a usable study row; MIN_USABLE=3 ⇒ study unlocks ~mid-2027. Unti
 rests on live `--vol` context only. Known-but-deferred (user skipped): backfill overwrites
 quote-based harvest IV on term-refill dates (docstring "never overwritten" is wrong — fix = write
 only NaN keys); lens `--vol` history line still suggests backfill_iv.py for CRSP where it can't help.
+**→ Both deferred items FIXED in S44** (per-cell `_apply_result`; harvest-accumulation wording).
 
 S40 (cont.): `lens.py --live` — INTRADAY mode. Motivated by measured source freshness (2026-07-02,
 market open): **Tradier brokerage-token market data is REAL-TIME (~4s delay on trades AND quotes)**;
@@ -244,6 +245,118 @@ CRSP → "$-210,577, 0 buys / 1 sell — sales only, weakly informative"; NVDA �
 3 insiders" with the ⚑ broad-selling flag (the 10b5-1 caveat earning its keep); second run 2.7s
 (session cache). 25 smoke tests (test 25: Form 4 XML parse, code filtering, 30d-window/distinct-
 owner cluster logic, net-flow read — offline fixtures).
+
+S42 (cont.) display polish: every lens section headline now renders as a dimmed title-in-rule
+separator (`── TITLE ────…`, `lens._section`, 78-col, dim only when colour is on) — the top/bottom
+`═` double lines are unchanged. Chosen over a full-width rule-above-title via user preview.
+
+S43: lens calculation-review honesty fixes (user-requested audit of lens.py + modules). Core math
+verified clean (BEs, expected move, heatmap, candles, percentiles); six output/scorecard-integrity
+defects found and fixed:
+(1) **`vol_setup` double-counted IV/HV** — the implied-vs-realized-move factor reduces to the SAME
+atm_iv/HV_20 ratio as the IV/HV factor (the √(dte/365) cancels; lens builds `em` from the same two
+gauges), so one input could fire 2 of the 2-factor verdict margin and flip the NET alone. Factor
+removed (the expected-move line is still displayed; `em` param kept for signature stability).
+(2) **HVN "approaching resistance/support" had no proximity check** — `near_hvn_above/below` was
+the nearest HVN at ANY distance, so both risk-scorecard factors fired nearly every run. Now bounded
+±`HVN_NEAR_PCT` (5%, volume_profile.py) like shortint's LVN-air band; setupcheck says "no HVN
+support nearby".
+(3) **`last_bar_partial(frac=0.7)` missed late-period forming bars** (a Thu/Fri forming week, the
+last ~third of a forming month) → unmarked, understated W/M volume reads — the S35 defect, just
+later in the period. Now calendar-aware: partial when the period end (resample label rolled back to
+a weekday) is after the most recent completed session (`now_session` injectable for tests); the
+count heuristic is kept as the stale-mid-period fallback.
+(4) **`gather_context` could present weeks-old gauges as current** — last-non-NaN per column, so a
+stopped Massive harvest kept showing the old IV/skew/term. Beyond `STALE_GAUGE_SESSIONS`=5 sessions
+the label now carries "(stale Nd)" + a note.
+(5) **Thin frames printed definite states from NaN indicators** — a 30–33-bar frame has no MACD
+signal yet but printed "bearish"; MACD/Stoch/RSI states are now None → "—" in the table.
+(6) **No-bid legs made the straddle/strangle mid fictional** (mid = ask/2) — combos carry `no_bid`,
+the lens prints "⚠ a leg has no bid — mid cost indicative" (volquote SCOPEKEY straddle6→straddle7).
+Minor: live-mode expected move uses the live IV's own DTE (was hardcoded 30); volume profile takes
+`ref_price` from the 1D close (the 1h stale-cache fallback skewed price_location); read_volume
+missing 10-bar history → "—" not "+0.0%"; dead `lens._fmt_vol` removed. 26 smoke tests (new test 26
+= Thursday-week/late-month calendar fixtures; test 19e asserts `em` is no longer scored).
+
+S44 (same working day): IV restoration prep + CRSP forward-capture — CODE ONLY (user runs the
+backfills/harvests themselves). Chosen as the next framework step because the S40 honesty pass made
+the `--vol` cheap/rich verdict depend on the REAL ATM-IV percentile, which QQQ (the reference
+ticker) can't produce until its wiped IV history is restored; and CRSP's ramp evidence can only be
+built forward (its backfill is a proven dead end — trades-only history, S40).
+(1) **backfill overwrite bug FIXED** (the S40 known-but-deferred item): new pure
+`backfill_iv._apply_result` writes result keys ONLY into NaN cells — a term-refill date keeps its
+harvested quote-based atm_iv_30d (previously every returned key was clobbered; the docstring's
+"never overwritten" claim is now true per-cell). Safe to re-run backfills over harvested history.
+(2) **Event-expiry IV in the daily harvest**: `massive.get_event_iv` (+ pure `pick_event_atm`,
+`_parse_snapshot_rows`) quotes the ATM IV of the nearest POST-earnings expiry (strictly after the
+report — an expiry ending on/before it carries no event premium, volquote convention); stamped by
+`indicators.harvest_iv_snapshot` as `atm_iv_event`/`event_expiry`/`event_dte` when earnings ≤45d
+out (`EVENT_EARN_WINDOW`). New `IV_EVENT_COLS` folded into `IV_META_COLS` → auto-excluded from every
+model's features and auto-merged/preserved by the CSV machinery; the harvest's IV_COLS stamp loop is
+key-guarded so the daily summary doesn't null the event cells. Rationale: the constant-maturity 30d
+gauge BLUNTS the front-expiry ramp (S39 caveat — why AMD reads weak); quote-based snapshots fill
+even for thin names like CRSP whose options rarely trade.
+(3) **vol_history prefers event IV** via `_iv_triplet` — but ONLY when all three sessions
+(entry/pre/post) carry it; tenors are never mixed inside one ramp measurement (that would fabricate
+ramp). 30d proxy fallback otherwise; per-row `iv_src` + an honest caveat line reporting the mix.
+(4) **Lens earnings-window capture guard**: when earnings ≤10d and the latest session's atm_iv_30d
+harvest is missing, a note fires same-day ("missed pre-earnings sessions cannot be backfilled") —
+for the Aug-10 CRSP window a missed day is unrecoverable. Also the `--vol` thin-history line no
+longer blindly recommends backfill_iv.py (it now says history accumulates via the daily harvest;
+backfill restores liquid names — resolving the second S40 deferred item).
+28 smoke tests (27 = per-cell no-overwrite; 28 = event-ATM selection + the no-tenor-mixing guard).
+STILL PENDING (user-run): QQQ backfill (~15–25 min) to restore the real-IV percentile path; then
+optionally SOFI/LYFT re-backfill + AAPL build.
+
+S46: **long-call decision context** — user asked "what other context matters before opening long
+calls?"; web-research-validated gap analysis found the lens covered direction/timing/vol but
+stopped before the INSTRUMENT's mechanics. Four additions (user-selected all four):
+(1) **`--call` LONG CALL VIABILITY block** (`modules/callquote.py`, volquote-pattern cache
+SCOPEKEY call1): nearest monthlies to 45/90 DTE, ATM + ~0.375Δ (the 0.35–0.40 trend band)
+candidates — mid premium, BE move, **theta/day as % of premium** (the carry number: QQQ live read
+45d ATM 1.2%/d vs 101d 0.5%/d — the DTE tradeoff made concrete), OI/spread, at-ask line (>3% S40
+pattern), per-expiry earnings notes (before-print = no event exposure / after = crush risk) and
+ex-div-before-expiry notes, an ATM-IV-by-expiry curve (`curve_read` cheap-tenor tag; ≤5 monthlies
+≤150d), and a "paying up" caution when real ATM IV ≥70%ile. Pure helpers
+(`pick_call_candidates`/`liquidity_grade`/`curve_read`/`_select_expiries`) offline-tested.
+(2) **Chain liquidity grade** — ATM-region (5 strikes, calls+puts) median mid-relative spread +
+OI → tight/ok/wide/dead (≤1%+OI≥1k / ≤3% / ≤8% / else; OI<100 demotes; majority-no-bid = dead).
+In the `--call` block always + a DEFAULT-ON `options liquidity:` line in OPTIONS & VOL CONTEXT
+served ZERO-NETWORK from the freshest `--call` cache (`cached_liquidity`, as-of + stale tag) —
+the principle held: no new default-on network calls.
+(3) **Ex-dividend awareness** — `features.next_ex_dividend` (exact from yfinance calendar, else
+pure `estimate_next_ex_div` cadence estimate flagged `~`; <4 payments or median gap >400d → None)
+→ SETUP CHECK Catalyst-timing suffix ≤45d ("calls don't earn it; deep-ITM early-exercise risk").
+(4) **Market beta SETUP CHECK row** — pure `setupcheck.beta_corr` (60d OLS β + corr vs SPY,
+`fetch_beta` one bounded yf call) — always-informational "–" row: corr ≥0.6 backdrop applies /
+<0.3 largely idiosyncratic (QQQ read β1.59 corr 0.92; CRSP β1.85 corr 0.41 moderate). NB this row
+made the checklist 8 rows (test 23's "7/7" → "7/8").
+(5) **KNOWN CATALYSTS section** (default-on) — `benchmarks.upcoming_catalysts` surfaces
+catalysts.csv (ticker,date,type,description) entries ≤45d in the lens; first run immediately
+surfaced CRSP's 2026-08-01 PDUFA (Casgevy pediatric, 25d out, 9d BEFORE the Aug-10 earnings) that
+only the ML layer could see before.
+**Rejected on ethos grounds** (researched, documented): GEX / call-walls / max pain (dealer
+positioning INFERRED not observed; vendor-marketing-driven, thin evidence), seasonality (n≈20 per
+calendar month; post-S31 calendar-feature skepticism), news/social sentiment (no reliable free
+source — S41 rejection stands). 31 smoke tests (30 = callquote pure helpers; 31 =
+beta/ex-div-estimator/catalysts filters).
+
+S45 (same working day): **equal-weight BREADTH on the MARKET BACKDROP** (`modules/breadth.py`),
+answering "is the equal-weighted S&P worth checking?" — yes: "SPY: up" is cap-weighted (top ~10
+mega-caps ≈ 35–40%), so the headline can rise while the MEDIAN stock falls. RSP−SPY (and
+QQQE−QQQ for the even-more-top-heavy NDX) 20d/63d relative returns read the AVERAGE stock's tape
+— what an individual-name entry actually trades. Design honesty: short horizons + a percentile of
+the rolling 20d-spread SERIES (not the ratio level) sidestep the secular mega-cap drift that would
+otherwise read "narrow" permanently; tags broad-led/narrow/mixed on a ±0.5% dead band. Mirrors the
+fng.py pattern exactly: pure `read_breadth` (offline test 29) + `fetch_breadth` (one batched
+yfinance download, `data/breadth_cache.json` ~6h TTL, stale fallback, never raises). Surfaced on
+the lens MARKET BACKDROP line (`breadth(20d) RSP−SPY +2.9% [91%ile] broad-led · …`, computed once
+before the ticker loop) + two market_context.py MARKET gauges (names ≤20 chars per the S40
+convention) with a narrow-breadth note (fires when narrow AND ≤25%ile). CONTEXT only — never a
+model feature (S20/S32) and deliberately NOT a rally/drawdown-scorecard factor (S43 lesson:
+near-always-on factors inflate the tally); narrow = fragility tell, not a sell (S21). First live
+read (2026-07-06): both pairs broad-led at the ~91st %ile — rotation INTO the average stock.
+29 smoke tests.
 
 --geo cross-asset / geopolitical backdrop (S35)
 -----------------------------------------------
@@ -319,15 +432,17 @@ Operational notes
   re-trigger every run). Best-effort/non-fatal — on failure it proceeds on whatever exists (yfinance
   fallback if still no CSV). `--no-refresh` opts out (skips build+refresh); `--refresh` forces even if
   current. indicators.py gained a non-interactive CLI (`--ticker/--start/--end/--no-chart/--data-dir`).
-- Smoke: `.\trade\Scripts\python.exe -m pytest tests/ -q` (15 tests, offline, ~2s).
+- Smoke: `.\trade\Scripts\python.exe -m pytest tests/ -q` (31 tests, offline, ~2-7s).
 - Harmless: `Select-Object -First N` truncating a lens pipe gives exit 255 (SIGPIPE), not a crash.
 
 Outstanding / backlog
 ---------------------
-- IV backfills wiped pre-S23 and not yet restored: SOFI, LYFT, QQQ (~15–25 min each, backfill_iv.py);
-  AAPL missing entirely. AMD (462 rows) + NVDA (452) intact. CRSP sparse (178 rows, gaps around
-  earnings → `--vol` history line unavailable; backfill offered and declined in S40 — run before
-  trusting the CRSP pre-earnings ramp thesis).
+- IV backfills wiped pre-S23 and not yet restored: SOFI, LYFT, QQQ (~15–25 min each, backfill_iv.py
+  — now safe to re-run over harvested history, S44 per-cell writes); AAPL missing entirely.
+  AMD (462 rows) + NVDA (452) intact. CRSP sparse (178 rows; backfill is a structural dead end per
+  S40 — the S44 event-expiry harvest through earnings windows is CRSP's path).
+- QQQ backfill run (user): restores the real-IV percentile path for the `--vol` scorecard + the
+  `[N percentile]` gauge columns (needs ≥63 IV rows).
 - Re-validate any NVDA-passed history (every pre-S31 cross-check used leaked features).
 - Optional `--geo` polish: normalize EPU/GPR to a ~365-obs window so all gauges are a true 1-year
   percentile (currently ~8mo for the calendar-daily indices).

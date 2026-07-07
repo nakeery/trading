@@ -18,6 +18,9 @@ unavailable (no key / lapsed subscription). Best-effort: never raises.
 
 Caveats (also printed): ~8 earnings (2yr Massive IV cap) is indicative, not proof; `atm_iv_30d` is a
 constant-maturity 30d proxy, not the exact earnings-expiry IV; BS with r=q=0, no bid/ask or fills.
+S44: when the daily harvest has stamped `atm_iv_event` (nearest post-earnings expiry — the tenor
+where the ramp actually concentrates) at ALL THREE sessions of an earnings, that series is preferred;
+tenors are never mixed within one measurement (that would fabricate ramp).
 """
 
 import os
@@ -58,18 +61,30 @@ def _sessions_for(idx, E, entry_td):
     return idx[pos_entry], idx[pos_pre], idx[pos_post]
 
 
+def _iv_triplet(df, entry_ts, pre_ts, post_ts):
+    """(iv_entry, iv_pre, iv_post, source) for one earnings. Prefers the event-expiry stamps
+    (`atm_iv_event`, S44 — the true front-expiry ramp) but ONLY when all three sessions have one:
+    mixing tenors inside a single ramp measurement would fabricate ramp. Falls back to the
+    constant-maturity `atm_iv_30d` proxy. Returns (None, None, None, None) when neither is complete."""
+    for col, src in (("atm_iv_event", "event"), ("atm_iv_30d", "30d")):
+        if col not in df.columns:
+            continue
+        vals = [df.at[ts, col] for ts in (entry_ts, pre_ts, post_ts)]
+        if not any(v is None or pd.isna(v) for v in vals):
+            return float(vals[0]), float(vals[1]), float(vals[2]), src
+    return None, None, None, None
+
+
 def _one_earnings(df, idx, E, entry_td):
     """Per-earnings IV ramp / crush / straddle P&L, or None if any input is missing/out of range."""
     s = _sessions_for(idx, E, entry_td)
     if s is None:
         return None
     entry_ts, pre_ts, post_ts = s
-    iv_entry, iv_pre, iv_post = (df.at[entry_ts, "atm_iv_30d"], df.at[pre_ts, "atm_iv_30d"],
-                                 df.at[post_ts, "atm_iv_30d"])
+    iv_entry, iv_pre, iv_post, iv_src = _iv_triplet(df, entry_ts, pre_ts, post_ts)
     s_entry, s_pre = df.at[entry_ts, "Close"], df.at[pre_ts, "Close"]
-    if any(v is None or pd.isna(v) for v in (iv_entry, iv_pre, iv_post, s_entry, s_pre)):
+    if iv_entry is None or any(v is None or pd.isna(v) for v in (s_entry, s_pre)):
         return None
-    iv_entry, iv_pre, iv_post = float(iv_entry), float(iv_pre), float(iv_post)
     s_entry, s_pre = float(s_entry), float(s_pre)
     if s_entry <= 0 or s_pre <= 0:
         return None
@@ -81,7 +96,7 @@ def _one_earnings(df, idx, E, entry_td):
     pnl = (st_p / st_e - 1.0) if (st_e and st_p and st_e > 0) else None
 
     return {"date": E.date().isoformat(), "iv_entry": iv_entry, "iv_pre": iv_pre, "iv_post": iv_post,
-            "ramp": iv_pre - iv_entry, "crush": iv_post - iv_pre, "pnl": pnl}
+            "ramp": iv_pre - iv_entry, "crush": iv_post - iv_pre, "pnl": pnl, "iv_src": iv_src}
 
 
 def _aggregate(df, idx, past, entry_td):
@@ -181,9 +196,14 @@ def pre_earnings_vol_study(ticker, entry_td=10, data_dir="data", earnings=None, 
     sweep_tds = sorted(set(ENTRY_SWEEP) | {entry_td})
     sweep = [a for a in ((main_agg if td == entry_td else _aggregate(df, idx, past, td))
                          for td in sweep_tds) if a]
+    n_event = sum(1 for r in main_agg["rows"] if r.get("iv_src") == "event")
+    iv_caveat = ("IV = atm_iv_30d, a constant-maturity 30d proxy (not the exact earnings-expiry IV)"
+                 if n_event == 0 else
+                 f"IV = event-expiry stamps for {n_event}/{usable} earnings (S44), "
+                 f"constant-maturity 30d proxy for the rest")
     caveats = [
         f"{usable} of {total} earnings usable (2yr Massive IV cap) — indicative, not proof",
-        "IV = atm_iv_30d, a constant-maturity 30d proxy (not the exact earnings-expiry IV)",
+        iv_caveat,
         "straddle P&L via Black-Scholes (r=q=0), no bid/ask or fills; entry/exit keyed to the "
         "earnings date (a day early for after-close reporters)",
     ]

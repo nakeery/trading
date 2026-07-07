@@ -52,7 +52,8 @@ def gauge_pct(ctx, name):
 def vol_setup(reads, squeeze, ctx, earnings=None, em=None, macro_days=None):
     """Two-sided long-vol vs short-vol scorecard. `squeeze` = {tf: read_squeeze(...)}. Returns
     {long_vol: [factor strings], short_vol: [...], notes: [...], net, hint}. Descriptive context,
-    not advice."""
+    not advice. `em` is accepted for signature stability but no longer scored — it duplicates the
+    IV/HV factor (see the S43 note below)."""
     long_v, short_v, notes = [], [], []
 
     iv_pct  = gauge_pct(ctx, "ATM IV (30d)")             # real harvested-IV percentile (S40)
@@ -115,12 +116,9 @@ def vol_setup(reads, squeeze, ctx, earnings=None, em=None, macro_days=None):
     if macro_days is not None and 0 <= macro_days <= 10:
         long_v.append(f"macro event in {macro_days}d — event vol ahead")
 
-    # implied vs realized move
-    if em and em.get("hv_pct"):
-        if em["pct"] < em["hv_pct"] * 0.95:
-            long_v.append(f"implied move {em['pct']:.1%} < realized {em['hv_pct']:.1%} — move cheap")
-        elif em["pct"] > em["hv_pct"] * 1.20:
-            short_v.append(f"implied move {em['pct']:.1%} > realized {em['hv_pct']:.1%} — move rich")
+    # NB: the implied-vs-realized MOVE is displayed by the lens but is NOT a factor — em.pct/em.hv_pct
+    # reduces to the same atm_iv/HV_20 ratio as the IV/HV factor above (the √(dte/365) cancels), so
+    # counting it double-counted one input, enough to flip the 2-factor verdict margin alone (S43).
 
     net, hint = _synthesize(long_v, short_v, earnings)
     return {"long_vol": long_v, "short_vol": short_v, "notes": notes, "net": net, "hint": hint}

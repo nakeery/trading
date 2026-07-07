@@ -134,6 +134,33 @@ def add_macro_features(df, macro_features, start_date, end_date):
     return df
 
 
+def upcoming_catalysts(ticker, within_days=45, data_dir="modules", today=None):
+    """(S46) Forward catalysts for `ticker` from catalysts.csv (ticker,date,type,description) —
+    the known binary events (PDUFA dates, trial readouts) that until now only the ML layer saw.
+    Returns [(date_iso, days_until, type, description), …] sorted soonest-first; [] on any
+    failure / no file / no forward entries. `today` injectable for testing. Best-effort."""
+    try:
+        csv_path = os.path.join(data_dir, "catalysts.csv")
+        cat = pd.read_csv(csv_path)
+        today = (pd.Timestamp(today).normalize() if today is not None
+                 else pd.Timestamp.today().normalize())
+        out = []
+        for _, r in cat.iterrows():
+            if str(r.get("ticker", "")).strip().upper() != ticker.upper():
+                continue
+            try:
+                d = pd.Timestamp(r["date"]).normalize()
+            except Exception:
+                continue
+            days = int((d - today).days)
+            if 0 <= days <= within_days:
+                out.append((d.date().isoformat(), days,
+                            str(r.get("type", "")).strip(), str(r.get("description", "")).strip()))
+        return sorted(out, key=lambda x: x[1])
+    except Exception:
+        return []
+
+
 def add_catalyst_proximity(df, ticker, data_dir="modules", for_direction=False):
     """
     Joins Days_to_catalyst from data/catalysts.csv — days until the next known binary event

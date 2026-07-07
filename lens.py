@@ -44,10 +44,22 @@ try:
 except Exception:
     gather_pc_oi = pc_label = LEAPS_MIN_DTE = LEAPS_MAX_DTE = None
 try:
-    from modules.volsetup import expected_move, vol_setup, gauge_val
+    from modules.volsetup import expected_move, vol_setup, gauge_val, gauge_pct
     from modules.features import next_earnings
 except Exception:
-    expected_move = vol_setup = gauge_val = next_earnings = None
+    expected_move = vol_setup = gauge_val = gauge_pct = next_earnings = None
+try:
+    from modules.features import next_ex_dividend
+except Exception:
+    next_ex_dividend = None
+try:
+    from modules.callquote import call_quote, cached_liquidity
+except Exception:
+    call_quote = cached_liquidity = None
+try:
+    from modules.benchmarks import upcoming_catalysts
+except Exception:
+    upcoming_catalysts = None
 try:
     from modules.volquote import straddle_quote
 except Exception:
@@ -65,14 +77,18 @@ try:
 except Exception:
     gather_squeeze = None
 try:
-    from modules.setupcheck import setup_check, fetch_rs, TIER1_MACRO
+    from modules.setupcheck import setup_check, fetch_rs, fetch_beta, TIER1_MACRO
 except Exception:
-    setup_check = fetch_rs = None
+    setup_check = fetch_rs = fetch_beta = None
     TIER1_MACRO = set()
 try:
     from modules.fng import fetch_fng
 except Exception:
     fetch_fng = None
+try:
+    from modules.breadth import fetch_breadth
+except Exception:
+    fetch_breadth = None
 try:
     from modules.insider import gather_insider
 except Exception:
@@ -145,7 +161,7 @@ def _rsi_tint(rsi):
 
 
 def _ob(state):
-    return _OB.get(state, state)
+    return _OB.get(state, state) or "—"       # None state (indicator NaN on a thin frame) → dash
 
 
 def _enable_windows_ansi():
@@ -454,26 +470,27 @@ def analyze(ticker, include_intraday=True, data_dir="data", live=False):
     summary = multi_timeframe_summary(reads)
     prof_src = frames.get("1h", frames.get("1D"))
     # ~6mo on the intraday path (≈126 sessions × ~7 1h-bars) so the shelves reflect near-term
-    # structure, not year-old levels; daily fallback = 252 sessions ≈ 1y.
+    # structure, not year-old levels; daily fallback = 252 sessions ≈ 1y. Reference price comes
+    # from the 1D close — the 1h cache can lag it (stale-cache fallback), skewing price_location.
     lookback = 880 if "1h" in frames else 252
-    profile = volume_profile(prof_src, lookback=lookback) if prof_src is not None else None
+    ref = float(frames["1D"]["Close"].iloc[-1]) if "1D" in frames else None
+    profile = (volume_profile(prof_src, lookback=lookback, ref_price=ref)
+               if prof_src is not None else None)
     return frames, reads, divs, summary, profile, notes, live_bar
 
 
-def _fmt_vol(v):
-    """RVOL (latest-bar volume vs its 20-bar avg) + a directional tag for the price-vs-volume-trend
-    relationship over the last ~10 bars (up-confirmed / up-WEAK / dn-distrib / dn-exhaust). The two
-    are independent: RVOL is a single-bar level; the tag is a multi-bar trend relationship."""
-    if not v or not v.get("ok"):
-        return "—"
-    rvol = f"{v['rvol']:.1f}x" if v.get("rvol") else "?"
-    return f"{rvol} {v.get('tag', '')}"
+def _section(title, color=True, w=78):
+    """Section headline embedded in a dimmed single rule — visual separation between the lens
+    blocks (the top header keeps its double line): `── TITLE ─────…` (S42)."""
+    dim, rst = (_DIM, _RESET) if color else ("", "")
+    pad = max(3, w - len(title) - 6)          # 2 indent + 2 rule + 2 spaces around the title
+    print(f"\n  {dim}──{rst} {title} {dim}{'─' * pad}{rst}")
 
 
 def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as_of=None,
                  ctx=None, backdrop=None, thesis=None, level=None, color=True, candle_style="box",
                  panel_bars=None, candle_px=128, geo=None, pcoi=None, vol=None, live=None,
-                 setup=None, squeeze=None, insider=None):
+                 setup=None, squeeze=None, insider=None, callq=None, liq=None, cats=None):
     w = 78
     print(f"\n{'═'*w}")
     hdr = f"  LENS — {ticker}"
@@ -525,11 +542,11 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
 
     # 1. MARKET BACKDROP
     if backdrop:
-        print(f"  MARKET BACKDROP — {backdrop}")
+        _section(f"MARKET BACKDROP — {backdrop}", color)
 
     # 2. MULTI-TIMEFRAME TABLE — column decode is printed at runtime (legend below). Trend = the
     # price-vs-MA structural trend, a different read from VolTrend (which is ΔPrc% vs ΔVol%).
-    print(f"\n  MULTI-TIMEFRAME  (longest → shortest)")
+    _section("MULTI-TIMEFRAME  (longest → shortest)", color)
     dim = _DIM if color else ""
     rst = _RESET if color else ""
     print(f"  {dim}RVOL = latest bar vs 20-bar avg (1.0 = normal)  ·  ΔPrc% = price move over last 10 bars{rst}")
@@ -561,21 +578,21 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         rvol = f"{v['rvol']:.1f}x" if v.get("rvol") else "—"
         dp = f"{v['price_chg_10']:+.1%}" if v.get("price_chg_10") is not None else "—"
         dv = f"{v['vol_trend_10']:+.1%}" if v.get("vol_trend_10") is not None else "—"
-        vt = v.get("tag", "—") if v.get("ok") else "—"
+        vt = (v.get("tag") or "—") if v.get("ok") else "—"
         rsi_c = _wrap(f"{rsi:<8}", _rsi_tint(r.get("rsi")))
         rvol_c = _wrap(f"{rvol:<6}", _heat(v.get("rvol"), 1.0, rv_hs, HEAT_DEAD["rvol"]))
         dp_c = _wrap(f"{dp:>7}", _heat(v.get("price_chg_10"), 0.0, dp_hs, HEAT_DEAD["price_chg_10"]))
         dv_c = _wrap(f"{dv:>8}", _heat(v.get("vol_trend_10"), 0.0, dv_hs, HEAT_DEAD["vol_trend_10"]))
         tf_lbl = f"{tf}*" if r.get("_partial") else tf
         print(f"  {tf_lbl:<4}{_ARROW.get(r['trend'], '?'):<7}{rsi_c}{_ob(r['stoch_state']):<6}"
-              f"{r['macd_state']:<8}{rvol_c}{dp_c}{dv_c}   {vt:<13}")
+              f"{(r['macd_state'] or '—'):<8}{rvol_c}{dp_c}{dv_c}   {vt:<13}")
     print(f"  → {summary['synthesis']}")
     if summary.get("rsi_conflict"):
         print(f"  ⚠ {summary['rsi_conflict']}")
 
     # 3. DIVERGENCES
     if divs:
-        print(f"\n  DIVERGENCES")
+        _section("DIVERGENCES", color)
         for tf, (kind, why) in divs.items():
             print(f"    {tf}: {kind} — {why}")
 
@@ -595,7 +612,7 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         below = sorted([h for h in hvns if h <= price], reverse=True)  # nearest support first (highest below)
         lvns = sorted(profile.get("lvns", []))
 
-        print(f"\n  VOLUME PROFILE  ({profile['n_bars']} bars)   HVN = volume S/R shelves · LVN = fast-move gaps")
+        _section(f"VOLUME PROFILE  ({profile['n_bars']} bars)   HVN = S/R shelves · LVN = fast-move gaps", color)
         print(f"    POC (fair value): {poc:.2f}   "
               f"Value area: {profile['va_low']:.2f} – {profile['va_high']:.2f}   (price {loc})")
         print(f"    HVN shelves  above price: {_levels(above)}")
@@ -604,7 +621,7 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
 
     # 5. RALLY vs DRAWDOWN RISK
     risk = rally_drawdown_risk(reads, profile=profile, ctx=ctx, divergences=divs)
-    print(f"\n  RALLY vs DRAWDOWN RISK  (current conditions, not a forecast)")
+    _section("RALLY vs DRAWDOWN RISK  (current conditions, not a forecast)", color)
     print(f"    NET: {risk['net']}")
     if risk["drawdown"]:
         print(f"    drawdown-risk factors:")
@@ -617,25 +634,30 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
 
     # 5b. SETUP CHECK — transparent completeness checklist (S41; default-on, best-effort)
     if setup and setup.get("rows"):
-        print(f"\n  SETUP CHECK  ({setup['net']})")
+        _section(f"SETUP CHECK  ({setup['net']})", color)
         for label, mark, detail in setup["rows"]:
             print(f"    {mark} {label:<18}{detail}")
         print(f"    · {setup['footer']}")
 
     # 6. OPTIONS & VOL CONTEXT
     if ctx and ctx.get("gauges"):
-        print(f"\n  OPTIONS & VOL CONTEXT  (regime: {ctx['regime']})")
+        _section(f"OPTIONS & VOL CONTEXT  (regime: {ctx['regime']})", color)
         for g in ctx["gauges"]:
             if g["group"] in ("OPTIONS", "VOL", "MARKET"):
                 val = g["fmt"].format(g["value"])
                 pct = f"  [{int(round(g['pct']*100))} percentile]" if g.get("pct") is not None else ""
                 lab = f"  {g['label']}" if g.get("label") else ""
                 print(f"    {g['name']:<20}{val:>9}{lab}{pct}")
+        if liq:
+            spr = f"{liq['spread_pct']:.1%}" if liq.get("spread_pct") is not None else "n/a"
+            stale_s = "  (stale)" if liq.get("stale") else ""
+            print(f"    options liquidity: {liq['grade']}  (ATM spread {spr}, OI {liq['oi']:,}) "
+                  f"— as of {liq['as_of_str']}{stale_s}")
         print(f"    NET: {ctx['net']}")
 
     # 6a. SHORT POSITIONING / SQUEEZE (--squeeze; S41 — fuel context, not an ignition forecast)
     if squeeze:
-        print(f"\n  SHORT POSITIONING / SQUEEZE  (context, not a prediction)")
+        _section("SHORT POSITIONING / SQUEEZE  (context, not a prediction)", color)
         si = squeeze.get("si")
         if si and si.get("interest"):
             chg = f"   Δ vs prior settlement {si['chg']:+.1%}" if si.get("chg") is not None else ""
@@ -670,8 +692,8 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
     # 6b. INSIDER ACTIVITY (--insider; S42 — SEC Form 4 open-market flow, cluster-buy detection)
     if insider:
         rd = insider.get("read") or {}
-        print(f"\n  INSIDER ACTIVITY — SEC Form 4, trailing {insider.get('lookback_days', 90)}d  "
-              f"(context, not a prediction)")
+        _section(f"INSIDER ACTIVITY — SEC Form 4, trailing {insider.get('lookback_days', 90)}d  "
+                 f"(context, not a prediction)", color)
         usd = rd.get("net_usd")
         usd_s = f"${usd:+,.0f}" if usd else "$0"
         print(f"    net open-market flow  {usd_s}  ({rd.get('n_buys', 0)} buys / "
@@ -696,7 +718,7 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         _hdr = f"({pcoi['scope']})"
         if pcoi.get("as_of_str"):
             _hdr += f" · as of {pcoi['as_of_str']}" + ("  (stale)" if pcoi.get("stale") else "")
-        print(f"\n  PUT/CALL OI — live Tradier chain, by expiry  {_hdr}")
+        _section(f"PUT/CALL OI — live Tradier chain, by expiry  {_hdr}", color)
         print(f"    {'Expiry':>10}  {'DTE':>4}  {'P/C OI':>6}  {'P/C Vol':>7}   Positioning")
         for r in pcoi["rows"]:
             pco = f"{r['pc']:.2f}"     if r["pc"]     is not None else "n/a"
@@ -713,7 +735,7 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
     # VOLATILITY SETUP — long-vol (straddle/strangle) context (--vol; descriptive, not a prediction).
     if vol and vol.get("setup"):
         s = vol["setup"]; em = vol.get("em"); eg = vol.get("earnings"); sq = vol.get("squeeze") or {}
-        print(f"\n  VOLATILITY SETUP — straddle/strangle context  (not a prediction)")
+        _section("VOLATILITY SETUP — straddle/strangle context  (not a prediction)", color)
         on = [tf for tf in ("1M", "1W", "1D", "4h", "1h") if sq.get(tf, {}).get("squeeze_on")]
         print(f"    compression: squeeze ON on {', '.join(on)}" if on
               else "    compression: no active squeeze")
@@ -730,7 +752,10 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         if hist and hist.get("status") == "ok":
             print(f"    history ({hist['usable']} earnings): {hist['summary']}")
         elif hist and hist.get("status") == "insufficient_iv":
-            print(f"    history: IV history thin — run `backfill_iv.py` ({hist['ticker']})")
+            # backfill only helps liquid names (trades-based; the CRSP dead end, S40) — the daily
+            # harvest through earnings windows is the path that always works (S44).
+            print(f"    history: IV history thin — accumulates via the daily harvest; "
+                  f"`backfill_iv.py` can restore liquid names ({hist['ticker']})")
         print(f"    NET: {s['net']}")
         for n in s.get("notes", []):
             print(f"      · {n}")
@@ -770,6 +795,11 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
                 return (f"          at ask: ${ca:.2f}/sh → BE {cb['lo_ask']:.2f} / {cb['hi_ask']:.2f}  "
                         f"(need −{cb['dn_move_ask']:.1%} / +{cb['up_move_ask']:.1%})")
 
+            def _nbln(cb):
+                # a no-bid leg makes the mid (= ask/2 on that leg) fictional — say so (S43)
+                return ("          ⚠ a leg has no bid — the mid cost is indicative, not executable"
+                        if cb.get("no_bid") else None)
+
             for blk in q["quotes"]:
                 kind = blk.get("expiry_kind", "")
                 dae = blk.get("days_after_earn")
@@ -779,7 +809,7 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
                 if stq:
                     print(f"        ATM straddle  {stq['call_strike']:g}: ${stq['cost']:.2f}/sh  "
                           f"BE {stq['lo']:.2f} / {stq['hi']:.2f}  (need −{stq['dn_move']:.1%} / +{stq['up_move']:.1%})")
-                    for ln in (_legln(stq), _askln(stq)):
+                    for ln in (_legln(stq), _nbln(stq), _askln(stq)):
                         if ln:
                             print(ln)
                 if sg:
@@ -795,15 +825,56 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
                         wing = f"≈±{sg['width']:.0%}{drift}"
                     print(f"        auto strangle ({wing})  {sg['put_strike']:g} / {sg['call_strike']:g}: "
                           f"${sg['cost']:.2f}/sh  BE {sg['lo']:.2f} / {sg['hi']:.2f}  (need −{sg['dn_move']:.1%} / +{sg['up_move']:.1%})")
-                    for ln in (_legln(sg), _askln(sg)):
+                    for ln in (_legln(sg), _nbln(sg), _askln(sg)):
                         if ln:
                             print(ln)
             print("      vega: straddle = max vega (enter close to the print); "
                   "strangle = cheaper + lower theta (enter earlier / run more names / vega convexity)")
 
+    # LONG CALL VIABILITY (--call; S46 — the directional instrument's carry math; context, not advice)
+    if callq and callq.get("quotes"):
+        tag = "  (stale)" if callq.get("stale") else ""
+        _section("LONG CALL VIABILITY  (context, not advice)", color)
+        print(f"    spot {callq['spot']:.2f}, as of {callq['as_of_str']}{tag}")
+        cliq = callq.get("liquidity")
+        if cliq:
+            spr = f"{cliq['spread_pct']:.1%}" if cliq.get("spread_pct") is not None else "n/a"
+            print(f"    chain liquidity: {cliq['grade'].upper()}  (ATM-region spread {spr}, "
+                  f"OI {cliq['oi']:,}, day vol {cliq['volume']:,})")
+
+        def _callln(kind, c):
+            if not c:
+                return
+            dlt = f"Δ{c['delta']:.2f}" if c.get("delta") is not None else "Δ—"
+            th = f"theta {c['theta_pct']:.1%}/d of premium" if c.get("theta_pct") else "theta n/a"
+            spr = f"spr {c['spread_pct']:.1%}" if c.get("spread_pct") is not None else "spr n/a"
+            oi = f"OI {int(c['oi']):,}" if c.get("oi") is not None else "OI —"
+            print(f"        {kind:<4}{c['strike']:g}c  {dlt}  ${c['mid']:.2f}/sh  "
+                  f"BE {c['be']:.2f} ({c['be_move']:+.1%})  {th}  {oi}  {spr}")
+            if c.get("be_ask") is not None:
+                print(f"            at ask ${c['ask']:.2f} → BE {c['be_ask']:.2f} ({c['be_move_ask']:+.1%})")
+
+        for blk in callq["quotes"]:
+            mon = "monthly, " if blk.get("monthly") else ""
+            print(f"      exp {blk['expiry']} ({mon}{blk['dte']}d):")
+            _callln("ATM", blk.get("atm"))
+            _callln("OTM", blk.get("otm"))
+            for n in blk.get("notes", []):
+                print(f"          · {n}")
+        curve = callq.get("curve")
+        if curve and curve.get("points"):
+            pts = " · ".join(f"{p['label']} {p['iv']:.1%}" for p in curve["points"])
+            print(f"      IV by expiry: {pts}  — {curve['tag']}")
+        ivp = gauge_pct(ctx, "ATM IV (30d)") if gauge_pct is not None else None
+        if ivp is not None and ivp >= 0.70:
+            print(f"      ⚠ ATM IV at {ivp:.0%}ile of its history — paying up for a direction bet; "
+                  f"debit spreads cut the vega/theta bill")
+        print("      guide: more DTE = slower theta · 0.35–0.40Δ in trends, lower Δ in chop · "
+              "BE move must be plausible within the tenor")
+
     # 6b. GEOPOLITICAL / CROSS-ASSET BACKDROP (--geo; context, not a prediction)
     if geo and geo.get("gauges"):
-        print(f"\n  GEOPOLITICAL / CROSS-ASSET BACKDROP  (context, not a prediction)")
+        _section("GEOPOLITICAL / CROSS-ASSET BACKDROP  (context, not a prediction)", color)
         last_grp = None
         for g in geo["gauges"]:
             if g["group"] != last_grp:
@@ -816,6 +887,13 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         for n in geo.get("notes", []):
             print(f"      · {n}")
 
+    # 7a. KNOWN CATALYSTS (S46) — catalysts.csv binary events (PDUFA / trial readouts) ≤45d out;
+    # until now only the ML layer saw these dates.
+    if cats:
+        _section("KNOWN CATALYSTS (catalysts.csv)", color)
+        for d, days, typ, desc in cats:
+            print(f"    {d} ({days}d)  {typ}: {desc}")
+
     # 7. MACRO
     if next_event_per_series:
         try:
@@ -823,14 +901,16 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
             soon = [(name, d, days) for name, (d, days) in ev.items()
                     if d is not None and days is not None and days <= 10]
             if soon:
-                print(f"\n  MACRO (next 10d): " +
-                      "  ".join(f"{n} {days}d" for n, d, days in sorted(soon, key=lambda x: x[2])))
+                _section("MACRO (next 10d): " +
+                         "  ".join(f"{n} {days}d" for n, d, days in sorted(soon, key=lambda x: x[2])),
+                         color)
         except Exception:
             pass
 
     # 8. THESIS CHECK
     if thesis:
-        print(f"\n  THESIS CHECK — you are {thesis.upper()}" + (f" (level {level})" if level else ""))
+        _section(f"THESIS CHECK — you are {thesis.upper()}" + (f" (level {level})" if level else ""),
+                 color)
         confirm = risk["rally"] if thesis == "bullish" else risk["drawdown"]
         contra  = risk["drawdown"] if thesis == "bullish" else risk["rally"]
         print(f"    CONFIRMATIONS ({len(confirm)}):")
@@ -962,6 +1042,11 @@ if __name__ == "__main__":
     ap.add_argument("--vol", action="store_true",
                     help="Add a VOLATILITY SETUP block — Bollinger-Keltner squeeze, expected move + breakevens, "
                          "earnings catalyst, and a two-sided long-vol (straddle/strangle) vs short-vol scorecard.")
+    ap.add_argument("--call", action="store_true",
+                    help="Add a LONG CALL VIABILITY block — ~45d/~90d monthly call quotes (ATM + "
+                         "~0.35-0.40 delta) with breakeven move, theta/day as %% of premium, an "
+                         "ATM-IV-by-expiry curve, and a chain liquidity grade. Network; needs "
+                         "TRADIER_TOKEN; cached like --vol.")
     args = ap.parse_args()
 
     _enable_windows_ansi()
@@ -979,6 +1064,15 @@ if __name__ == "__main__":
         tickers = [t]
 
     backdrop_base = market_backdrop(args.data_dir)   # SPY tide — same for all tickers, computed once
+    if fetch_breadth is not None:                    # equal-weight breadth (S45) — market-level, cached ~6h
+        br = fetch_breadth(data_dir=args.data_dir)
+        segs = []
+        for lbl, d in ((br or {}).get("pairs") or {}).items():
+            pct = f" [{d['pct']:.0%}ile]" if d.get("pct") is not None else ""
+            segs.append(f"{lbl} {d['rel_20d']:+.1%}{pct} {d['tag']}")
+        if segs:
+            seg = "breadth(20d) " + " · ".join(segs)
+            backdrop_base = f"{backdrop_base}  |  {seg}" if backdrop_base else seg
     if fetch_fng is not None:                        # CNN Fear & Greed (S41) — market-level, cached ~6h
         fng = fetch_fng(data_dir=args.data_dir)
         if fng and fng.get("score") is not None:
@@ -1060,6 +1154,29 @@ if __name__ == "__main__":
             except Exception:
                 earn = None
 
+        # next ex-dividend (S46) — shared by the SETUP CHECK catalyst row and the --call block
+        exd = None
+        if next_ex_dividend is not None:
+            try:
+                exd = next_ex_dividend(ticker)
+            except Exception:
+                exd = None
+
+        # earnings-window capture guard (S44): inside the pre-earnings window, a missed daily IV
+        # harvest is UNRECOVERABLE for the vol study (Massive history is trades-only — thin names
+        # can't be backfilled). Surface a missing harvest the same day instead of post-print.
+        if earn and earn.get("days") is not None and 0 <= earn["days"] <= 10:
+            try:
+                _csv = os.path.join(args.data_dir, f"{ticker.lower()}_indicators.csv")
+                _iv = pd.read_csv(_csv, index_col=0, parse_dates=True)["atm_iv_30d"].dropna()
+                _last_iv = _iv.index.max() if len(_iv) else None
+                if _last_iv is None or pd.Timestamp(_last_iv).normalize() < _expected_last_session():
+                    notes.append(f"earnings in {earn['days']}d and the latest session's IV harvest is "
+                                 f"missing — run `indicators.py --ticker {ticker}` (missed pre-earnings "
+                                 f"sessions cannot be backfilled).")
+            except Exception:
+                pass
+
         vol = None
         if args.vol and vol_setup is not None:
             try:
@@ -1067,8 +1184,11 @@ if __name__ == "__main__":
                 squeeze = {tf: read_squeeze(frames[tf]) for tf in frames}
                 # --live: prefer the real-time Tradier IV for the expected move (spot is already
                 # live via the provisional today-bar); the scorecard percentile stays harvest-based.
-                em_iv = (live_iv or {}).get("iv") or gauge_val(ctx, "ATM IV (30d)")
-                em = expected_move(spot, em_iv, dte=30,
+                # The live IV carries its own tenor — scale the move by that DTE, not a fixed 30.
+                live_ok = bool((live_iv or {}).get("iv"))
+                em_iv = live_iv["iv"] if live_ok else gauge_val(ctx, "ATM IV (30d)")
+                em_dte = (live_iv.get("dte") or 30) if live_ok else 30
+                em = expected_move(spot, em_iv, dte=em_dte,
                                    hv=gauge_val(ctx, "HV-20 (annualized)"))
                 vol = {"squeeze": squeeze, "em": em, "earnings": earn,
                        "setup": vol_setup(reads, squeeze, ctx, earnings=earn, em=em),
@@ -1081,6 +1201,28 @@ if __name__ == "__main__":
                                    if pre_earnings_vol_study else None)}
             except Exception as e:
                 notes.append(f"vol setup unavailable ({type(e).__name__}).")
+
+        # LONG CALL VIABILITY (--call; S46) — the directional instrument's carry math, cached.
+        callq = None
+        if args.call and call_quote is not None:
+            try:
+                callq = call_quote(ticker, earnings_date=(earn or {}).get("date"),
+                                   ex_div_date=(exd or {}).get("date"),
+                                   interactive=sys.stdin.isatty(), data_dir=args.data_dir,
+                                   force=args.live)
+            except Exception as e:
+                notes.append(f"call viability unavailable ({type(e).__name__}).")
+            else:
+                if callq is None:
+                    notes.append("call viability unavailable (no Tradier token or no chain data).")
+                elif callq.get("cached") and callq.get("stale"):
+                    notes.append(f"call quote cached {callq['age_str']} and stale — run in a terminal to refresh.")
+
+        # chain liquidity grade (S46) — default-on, ZERO network: reads the freshest --call cache.
+        liq = cached_liquidity(ticker, data_dir=args.data_dir) if cached_liquidity is not None else None
+
+        # known binary catalysts (S46) — surfaces catalysts.csv (PDUFA/trial dates) in the lens.
+        cats = upcoming_catalysts(ticker) if upcoming_catalysts is not None else []
 
         # SHORT POSITIONING / SQUEEZE (--squeeze; S41) — reuses the lens' own profile + pc flow.
         sqz = None
@@ -1110,8 +1252,10 @@ if __name__ == "__main__":
                     macro_t1 = min(t1) if t1 else None
                 rs = (fetch_rs(ticker, frames["1D"], data_dir=args.data_dir)
                       if (fetch_rs is not None and "1D" in frames) else None)
+                beta = (fetch_beta(ticker, frames["1D"])
+                        if (fetch_beta is not None and "1D" in frames) else None)
                 setup = setup_check(reads, profile=profile, ctx=ctx, earn=earn,
-                                    macro_tier1_days=macro_t1, rs=rs)
+                                    macro_tier1_days=macro_t1, rs=rs, beta=beta, ex_div=exd)
             except Exception as e:
                 notes.append(f"setup check unavailable ({type(e).__name__}).")
 
@@ -1135,4 +1279,4 @@ if __name__ == "__main__":
                      ctx=ctx, backdrop=backdrop, thesis=args.thesis, level=args.level, color=use_color,
                      candle_style=args.candle, panel_bars=panel_bars, candle_px=args.candle_px,
                      geo=geo, pcoi=pc, vol=vol, live=live_bar, setup=setup, squeeze=sqz,
-                     insider=ins)
+                     insider=ins, callq=callq, liq=liq, cats=cats)

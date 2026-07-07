@@ -20,7 +20,7 @@ import datetime
 from modules.tradier import TRADIER_TOKEN, get_current_price, get_expirations, get_chain
 from modules.pc_oi import _cache_path, cache_stale, _cache_age, _hhmm, is_monthly_expiry
 
-SCOPEKEY = "straddle6"       # bumped when the cached payload shape changes (per-wing widths + ask-side cost)
+SCOPEKEY = "straddle7"       # bumped when the cached payload shape changes (no_bid combo flag, S43)
 EM_MULT = 1.0                # "auto" strangle wings at ±(EM_MULT × expected move); exp move = straddle/spot
 SNAP_K = 3                   # a wing snaps within the K nearest OTM strikes to its target
 SNAP_OI_FRAC = 0.5           # a wing takes the NEAREST candidate holding ≥ this fraction of the best candidate's OI
@@ -66,6 +66,8 @@ def _combo(call, put, spot):
     leg = lambda o: {"strike": o["strike"], "bid": o["bid"], "ask": o["ask"], "oi": o.get("oi")}
     out = {"call_strike": call["strike"], "put_strike": put["strike"], "cost": cost,
            "lo": lo, "hi": hi, "up_move": (hi - spot) / spot, "dn_move": (spot - lo) / spot,
+           # a no-bid leg makes its mid (= ask/2) fictional — the lens flags the combo (S43)
+           "no_bid": (call.get("bid") or 0) <= 0 or (put.get("bid") or 0) <= 0,
            "legs": {"call": leg(call), "put": leg(put)}}
     if call["ask"] > 0 and put["ask"] > 0:
         ca = call["ask"] + put["ask"]

@@ -280,6 +280,57 @@ def next_earnings(ticker, daily=None):
     return {"date": nxt.date().isoformat(), "days": int((nxt - today).days), "hist_move": hist}
 
 
+def estimate_next_ex_div(ex_dates, today=None):
+    """PURE (S46): next ex-dividend date estimated from PAST ex-dates (yfinance `dividends` index)
+    — last ex-date + median cadence, rolled forward past today. Returns a normalized Timestamp, or
+    None when history is too thin (<4 payments) or the cadence is irregular (median gap >400d,
+    e.g. specials-only)."""
+    if ex_dates is None or len(ex_dates) < 4:
+        return None
+    idx = pd.DatetimeIndex(ex_dates)
+    if idx.tz is not None:
+        idx = idx.tz_convert(None)
+    idx = idx.normalize().sort_values()
+    med = idx.to_series().diff().median()
+    if med is None or pd.isna(med) or med > pd.Timedelta(days=400) or med <= pd.Timedelta(0):
+        return None
+    today = pd.Timestamp(today).normalize() if today is not None else pd.Timestamp.today().normalize()
+    nxt = idx[-1] + med
+    while nxt <= today:
+        nxt += med
+    return nxt.normalize()
+
+
+def next_ex_dividend(ticker):
+    """Next ex-dividend date for `ticker` (S46) — a long call doesn't earn the dividend, the stock
+    gaps down by it, and deep-ITM calls face early-exercise into ex-div. Exact date from the
+    yfinance calendar when available; else estimated from the dividend-history cadence (flagged
+    `est`). Returns {date, days, est} or None (non-payer / no data). Best-effort: never raises."""
+    try:
+        t = yf.Ticker(ticker)
+        today = pd.Timestamp.today().normalize()
+        exd = None
+        try:
+            cal = t.get_calendar() if hasattr(t, "get_calendar") else t.calendar
+            if isinstance(cal, dict):
+                exd = cal.get("Ex-Dividend Date")
+            elif cal is not None and hasattr(cal, "index") and "Ex-Dividend Date" in list(cal.index):
+                exd = cal.loc["Ex-Dividend Date"].iloc[0]
+        except Exception:
+            exd = None
+        if exd is not None:
+            d = pd.Timestamp(exd).normalize()
+            if d >= today:
+                return {"date": d.date().isoformat(), "days": int((d - today).days), "est": False}
+        div = t.dividends
+        nxt = estimate_next_ex_div(div.index if (div is not None and len(div)) else None, today)
+        if nxt is None:
+            return None
+        return {"date": nxt.date().isoformat(), "days": int((nxt - today).days), "est": True}
+    except Exception:
+        return None
+
+
 def normalize_features(df):
     """Replace absolute price-level indicators with scale-invariant ratios.
 

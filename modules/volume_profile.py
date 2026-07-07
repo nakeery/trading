@@ -17,9 +17,11 @@ import numpy as np
 import pandas as pd
 
 VALUE_AREA_FRAC = 0.70
+HVN_NEAR_PCT = 0.05     # near_hvn_above/below only report a shelf within ±5% of price — "approaching"
+                        # in the risk scorecard means genuinely near, not the nearest at any distance (S43)
 
 
-def volume_profile(ohlcv, lookback=None, bins=50):
+def volume_profile(ohlcv, lookback=None, bins=50, ref_price=None):
     df = ohlcv.tail(lookback) if lookback else ohlcv
     df = df.dropna(subset=["High", "Low", "Close", "Volume"])
     if len(df) < 5 or df["Volume"].sum() == 0:
@@ -64,11 +66,13 @@ def volume_profile(ohlcv, lookback=None, bins=50):
         if vap[i] <= vap[i - 1] and vap[i] <= vap[i + 1] and vap[i] < mean - 0.5 * std:
             lvns.append(float(centers[i]))
 
-    price = float(ohlcv["Close"].iloc[-1])
+    # ref_price: the caller's current price (e.g. the lens' 1D close) — the profile source can be a
+    # stale 1h cache whose last close lags the daily bar, silently skewing price_location (S43).
+    price = float(ref_price) if ref_price is not None else float(ohlcv["Close"].iloc[-1])
     location = ("in_value" if va_lo <= price <= va_hi
                 else "above_value" if price > va_hi else "below_value")
-    hvn_above = min((h for h in hvns if h > price), default=None)
-    hvn_below = max((h for h in hvns if h < price), default=None)
+    hvn_above = min((h for h in hvns if price < h <= price * (1 + HVN_NEAR_PCT)), default=None)
+    hvn_below = max((h for h in hvns if price * (1 - HVN_NEAR_PCT) <= h < price), default=None)
 
     return {
         "poc": poc, "va_low": va_lo, "va_high": va_hi,

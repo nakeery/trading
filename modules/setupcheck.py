@@ -51,6 +51,38 @@ def fetch_rs(ticker, daily, data_dir="data"):
         return None
 
 
+def beta_corr(closes, bench_closes, window=60):
+    """PURE (S46): trailing OLS beta (cov/var of daily returns) + Pearson correlation vs the
+    benchmark over the last `window` aligned sessions. {beta, corr, n} or None when too short
+    (<20 returns) or the benchmark is degenerate (zero variance)."""
+    c = pd.Series(closes, dtype=float).dropna().pct_change()
+    b = pd.Series(bench_closes, dtype=float).dropna().pct_change()
+    df = pd.concat([c, b], axis=1, join="inner", keys=["s", "m"]).dropna().iloc[-window:]
+    if len(df) < 20:
+        return None
+    var = float(df["m"].var())
+    if not var:
+        return None
+    return {"beta": float(df["s"].cov(df["m"]) / var),
+            "corr": float(df["s"].corr(df["m"])), "n": len(df)}
+
+
+def fetch_beta(ticker, daily, window=60):
+    """Best-effort 60d beta/corr vs SPY (S46) — how much the MARKET BACKDROP applies to THIS name.
+    One yfinance daily fetch, aligned to the common last date like fetch_rs; None on any failure."""
+    try:
+        import yfinance as yf
+        raw = yf.download("SPY", period="6mo", interval="1d", progress=False, auto_adjust=True)
+        if raw is None or len(raw) == 0:
+            return None
+        if isinstance(raw.columns, pd.MultiIndex):
+            raw.columns = raw.columns.get_level_values(0)
+        last = min(daily.index[-1], raw.index[-1])
+        return beta_corr(daily.loc[:last, "Close"], raw.loc[:last, "Close"], window=window)
+    except Exception:
+        return None
+
+
 def _gauge(ctx, name):
     for g in (ctx or {}).get("gauges", []):
         if g.get("name") == name:
@@ -58,11 +90,14 @@ def _gauge(ctx, name):
     return None
 
 
-def setup_check(reads, profile=None, ctx=None, earn=None, macro_tier1_days=None, rs=None):
+def setup_check(reads, profile=None, ctx=None, earn=None, macro_tier1_days=None, rs=None,
+                beta=None, ex_div=None):
     """Build the checklist. `reads` = lens per-TF reads (needs '1D'; uses 1W/1M when present);
     `profile` = volume_profile dict; `ctx` = gather_context result; `earn` = next_earnings dict;
     `macro_tier1_days` = days to the nearest Tier-1 release (None = unknown); `rs` = fetch_rs
-    result. Pure — all inputs injectable. Returns {rows: [(label, mark, detail)], net, footer}."""
+    result; `beta` = beta_corr/fetch_beta result (S46 — informational, never ✓/✗); `ex_div` =
+    features.next_ex_dividend result (S46 — appended to the catalyst row). Pure — all inputs
+    injectable. Returns {rows: [(label, mark, detail)], net, footer}."""
     rows = []
 
     # 1. higher-timeframe alignment
@@ -120,11 +155,24 @@ def setup_check(reads, profile=None, ctx=None, earn=None, macro_tier1_days=None,
     else:
         rows.append(("Relative strength", "–", "n/a (benchmark data unavailable)"))
 
+    # 4b. market coupling (S46) — how much the MARKET BACKDROP applies to THIS name. Always
+    # informational ("–"): high or low coupling is neither favorable nor against by itself.
+    if beta and beta.get("corr") is not None:
+        bc = f"β {beta['beta']:.2f} / corr {beta['corr']:.2f} vs SPY ({beta.get('n', 60)}d)"
+        if beta["corr"] >= 0.6:
+            rows.append(("Market beta", "–", f"{bc} — backdrop applies"))
+        elif beta["corr"] < 0.3:
+            rows.append(("Market beta", "–", f"{bc} — largely idiosyncratic; backdrop matters less"))
+        else:
+            rows.append(("Market beta", "–", f"{bc} — moderate coupling"))
+    else:
+        rows.append(("Market beta", "–", "n/a"))
+
     # 5. location vs volume structure
     if profile:
         loc = profile.get("price_location")
-        sup = profile.get("near_hvn_below")
-        sup_s = f"; HVN support {sup:.2f} below" if sup else "; no HVN support below"
+        sup = profile.get("near_hvn_below")           # proximity-filtered (±HVN_NEAR_PCT, S43)
+        sup_s = f"; HVN support {sup:.2f} below" if sup else "; no HVN support nearby"
         if loc == "in_value":
             rows.append(("Location", "✓", f"inside value area{sup_s}"))
         elif loc == "above_value":
@@ -161,6 +209,12 @@ def setup_check(reads, profile=None, ctx=None, earn=None, macro_tier1_days=None,
     if macro_tier1_days is not None and macro_tier1_days <= 1:
         mark = "–"
         parts.append("Tier-1 macro ≤1d (FOMC/CPI/NFP/PCE)")
+    if ex_div and ex_div.get("days") is not None and 0 <= ex_div["days"] <= 45:
+        # informational (mark unchanged): a long call doesn't earn the dividend, and deep-ITM
+        # calls face early-exercise into ex-div (S46)
+        pre = "~" if ex_div.get("est") else ""
+        parts.append(f"ex-div {pre}{ex_div['date']} ({ex_div['days']}d) — calls don't earn it; "
+                     f"deep-ITM early-exercise risk")
     rows.append(("Catalyst timing", mark, "; ".join(parts)))
 
     n_ok = sum(1 for _, m, _ in rows if m == "✓")

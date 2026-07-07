@@ -49,11 +49,14 @@ def read_timeframe(ohlcv):
     else:
         trend = "mixed"
 
-    # range position over a ~1y-equivalent trailing window for this TF
+    # range position over the trailing window — up to 252 bars OF THIS TF (= ~1y on the daily row,
+    # the only timeframe whose range_pos the risk scorecard consumes; far longer on 1W/1M)
     win = min(len(c), 252)
     lo, hi = c.iloc[-win:].min(), c.iloc[-win:].max()
     range_pos = (price - lo) / (hi - lo) if hi > lo else 0.5
 
+    # States are None (not a definite label) when the underlying indicator is NaN — a 30–33-bar
+    # frame has no MACD signal yet and used to print a confident "bearish" from it (S43).
     return {
         "ok": True,
         "price": price,
@@ -61,9 +64,11 @@ def read_timeframe(ohlcv):
         "above_ma20": above20, "above_ma50": above50,
         "dist_ma20_pct": (price / m20 - 1) if (price and m20) else None,
         "rsi": r,
-        "rsi_state": "overbought" if (r and r >= 70) else "oversold" if (r and r <= 30) else "neutral",
-        "stoch_state": "overbought" if (st and st >= 80) else "oversold" if (st and st <= 20) else "neutral",
-        "macd_state": "bullish" if (ml is not None and ms is not None and ml > ms) else "bearish",
+        "rsi_state": None if r is None else
+                     "overbought" if r >= 70 else "oversold" if r <= 30 else "neutral",
+        "stoch_state": None if st is None else
+                       "overbought" if st >= 80 else "oversold" if st <= 20 else "neutral",
+        "macd_state": None if (ml is None or ms is None) else "bullish" if ml > ms else "bearish",
         "range_pos": range_pos,
     }
 
@@ -116,9 +121,12 @@ def read_volume(ohlcv, exclude_last=False):
 
     # price direction vs the TREND in average volume, both over the last ~10 bars (NOT the latest-bar
     # RVOL above). Volume should expand in the direction of the trend; if it doesn't, the move is weak.
-    price_chg = _safe(c_live) / _safe(c_live, -11) - 1 if _safe(c_live, -11) else 0
-    vol_trend = (_safe(avgvol) / _safe(avgvol, -11) - 1) if _safe(avgvol, -11) else 0
-    if price_chg > 0 and vol_trend > 0:
+    # None (not 0) when the 10-bar history is missing, so the table shows "—" instead of "+0.0%" (S43).
+    price_chg = (_safe(c_live) / _safe(c_live, -11) - 1) if _safe(c_live, -11) else None
+    vol_trend = (_safe(avgvol) / _safe(avgvol, -11) - 1) if _safe(avgvol, -11) else None
+    if price_chg is None or vol_trend is None:
+        tag, conf = None, None
+    elif price_chg > 0 and vol_trend > 0:
         tag, conf = "up-confirmed", "rising price + rising volume (healthy advance)"
     elif price_chg > 0:
         tag, conf = "up-WEAK", "rising price on FALLING volume (advance unconfirmed)"

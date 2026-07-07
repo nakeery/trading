@@ -27,7 +27,8 @@ import matplotlib.pyplot as plt
 from matplotlib.gridspec import GridSpec
 from matplotlib.ticker import MaxNLocator, FuncFormatter
 
-from modules.massive import IV_COLS, get_chain_summary
+from modules.massive import IV_COLS, get_chain_summary, get_event_iv, EVENT_EARN_WINDOW
+from modules.features import next_earnings
 
 # ─────────────────────────────────────────
 # CONFIG — adjust these to your preference
@@ -454,13 +455,32 @@ def harvest_iv_snapshot(df, ticker, csv_path):
         return df
 
     for k in IV_COLS:
-        df.loc[last_idx, k] = summary.get(k)
+        if k in summary:                        # event cols (S44) aren't in the chain summary —
+            df.loc[last_idx, k] = summary.get(k)   # leave them for the event stamp below
 
     skew_s = f"{summary['iv_skew_25d']:+.3f}" if summary["iv_skew_25d"] is not None else "n/a"
     term_s = f"{summary['term_structure']:.2f}" if summary["term_structure"] is not None else "n/a"
     pc_s   = f"{summary['put_call_oi_ratio']:.2f}" if summary["put_call_oi_ratio"] is not None else "n/a"
     print(f"  ATM IV (~{summary['atm_dte']}d): {summary['atm_iv_30d']:.1%} | "
           f"25Δ skew: {skew_s} | term: {term_s} | P/C OI: {pc_s}  → row {last_idx.date()}")
+
+    # Event-expiry IV (S44): when earnings are near, also stamp the nearest POST-earnings expiry's
+    # ATM IV — the tenor where the pre-earnings ramp concentrates (the constant-maturity 30d gauge
+    # blunts it; the modules/vol_history.py study reads these stamps). Quote-based, so it fills for
+    # thin names (CRSP) whose trades-based history can't be backfilled. Best-effort, never fatal.
+    try:
+        earn = next_earnings(ticker)
+        if earn and earn.get("days") is not None and 0 <= earn["days"] <= EVENT_EARN_WINDOW:
+            ev = get_event_iv(ticker, spot, earn["days"])
+            if ev:
+                for k, v in ev.items():
+                    df.loc[last_idx, k] = v
+                print(f"  event-expiry IV ({ev['event_expiry']}, {ev['event_dte']}d, "
+                      f"earnings in {earn['days']}d): {ev['atm_iv_event']:.1%}")
+            else:
+                print(f"  event-expiry IV unavailable (earnings in {earn['days']}d) — column left NaN")
+    except Exception as e:
+        print(f"  event-expiry IV skipped ({type(e).__name__})")
     return df
 
 

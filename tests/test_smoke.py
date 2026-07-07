@@ -1,7 +1,7 @@
 """
 Smoke tests for the options trading ML pipeline.
 
-25 regression guards:
+31 regression guards:
   1. Signal hierarchy (backtest CSV) — STRONG ENTRY > CAUTION > STAY OUT by avg return
   2. STRONG ENTRY baseline sanity (backtest CSV) — count/return/win-rate loose bounds
   3. Vol thresholds range (QQQ indicators CSV) — positive values in expected ranges
@@ -37,6 +37,23 @@ Smoke tests for the options trading ML pipeline.
  24. fng parser — score/rating/percentile from fixture payload; missing score → None (S41, offline)
  25. insider Form 4 — XML parse (P/S only), 30d cluster-buy detection (distinct owners), net-flow
      read + sales-are-weak caveat (S42, offline)
+ 26. timeframes last_bar_partial calendar check — a Thu forming week / late-month forming month is
+     partial even when the bar count clears frac; weekend month-end labels roll back; the count
+     heuristic still catches stale mid-period data (S43, offline)
+ 27. backfill_iv _apply_result — writes only NaN cells: a date revisited for a missing
+     term_structure keeps its harvested atm_iv_30d (S44, offline)
+ 28. massive pick_event_atm + vol_history _iv_triplet — earliest post-earnings expiry ATM chosen,
+     iv=20 placeholder rejected; event IV used only when all three sessions have it (never mixes
+     tenors within one ramp), 30d fallback otherwise (S44, offline)
+ 29. breadth read_breadth — equal-weight leading → broad-led, lagging → narrow, flat → mixed
+     (±0.5% dead band); percentile off the rolling 20d-spread series; short pairs omitted
+     (S45, offline)
+ 30. callquote pure helpers — pick_call_candidates (ATM + ~0.375Δ, no-bid strikes skipped),
+     liquidity_grade bands (tight/ok/wide/dead + OI floor), curve_read cheap-tenor tag,
+     _select_expiries monthly-nearest-45/90 (S46, offline)
+ 31. beta_corr (2x-levered clone → β≈2 corr≈1; independent → low corr; short → None),
+     estimate_next_ex_div cadence estimator (quarterly → +~91d; irregular/thin → None),
+     upcoming_catalysts window + ticker filter (S46, offline)
 """
 
 
@@ -727,6 +744,14 @@ def test_vol_setup_factors():
     on_1w = vol_setup(None, {"1W": {"ok": True, "squeeze_on": True}}, ctx())["long_vol"]
     assert any("squeeze ON (1W)" in f for f in on_1w)
 
+    # (e) S43: the implied-vs-realized `em` factor was removed — em.pct/em.hv_pct reduces to the
+    # same atm_iv/HV_20 ratio as the IV/HV factor, so it double-counted one input (2-factor margin).
+    em_cheap = {"pct": 0.05, "hv_pct": 0.10, "dte": 30}
+    with_em = vol_setup(None, {}, ctx(iv_pct=0.20), earnings=earn, em=em_cheap)
+    without = vol_setup(None, {}, ctx(iv_pct=0.20), earnings=earn)
+    assert with_em["long_vol"] == without["long_vol"]
+    assert not any("implied move" in f for f in with_em["long_vol"] + with_em["short_vol"])
+
 
 # ─── Test 20: timeframes live-bar append (offline) ────────────────────────────
 def test_append_live_bar():
@@ -786,6 +811,230 @@ def test_merge_intraday_topup():
 
     same, n0 = merge_intraday_topup(cached, cached.iloc[0:0])         # empty top-up → no-op
     assert n0 == 0 and same is cached
+
+
+# ─── Test 26: timeframes last_bar_partial calendar check (offline) ────────────
+def test_last_bar_partial_calendar():
+    """modules/timeframes.last_bar_partial (S43): the count heuristic (frac=0.7) missed a Thu/Fri
+    forming week and a late-month forming month — the calendar check (period end vs the most recent
+    completed session, injectable via now_session) flags them; weekend month-end labels roll back to
+    the last weekday so a complete month isn't misflagged; stale mid-period data still trips the
+    count fallback. Pure logic, no network."""
+    import pandas as pd
+    from modules.timeframes import last_bar_partial
+
+    def daily(end):
+        idx = pd.bdate_range("2026-01-05", end)
+        return pd.DataFrame({"Close": 100.0}, index=idx)
+
+    thu = pd.Timestamp("2026-06-25")                              # Thursday
+    # forming week, 4 bars: count heuristic alone said complete (4 ≥ 0.7×5) — calendar says partial
+    assert last_bar_partial(daily(thu), "1W", now_session=thu) is True
+    # after Friday's close the week is complete
+    fri = pd.Timestamp("2026-06-26")
+    assert last_bar_partial(daily(fri), "1W", now_session=fri) is False
+    # late-month forming month (18 of ~22 June sessions ≥ 0.7×typical) → calendar says partial
+    assert last_bar_partial(daily(thu), "1M", now_session=thu) is True
+    # month-end session close → complete
+    eom = pd.Timestamp("2026-06-30")                              # Tuesday, last June session
+    assert last_bar_partial(daily(eom), "1M", now_session=eom) is False
+    # weekend month-end label (May 2026 ends Sunday) rolls back to Friday → complete, not misflagged
+    may_end = pd.Timestamp("2026-05-29")                          # Friday, last May session
+    assert last_bar_partial(daily(may_end), "1M", now_session=may_end) is False
+    # stale data ending mid-week long ago: calendar can't fire, the count fallback still does
+    stale_end = pd.Timestamp("2026-06-10")                        # Wednesday, 3-bar final week
+    assert last_bar_partial(daily(stale_end), "1W", now_session=pd.Timestamp("2026-07-06")) is True
+
+
+# ─── Test 27: backfill_iv per-cell no-overwrite (offline) ─────────────────────
+def test_backfill_apply_result():
+    """backfill_iv._apply_result (S44): the work list selects dates missing atm_iv_30d OR
+    term_structure, so a date revisited only for its missing term_structure must NOT have its
+    harvested quote-based atm_iv_30d replaced by the trades-based inversion value. Only NaN
+    cells are written; None values never write. Pure, no network."""
+    import pandas as pd
+    from backfill_iv import _apply_result
+
+    df = pd.DataFrame(
+        {"atm_iv_30d": [0.63, None], "term_structure": [None, None], "iv_skew_25d": [0.02, None]},
+        index=pd.DatetimeIndex(["2026-06-20", "2026-06-21"]))
+    result = {"atm_iv_30d": 0.40, "term_structure": 1.05, "iv_skew_25d": 0.09,
+              "not_a_column": 9.9, "atm_strike": None}
+
+    # term-refill date: harvested atm_iv_30d + skew survive, only the NaN term is written
+    ts = pd.Timestamp("2026-06-20")
+    written = _apply_result(df, ts, result)
+    assert written == ["term_structure"]
+    assert float(df.loc[ts, "atm_iv_30d"]) == 0.63          # harvested value UNCHANGED
+    assert float(df.loc[ts, "iv_skew_25d"]) == 0.02
+    assert float(df.loc[ts, "term_structure"]) == 1.05      # the gap it came for IS filled
+
+    # all-NaN date: every present, non-None key is written
+    ts2 = pd.Timestamp("2026-06-21")
+    written2 = _apply_result(df, ts2, result)
+    assert set(written2) == {"atm_iv_30d", "term_structure", "iv_skew_25d"}
+    assert float(df.loc[ts2, "atm_iv_30d"]) == 0.40
+    assert _apply_result(df, ts2, None) == []               # no result → no-op
+
+
+# ─── Test 28: event-expiry IV selection + tenor guard (offline) ───────────────
+def test_event_iv_selection():
+    """massive.pick_event_atm (S44): earliest post-earnings expiry wins, ATM = strike nearest
+    spot, the iv=20 placeholder is rejected. vol_history._iv_triplet: event-expiry IV is used
+    only when ALL THREE sessions carry it (mixing tenors inside one ramp measurement would
+    fabricate ramp); otherwise the 30d proxy for all three. Pure, no network."""
+    import datetime
+    import pandas as pd
+    from modules.massive import pick_event_atm
+    from modules.vol_history import _iv_triplet
+
+    def p(typ, strike, expiry, iv):
+        e = datetime.date.fromisoformat(expiry)
+        return {"type": typ, "strike": strike, "expiry": e,
+                "dte": (e - datetime.date(2026, 7, 6)).days, "iv": iv}
+
+    parsed = [
+        p("call", 45.0, "2026-08-21", 0.90),      # later expiry — must lose to the front one
+        p("call", 47.5, "2026-08-14", 20),        # front expiry but placeholder iv → rejected
+        p("call", 45.0, "2026-08-14", 0.95),      # front expiry, ATM (spot 44.8) → winner
+        p("call", 50.0, "2026-08-14", 1.10),      # front expiry, farther strike
+        p("put",  45.0, "2026-08-14", 0.97),      # puts ignored
+    ]
+    ev = pick_event_atm(parsed, underlying_price=44.8)
+    assert ev and ev["event_expiry"] == "2026-08-14" and ev["atm_iv_event"] == 0.95
+    assert pick_event_atm([p("call", 45.0, "2026-08-14", 20)], 44.8) is None   # placeholder-only
+
+    idx = pd.DatetimeIndex(["2026-07-01", "2026-07-02", "2026-07-03"])
+    full = pd.DataFrame({"atm_iv_30d": [0.50, 0.55, 0.40],
+                         "atm_iv_event": [0.60, 0.70, 0.45]}, index=idx)
+    gap = pd.DataFrame({"atm_iv_30d": [0.50, 0.55, 0.40],
+                        "atm_iv_event": [None, 0.70, 0.45]}, index=idx)
+    assert _iv_triplet(full, *idx) == (0.60, 0.70, 0.45, "event")   # complete → event series
+    assert _iv_triplet(gap, *idx) == (0.50, 0.55, 0.40, "30d")      # gap → 30d for ALL three
+    assert _iv_triplet(gap[["atm_iv_30d"]].assign(atm_iv_30d=None), *idx) == (None, None, None, None)
+
+
+# ─── Test 29: equal-weight breadth read (offline) ─────────────────────────────
+def test_read_breadth():
+    """modules/breadth.read_breadth (S45): equal-weight outperforming over 20d → 'broad-led',
+    lagging → 'narrow', inside the ±0.5% dead band → 'mixed'; percentile computed off the
+    rolling 20d-spread series (an accelerating spread reads at the top of its own range);
+    too-short pairs are omitted. Pure, no network."""
+    import pandas as pd
+    from modules.breadth import read_breadth, BREADTH_DEAD
+
+    n = 300
+    cap = pd.Series([100.0] * n)
+    lead = pd.Series([100.0 * (1.002 ** i) for i in range(n)])        # steady eq outperformance
+    lag = pd.Series([100.0 * (0.998 ** i) for i in range(n)])         # steady eq underperformance
+    flat = cap * (1 + BREADTH_DEAD / 10)                              # inside the dead band
+
+    out = read_breadth({"LEAD": (lead, cap), "LAG": (lag, cap), "FLAT": (flat, cap)})
+    assert out["LEAD"]["tag"] == "broad-led" and out["LEAD"]["rel_20d"] > 0
+    assert out["LAG"]["tag"] == "narrow" and out["LAG"]["rel_20d"] < 0
+    assert out["FLAT"]["tag"] == "mixed"
+    assert out["LEAD"]["rel_63d"] > out["LEAD"]["rel_20d"] > 0        # longer horizon compounds
+
+    # accelerating outperformance (daily edge grows each session) → the latest 20d spread is the
+    # strict max of its own rolling history → top-of-range percentile
+    accel = 100.0 * pd.Series([1 + 0.00002 * i for i in range(n)]).cumprod()
+    pct = read_breadth({"ACC": (accel, cap)})["ACC"]["pct"]
+    assert pct is not None and pct >= 0.9
+
+    # constant-spread pair reads mixed with a defined percentile; short pair is omitted
+    assert read_breadth({"S": (lead.iloc[:15], cap.iloc[:15])}) is None
+    both = read_breadth({"OK": (lead, cap), "S": (lead.iloc[:15], cap.iloc[:15])})
+    assert "OK" in both and "S" not in both
+
+
+# ─── Test 30: callquote pure helpers (offline) ────────────────────────────────
+def test_callquote_helpers():
+    """modules/callquote (S46): pick_call_candidates takes the tradeable ATM + the OTM call with
+    delta nearest 0.375 (no-bid strikes skipped); liquidity_grade bands (tight/ok/wide/dead, OI
+    floor demotion, majority-no-bid → dead); curve_read tags the cheaper tenor; _select_expiries
+    picks the monthlies nearest 45/90 DTE. Pure, no network."""
+    from modules.callquote import (pick_call_candidates, liquidity_grade, curve_read,
+                                   _select_expiries)
+
+    def row(typ, strike, bid, ask, oi=100, delta=None, theta=None, iv=None, volume=10):
+        return {"type": typ, "strike": strike, "bid": bid, "ask": ask, "oi": oi,
+                "volume": volume, "delta": delta, "theta": theta, "iv": iv}
+
+    rows = [row("call", 100.0, 5.0, 5.2, oi=500, delta=0.52),
+            row("call", 105.0, 2.6, 2.8, oi=300, delta=0.38),
+            row("call", 110.0, 1.2, 1.4, oi=200, delta=0.25),
+            row("call", 102.5, 0.0, 3.9, oi=50, delta=0.45),      # no bid → skipped
+            row("put", 100.0, 4.8, 5.0, oi=400, delta=-0.48)]
+    atm, otm = pick_call_candidates(rows, spot=100.4)
+    assert atm["strike"] == 100.0                                 # nearest TRADEABLE (102.5 dead)
+    assert otm["strike"] == 105.0                                 # Δ0.38 nearest the 0.375 band
+    assert pick_call_candidates([row("call", 100.0, 0.0, 5.0)], 100.0) == (None, None)
+
+    def chain(spread_frac, oi, bid0=False):
+        out = []
+        for k in (90.0, 95.0, 100.0, 105.0, 110.0):
+            for typ in ("call", "put"):
+                b = 0.0 if bid0 else 5.0 * (1 - spread_frac / 2)
+                out.append(row(typ, k, b, 5.0 * (1 + spread_frac / 2), oi=oi))
+        return out
+    assert liquidity_grade(chain(0.008, 200), 100.0)["grade"] == "tight"   # 0.8% spr, OI 2000
+    assert liquidity_grade(chain(0.02, 100), 100.0)["grade"] == "ok"
+    assert liquidity_grade(chain(0.05, 100), 100.0)["grade"] == "wide"
+    assert liquidity_grade(chain(0.02, 5), 100.0)["grade"] == "wide"       # OI floor demotes
+    assert liquidity_grade(chain(0.02, 100, bid0=True), 100.0)["grade"] == "dead"
+
+    cr = curve_read([("Aug21", 46, 0.28), ("Sep18", 74, 0.26), ("Dec18", 165, 0.24)])
+    assert cr["tag"].startswith("back cheaper") and cr["points"][0]["label"] == "Aug21"
+    assert curve_read([("Aug21", 46, 0.28)]) is None
+    assert curve_read([("A", 30, 0.25), ("B", 90, 0.25)])["tag"] == "flat curve"
+
+    future = [("2026-07-17", 10), ("2026-08-07", 31), ("2026-08-21", 45),
+              ("2026-09-18", 73), ("2026-10-16", 101)]
+    assert [s[0] for s in _select_expiries(future)] == ["2026-08-21", "2026-10-16"]
+
+
+# ─── Test 31: beta / ex-div / catalysts helpers (offline) ─────────────────────
+def test_beta_exdiv_catalysts():
+    """S46 pure helpers: setupcheck.beta_corr (a 2x-levered clone reads β≈2 corr≈1; independent
+    series read low corr; short series → None); features.estimate_next_ex_div (quarterly cadence
+    rolls ~91d forward; thin/irregular history → None); benchmarks.upcoming_catalysts (ticker +
+    window filter off a fixture CSV). No network."""
+    import os
+    import tempfile
+    import numpy as np
+    import pandas as pd
+    from modules.setupcheck import beta_corr
+    from modules.features import estimate_next_ex_div
+    from modules.benchmarks import upcoming_catalysts
+
+    rng = np.random.default_rng(7)
+    m_ret = rng.normal(0, 0.01, 200)
+    m = pd.Series(100 * np.cumprod(1 + m_ret))
+    lev = pd.Series(100 * np.cumprod(1 + 2 * m_ret))              # 2x daily-return clone
+    bc = beta_corr(lev, m, window=60)
+    assert bc and abs(bc["beta"] - 2.0) < 0.15 and bc["corr"] > 0.99
+    indep = pd.Series(100 * np.cumprod(1 + rng.normal(0, 0.01, 200)))
+    bu = beta_corr(indep, m, window=60)
+    assert bu and abs(bu["corr"]) < 0.5
+    assert beta_corr(lev.iloc[:10], m.iloc[:10]) is None          # too short
+
+    q = pd.DatetimeIndex(["2025-02-06", "2025-05-08", "2025-08-07", "2025-11-06",
+                          "2026-02-05", "2026-05-07"])            # quarterly, ~91d cadence
+    nxt = estimate_next_ex_div(q, today="2026-07-07")
+    assert nxt is not None and abs((nxt - pd.Timestamp("2026-08-06")).days) <= 7
+    assert estimate_next_ex_div(q[:3], today="2026-07-07") is None            # <4 payments
+    irregular = pd.DatetimeIndex(["2020-01-01", "2021-06-01", "2023-01-01", "2024-09-01"])
+    assert estimate_next_ex_div(irregular, today="2026-07-07") is None        # gaps > 400d
+
+    d = tempfile.mkdtemp()
+    with open(os.path.join(d, "catalysts.csv"), "w") as f:
+        f.write("ticker,date,type,description\n"
+                "CRSP,2026-07-20,pdufa,exa-cel label expansion decision\n"
+                "CRSP,2026-12-01,trial_readout,too far out\n"
+                "NVDA,2026-07-15,other,wrong ticker\n")
+    cats = upcoming_catalysts("CRSP", within_days=45, data_dir=d, today="2026-07-07")
+    assert len(cats) == 1 and cats[0][0] == "2026-07-20" and cats[0][1] == 13
+    assert upcoming_catalysts("CRSP", data_dir=os.path.join(d, "missing")) == []
 
 
 # ─── Test 22: shortint parsers + squeeze scorecard (offline) ──────────────────
@@ -858,7 +1107,8 @@ def test_setup_check():
     marks = {label: m for label, m, _ in s["rows"]}
     assert marks["HTF alignment"] == "✓" and marks["Volume confirms"] == "✓"
     assert marks["Relative strength"] == "✓" and marks["Catalyst timing"] == "✓"
-    assert s["n_bad"] == 0 and "7/7" in s["net"]
+    assert marks["Market beta"] == "–"                    # S46 row: n/a degrade, informational
+    assert s["n_bad"] == 0 and "7/8" in s["net"]
 
     # unconfirmed rally + rich vol + imminent earnings + macro tomorrow
     s2 = setup_check(reads(tag="up-WEAK"), profile=profile,

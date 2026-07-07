@@ -7,7 +7,10 @@ CSV using Black-Scholes inversion on Massive.com historical options data
 
 Run once per ticker after backfill_iv.py prerequisites are met. Takes
 roughly 10-20 minutes for 500 trading days at ~0.05s sleep between dates.
-Resumable: already-populated dates are never overwritten.
+Resumable: already-populated CELLS are never overwritten (S44) — a date revisited
+to fill a missing term_structure keeps its harvested atm_iv_30d. (The daily
+quote-based harvest is higher-quality than trades-based BS-inversion; pre-S44
+this script overwrote every returned key on any date it touched.)
 
 Usage:
     python backfill_iv.py       # prompts for ticker
@@ -79,6 +82,19 @@ def get_rate(irx, date):
 # ─────────────────────────────────────────
 # BACKFILL
 # ─────────────────────────────────────────
+def _apply_result(df, ts, result):
+    """Write `result` keys into df.loc[ts] — ONLY into cells that are currently NaN (S44).
+    The work list selects any date missing atm_iv_30d OR term_structure, so a date revisited
+    only for its missing term_structure must not have its harvested quote-based atm_iv_30d
+    replaced by the cruder trades-based inversion value. Pure; returns the keys written."""
+    written = []
+    for key, val in (result or {}).items():
+        if key in df.columns and val is not None and pd.isna(df.loc[ts, key]):
+            df.loc[ts, key] = val
+            written.append(key)
+    return written
+
+
 def backfill(ticker, data_dir=DATA_DIR):
     """Backfill atm_iv_30d / iv_skew_25d / term_structure into data/{ticker}_indicators.csv via
     Massive BS-inversion. Reusable + best-effort: returns a status dict and NEVER calls sys.exit,
@@ -159,9 +175,7 @@ def backfill(ticker, data_dir=DATA_DIR):
             continue
 
         if result is not None:
-            for key, val in result.items():
-                if key in df.columns and val is not None:
-                    df.loc[ts, key] = val
+            _apply_result(df, ts, result)          # NaN cells only — never clobber harvested IV (S44)
             filled += 1
             atm_iv = result.get("atm_iv_30d")
             skew   = result.get("iv_skew_25d")

@@ -211,12 +211,29 @@ def apply_live_bar(frames, bar):
 _PARTIAL_RULES = {"1W": "W-FRI", "1M": "ME"}
 
 
-def last_bar_partial(daily, tf, frac=0.7):
-    """True when the most recent resampled bar for `tf` is still forming — it holds fewer source
-    (daily) bars than a typical complete period. Counts daily bars per period from the daily frame,
-    so it catches BOTH an in-progress current period AND a dataset that simply ends mid-period (stale
-    data), without relying on the wall clock. Only the D→W/M timeframes can be partial here; intraday
-    and 1D return False (their freshness is handled upstream)."""
+def _last_completed_session():
+    """Most recent COMPLETED daily session (naive date): today if a weekday past 4 PM ET, else the
+    prior weekday. Holidays approximated as weekdays — same convention as lens._expected_last_session."""
+    now_et = pd.Timestamp.now(tz="America/New_York")
+    d = pd.Timestamp(now_et.date())
+    if not (now_et.weekday() < 5 and now_et.hour >= 16):
+        d -= pd.Timedelta(days=1)
+    while d.weekday() >= 5:
+        d -= pd.Timedelta(days=1)
+    return d
+
+
+def last_bar_partial(daily, tf, frac=0.7, now_session=None):
+    """True when the most recent resampled bar for `tf` is still forming. Two checks (S43):
+    (1) CALENDAR — the last period's end (its resample label, rolled back to a weekday) is after the
+        most recent completed session, i.e. the period can still grow. This catches a Thu/Fri forming
+        week or a late-month forming month that the count heuristic misses (frac=0.7 exists so a
+        complete 4-day holiday week isn't misflagged — but that tolerance left late-period forming
+        bars unmarked, quietly understating W/M volume reads).
+    (2) COUNT — the last period holds < frac × the typical bar count: catches a dataset that simply
+        ends mid-period (stale data), where the calendar check can't fire.
+    `now_session` overrides the wall clock for testing. Only the D→W/M timeframes can be partial
+    here; intraday and 1D return False (their freshness is handled upstream)."""
     rule = _PARTIAL_RULES.get(tf)
     if rule is None or daily is None or len(daily) < 60:
         return False
@@ -224,6 +241,12 @@ def last_bar_partial(daily, tf, frac=0.7):
     counts = counts[counts > 0]
     if len(counts) < 4:
         return False
+    end = counts.index[-1]                      # period end: the Friday (W-FRI) / month-end (ME)
+    while end.weekday() >= 5:                   # a weekend month-end resolves to its last weekday
+        end -= pd.Timedelta(days=1)
+    sess = now_session if now_session is not None else _last_completed_session()
+    if end > sess:
+        return True
     typical = counts.iloc[:-1].median()
     return bool(typical and counts.iloc[-1] < frac * typical)
 
