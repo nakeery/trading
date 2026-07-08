@@ -136,40 +136,62 @@ def _candle_fig(df, overlays=(), show_volume=False, price_line=None, vprofile=No
                                  showlegend=False, name="volume"), row=2, col=1)
         if vprofile:
             a = vprofile.get("aspects") or set()
+            # The profile spans ~1y of prices — levels and histogram bins can sit far outside
+            # the 120-bar window, and autorange would stretch the y-axis to include them,
+            # squishing the candles. Pin the price pane to the VISIBLE window's range (bars +
+            # overlays + price line, padded) and clip every profile aspect to it.
+            ylo = float(df["Low"].min())
+            yhi = float(df["High"].max())
+            for _n, s, _c, _d in overlays:
+                sv = s.dropna()
+                if len(sv):
+                    ylo, yhi = min(ylo, float(sv.min())), max(yhi, float(sv.max()))
+            if price_line is not None:
+                ylo, yhi = min(ylo, price_line), max(yhi, price_line)
+            pad = (yhi - ylo) * 0.03 or 1.0
+            ylo, yhi = ylo - pad, yhi + pad
+            fig.update_yaxes(range=[ylo, yhi], row=1, col=1)
+
             ann = dict(x=0.0, xanchor="left", showarrow=False)     # inside-left level tags
-            if "value area" in a:
-                fig.add_hrect(y0=vprofile["va_low"], y1=vprofile["va_high"],
+            if "value area" in a and vprofile["va_low"] < yhi and vprofile["va_high"] > ylo:
+                fig.add_hrect(y0=max(vprofile["va_low"], ylo), y1=min(vprofile["va_high"], yhi),
                               fillcolor="rgba(94,140,200,0.10)", line_width=0, row=1, col=1)
-            if "POC" in a:
+            if "POC" in a and ylo <= vprofile["poc"] <= yhi:
                 fig.add_hline(y=vprofile["poc"], line_width=1.2, line_color="#e0a63a",
                               row=1, col=1,
                               annotation=dict(text=f"POC {vprofile['poc']:,.2f}",
                                               font=dict(color="#e0a63a", size=10), **ann))
             if "HVN" in a:
                 for h in vprofile.get("hvns", []):
-                    if abs(h - vprofile["poc"]) < 1e-6:
-                        continue                                   # POC is itself an HVN
+                    if abs(h - vprofile["poc"]) < 1e-6 or not ylo <= h <= yhi:
+                        continue                                   # POC dup / outside the window
                     fig.add_hline(y=h, line_dash="dash", line_width=1, line_color="#9fb4d0",
                                   row=1, col=1,
                                   annotation=dict(text=f"HVN {h:,.2f}",
                                                   font=dict(color="#9fb4d0", size=9), **ann))
             if "LVN" in a:
                 for l in vprofile.get("lvns", []):
+                    if not ylo <= l <= yhi:
+                        continue
                     fig.add_hline(y=l, line_dash="dot", line_width=1, line_color="#6a7686",
                                   row=1, col=1,
                                   annotation=dict(text=f"LVN {l:,.2f}",
                                                   font=dict(color="#6a7686", size=9), **ann))
             if "histogram" in a and vprofile.get("hist_volumes"):
-                vols = vprofile["hist_volumes"]
-                # right-edge volume-at-price bars on an overlaying, reversed x-axis: value 0 sits
-                # at the RIGHT edge and bars extend left, occupying ~28% of the plot width
-                fig.add_trace(go.Bar(x=vols, y=vprofile["hist_centers"], orientation="h",
-                                     marker_color="rgba(150,170,200,0.20)",
-                                     marker_line_width=0, showlegend=False, hoverinfo="skip",
-                                     xaxis="x3", yaxis="y"))
-                fig.update_layout(xaxis3=dict(overlaying="x", range=[max(vols) * 3.5, 0],
-                                              showgrid=False, showticklabels=False,
-                                              visible=False))
+                pairs = [(c, v) for c, v in zip(vprofile["hist_centers"],
+                                                vprofile["hist_volumes"])
+                         if ylo <= c <= yhi]
+                if pairs:
+                    centers, vols = [p[0] for p in pairs], [p[1] for p in pairs]
+                    # right-edge volume-at-price bars on an overlaying, reversed x-axis: value 0
+                    # sits at the RIGHT edge and bars extend left, ~28% of the plot width
+                    fig.add_trace(go.Bar(x=vols, y=centers, orientation="h",
+                                         marker_color="rgba(150,170,200,0.20)",
+                                         marker_line_width=0, showlegend=False,
+                                         hoverinfo="skip", xaxis="x3", yaxis="y"))
+                    fig.update_layout(xaxis3=dict(overlaying="x", range=[max(vols) * 3.5, 0],
+                                                  showgrid=False, showticklabels=False,
+                                                  visible=False))
         if price_line is not None:
             # price-tag style: label anchored LEFT at the plot's right edge, extending into the
             # widened right margin — never clipped by the plot area
@@ -267,12 +289,23 @@ def draw_chart(ticker, live=False):
 
 
 # ── controls ─────────────────────────────────────────────────────────────────
+def _pick_ticker():
+    """Recent-data pill → ONE-SHOT event: copy the pick into the search box, then deselect the
+    pill. st.pills selection is otherwise persistent state — a stuck pill silently overrode a
+    typed ticker on every later run (and the write-back clobbered the box's text)."""
+    pick = st.session_state.get("ticker_pills")
+    if pick:
+        st.session_state["ticker_input"] = pick
+        st.session_state["ticker_pills"] = None
+
+
 st.markdown("### 🔭 LENS — multi-timeframe market-structure & risk")
 known = known_tickers()
 c1, c2 = st.columns([2, 5])
 with c1:
-    ticker = st.text_input("Ticker", value=st.session_state.get("ticker", ""),
-                           placeholder="e.g. CRSP", max_chars=8).strip().upper()
+    # key = the single source of truth for the ticker; the pill callback writes into it
+    ticker = st.text_input("Ticker", key="ticker_input", placeholder="e.g. CRSP",
+                           max_chars=8).strip().upper()
 with c2:
     st.caption("blocks")
     f1, f2, f3, f4, f5, f6, f7 = st.columns(7)
@@ -291,10 +324,8 @@ with st.expander("thesis overlay (optional)"):
     level = t2.number_input("key level", value=0.0, step=1.0)
 
 if known:
-    picked = st.pills("recent data", known, selection_mode="single", default=None,
-                      key=f"pills_{st.session_state.get('pills_nonce', 0)}")
-    if picked:
-        ticker = picked
+    st.pills("recent data", known, selection_mode="single", default=None,
+             key="ticker_pills", on_change=_pick_ticker)
 
 run_clicked = st.button("Run", type="primary", use_container_width=False)
 
@@ -319,6 +350,8 @@ should_generate = False
 if ticker and run_clicked:
     should_generate = True
     st.session_state.pop("pending_key", None)
+elif run_clicked and not ticker:
+    st.warning("enter a ticker first (or pick one from the recent-data pills)")
 elif ticker and key != st.session_state.get("last_key"):
     now = time.time()
     if st.session_state.get("pending_key") != key:
@@ -334,10 +367,10 @@ elif ticker and key != st.session_state.get("last_key"):
         st.session_state.pop("pending_key", None)
 
 if should_generate:
-    st.session_state["ticker"] = ticker
     with st.spinner(f"running the lens on {ticker}…"):
         if live or run_clicked:
-            generate_report.clear()          # explicit Run / live mode = fetch fresh, not cached
+            # explicit Run / live mode = fetch fresh — clear THIS entry only, not every ticker's
+            generate_report.clear(ticker, flags_key)
         try:
             report = generate_report(ticker, flags_key)
         except Exception as e:
@@ -346,6 +379,10 @@ if should_generate:
     if report:
         st.session_state["last_key"] = key
         st.session_state["last_report"] = report
+        # the generate may have auto-refreshed the indicators CSV (new close stamped) — drop the
+        # chart caches so the candles/profile always match the report's data vintage
+        load_daily_tail.clear()
+        load_profile.clear()
 
 # ── display (every rerun, from session state) ────────────────────────────────
 if st.session_state.get("last_report"):
@@ -367,5 +404,5 @@ if st.session_state.get("last_report"):
         f'<pre style="font-family:Cascadia Mono,Consolas,monospace;font-size:13px;'
         f'line-height:1.35;color:#d8dee9;margin:0;">{html}</pre></div>')
 else:
-    st.info("Type a ticker (or pick one below) to run the lens. "
+    st.info("Type a ticker (or pick one above) to run the lens. "
             "Checkbox blocks mirror the CLI flags; quotes are cached per session like the CLI.")
