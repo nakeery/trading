@@ -461,8 +461,11 @@ def harvest_iv_snapshot(df, ticker, csv_path):
     skew_s = f"{summary['iv_skew_25d']:+.3f}" if summary["iv_skew_25d"] is not None else "n/a"
     term_s = f"{summary['term_structure']:.2f}" if summary["term_structure"] is not None else "n/a"
     pc_s   = f"{summary['put_call_oi_ratio']:.2f}" if summary["put_call_oi_ratio"] is not None else "n/a"
+    long_s = (f"{summary['atm_iv_180d']:.1%} (~{summary['atm_dte_180d']}d)"
+              if summary.get("atm_iv_180d") is not None else "n/a")
     print(f"  ATM IV (~{summary['atm_dte']}d): {summary['atm_iv_30d']:.1%} | "
-          f"25Δ skew: {skew_s} | term: {term_s} | P/C OI: {pc_s}  → row {last_idx.date()}")
+          f"25Δ skew: {skew_s} | term: {term_s} | P/C OI: {pc_s} | "
+          f"long IV: {long_s}  → row {last_idx.date()}")
 
     # Event-expiry IV (S44): when earnings are near, also stamp the nearest POST-earnings expiry's
     # ATM IV — the tenor where the pre-earnings ramp concentrates (the constant-maturity 30d gauge

@@ -60,8 +60,8 @@ def print_console(ctx):
     print(f"\n{'═'*w}")
     print(f"  MARKET CONTEXT — {ctx['ticker']}  |  as of {ctx['as_of']}  |  regime: {ctx['regime'].upper()}")
     print(f"{'─'*w}")
-    print(f"  {'Gauge':<22}{'Value':>9}  {'Label':<22}{'%ile(1y)':>9}")
-    print(f"  {'─'*66}")
+    print(f"  {'Gauge':<22}{'Value':>9}  {'Label':<22}{'percentile(1y)':>14}")
+    print(f"  {'─'*71}")
     last_group = None
     for g in ctx["gauges"]:
         if g["group"] != last_group:
@@ -69,8 +69,8 @@ def print_console(ctx):
             last_group = g["group"]
         val = g["fmt"].format(g["value"])
         pct = f"{int(round(g['pct']*100))}" if g["pct"] is not None else "—"
-        print(f"    {g['name']:<20}{val:>9}  {g['label']:<22}{pct:>9}")
-    print(f"  {'─'*66}")
+        print(f"    {g['name']:<20}{val:>9}  {g['label']:<22}{pct:>14}")
+    print(f"  {'─'*71}")
     print(f"  NET: {ctx['net']}")
     for n in ctx["notes"]:
         print(f"  note: {n}")

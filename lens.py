@@ -517,7 +517,9 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
 
     # candle: sixel pixel image, or text panel (today + N previous), or one detailed candle (--prev 0)
     eff_style = "braille" if candle_style == "sixel" else candle_style   # text fallback when sixel off
-    if candle_style == "sixel" and color and panel_bars:
+    if candle_style == "none":                        # S48 — lens_web renders a real chart instead
+        pass
+    elif candle_style == "sixel" and color and panel_bars:
         ohlc = [(b[1], b[2], b[3], b[4], b[5]) for b in panel_bars]
         sys.stdout.write("\n  " + sixel_candles(ohlc, color=color, height_px=candle_px) + "\n")
         span = (f"{panel_bars[0][0][5:]} (prev) → {panel_bars[-1][0][5:]} (today)"
@@ -671,7 +673,7 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
                   f"(NYSE tickers return no data)")
         sv = squeeze.get("svr") or {}
         if sv.get("now") is not None:
-            pct = f"  [{sv['pct']:.0%}ile of {sv['n']} sessions]" if sv.get("pct") is not None else ""
+            pct = f"  [{sv['pct'] * 100:.0f} percentile of {sv['n']} sessions]" if sv.get("pct") is not None else ""
             avgs = ""
             if sv.get("avg5") is not None and sv.get("avg20") is not None:
                 avgs = f" · 5d avg {sv['avg5']:.0%} · 20d avg {sv['avg20']:.0%}"
@@ -867,8 +869,10 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
             print(f"      IV by expiry: {pts}  — {curve['tag']}")
         ivp = gauge_pct(ctx, "ATM IV (30d)") if gauge_pct is not None else None
         if ivp is not None and ivp >= 0.70:
-            print(f"      ⚠ ATM IV at {ivp:.0%}ile of its history — paying up for a direction bet; "
-                  f"debit spreads cut the vega/theta bill")
+            ivl = gauge_pct(ctx, "ATM IV (180d)") if gauge_pct is not None else None
+            l180 = f" (180d tenor at {ivl * 100:.0f} percentile)" if ivl is not None else ""
+            print(f"      ⚠ ATM IV (30d) at {ivp * 100:.0f} percentile of its history{l180} — "
+                  f"paying up for a direction bet; debit spreads cut the vega/theta bill")
         print("      guide: more DTE = slower theta · 0.35–0.40Δ in trends, lower Δ in chop · "
               "BE move must be plausible within the tenor")
 
@@ -1005,6 +1009,239 @@ def _refresh_indicators(ticker, data_dir):
         return False
 
 
+def build_backdrop(data_dir="data"):
+    """Assemble the MARKET BACKDROP line — SPY tide + equal-weight breadth (S45) + CNN F&G
+    (S41). Market-level, cached fetchers; computed once per run (or per render in app mode)."""
+    backdrop_base = market_backdrop(data_dir)   # SPY tide — same for all tickers, computed once
+    if fetch_breadth is not None:                    # equal-weight breadth (S45) — market-level, cached ~6h
+        br = fetch_breadth(data_dir=data_dir)
+        segs = []
+        for lbl, d in ((br or {}).get("pairs") or {}).items():
+            pct = f" [{d['pct'] * 100:.0f} percentile]" if d.get("pct") is not None else ""
+            segs.append(f"{lbl} {d['rel_20d']:+.1%}{pct} {d['tag']}")
+        if segs:
+            seg = "breadth(20d) " + " · ".join(segs)
+            backdrop_base = f"{backdrop_base}  |  {seg}" if backdrop_base else seg
+    if fetch_fng is not None:                        # CNN Fear & Greed (S41) — market-level, cached ~6h
+        fng = fetch_fng(data_dir=data_dir)
+        if fng and fng.get("score") is not None:
+            pct = f" [{fng['pct'] * 100:.0f} percentile]" if fng.get("pct") is not None else ""
+            seg = f"F&G {fng['score']:.0f} {fng['rating']}{pct}"
+            backdrop_base = f"{backdrop_base}  |  {seg}" if backdrop_base else seg
+    return backdrop_base
+
+
+def render_ticker(ticker, args, use_color, interactive, backdrop_base):
+    """Run the full lens for ONE ticker and print the report (S48 — extracted from __main__
+    so the CLI and lens_web.py share it). `args` is the argparse namespace (or an equivalent
+    object); `interactive` gates the TTY cache-refresh prompts (False under capture/server).
+    Pure move of the original loop body — no behavior change."""
+    if not args.no_refresh:
+        csv_missing = not os.path.exists(
+            os.path.join(args.data_dir, f"{ticker.lower()}_indicators.csv"))
+        if args.refresh or csv_missing or _indicators_stale(ticker, args.data_dir):
+            print(f"  ↻ {ticker}: {'building' if csv_missing else 'refreshing'} indicators data…")
+            _refresh_indicators(ticker, args.data_dir)
+    try:
+        frames, reads, divs, summary, profile, notes, live_bar = analyze(
+            ticker, include_intraday=not args.no_intraday, data_dir=args.data_dir,
+            live=args.live)
+    except FileNotFoundError as e:
+        print(f"  Could not load data for {ticker}: {e}")
+        return
+
+    ctx = None
+    if not args.no_vix and gather_context is not None:
+        try:
+            ctx = gather_context(ticker, data_dir=args.data_dir, with_vix=True)
+        except Exception as e:
+            notes.append(f"options/vol context unavailable ({type(e).__name__}).")
+        else:
+            # surface gather_context's own notes (thin IV history → percentiles omitted, stale
+            # gauges, skipped blocks) — previously only market_context.py showed them, so a
+            # missing percentile in the lens had no visible explanation (S48)
+            notes.extend(f"options: {n}" for n in (ctx or {}).get("notes", []))
+
+    # --live: real-time ATM IV from Tradier (smv), shown beside the harvested gauge so
+    # "IV now" and "IV's place in its history" are both visible intraday.
+    live_iv = None
+    if args.live and get_atm_iv is not None:
+        try:
+            spot_now = float(frames["1D"]["Close"].iloc[-1]) if "1D" in frames else None
+            live_iv = get_atm_iv(ticker, current_price=spot_now)
+        except Exception:
+            live_iv = None
+        if live_iv and ctx and ctx.get("gauges"):
+            gs = ctx["gauges"]
+            pos = next((i + 1 for i, x in enumerate(gs) if x.get("name") == "ATM IV (30d)"), 0)
+            gs.insert(pos, {"group": "OPTIONS", "name": "ATM IV (live)", "value": live_iv["iv"],
+                            "fmt": "{:.1%}", "label": f"Tradier now, {live_iv['dte']}d",
+                            "pct": None})
+
+    backdrop = backdrop_base
+    if ctx and ctx.get("regime") and ctx["regime"] != "n/a" and backdrop:
+        backdrop = f"{backdrop_base}  |  VIX regime: {ctx['regime']}"
+
+    geo = None
+    if args.geo and gather_geo_context is not None:
+        try:
+            geo = gather_geo_context(data_dir=args.data_dir)
+        except Exception as e:
+            notes.append(f"geopolitical backdrop unavailable ({type(e).__name__}).")
+
+    pc = None
+    if args.pc_oi is not None and gather_pc_oi is not None:   # [] (bare = all) is falsy → test is-not-None
+        toks = set(args.pc_oi)
+        monthly = "monthly" in toks
+        tenor = "near" if "near" in toks else "leaps" if "leaps" in toks else "all"
+        try:
+            pc = gather_pc_oi(ticker, preset=tenor, monthly=monthly,
+                              interactive=interactive, data_dir=args.data_dir,
+                              force=args.live)
+        except Exception as e:
+            notes.append(f"put/call OI unavailable ({type(e).__name__}).")
+        else:
+            if pc is None:
+                notes.append("put/call OI unavailable (no Tradier token or no chain data).")
+            elif pc.get("cached") and pc.get("stale"):
+                notes.append(f"put/call OI cached {pc['age_str']} and stale — run in a terminal to refresh.")
+
+    # earnings date — shared by the --vol block and the SETUP CHECK (S41)
+    earn = None
+    if next_earnings is not None:
+        try:
+            earn = next_earnings(ticker, daily=frames.get("1D"))
+        except Exception:
+            earn = None
+
+    # next ex-dividend (S46) — shared by the SETUP CHECK catalyst row and the --call block
+    exd = None
+    if next_ex_dividend is not None:
+        try:
+            exd = next_ex_dividend(ticker)
+        except Exception:
+            exd = None
+
+    # earnings-window capture guard (S44): inside the pre-earnings window, a missed daily IV
+    # harvest is UNRECOVERABLE for the vol study (Massive history is trades-only — thin names
+    # can't be backfilled). Surface a missing harvest the same day instead of post-print.
+    if earn and earn.get("days") is not None and 0 <= earn["days"] <= 10:
+        try:
+            _csv = os.path.join(args.data_dir, f"{ticker.lower()}_indicators.csv")
+            _iv = pd.read_csv(_csv, index_col=0, parse_dates=True)["atm_iv_30d"].dropna()
+            _last_iv = _iv.index.max() if len(_iv) else None
+            if _last_iv is None or pd.Timestamp(_last_iv).normalize() < _expected_last_session():
+                notes.append(f"earnings in {earn['days']}d and the latest session's IV harvest is "
+                             f"missing — run `indicators.py --ticker {ticker}` (missed pre-earnings "
+                             f"sessions cannot be backfilled).")
+        except Exception:
+            pass
+
+    vol = None
+    if args.vol and vol_setup is not None:
+        try:
+            spot = float(frames["1D"]["Close"].iloc[-1]) if "1D" in frames else None
+            squeeze = {tf: read_squeeze(frames[tf]) for tf in frames}
+            # --live: prefer the real-time Tradier IV for the expected move (spot is already
+            # live via the provisional today-bar); the scorecard percentile stays harvest-based.
+            # The live IV carries its own tenor — scale the move by that DTE, not a fixed 30.
+            live_ok = bool((live_iv or {}).get("iv"))
+            em_iv = live_iv["iv"] if live_ok else gauge_val(ctx, "ATM IV (30d)")
+            em_dte = (live_iv.get("dte") or 30) if live_ok else 30
+            em = expected_move(spot, em_iv, dte=em_dte,
+                               hv=gauge_val(ctx, "HV-20 (annualized)"))
+            vol = {"squeeze": squeeze, "em": em, "earnings": earn,
+                   "setup": vol_setup(reads, squeeze, ctx, earnings=earn, em=em),
+                   "quote": (straddle_quote(ticker, earnings_date=(earn or {}).get("date"),
+                                            interactive=interactive,
+                                            data_dir=args.data_dir,
+                                            force=args.live) if straddle_quote else None),
+                   "history": (pre_earnings_vol_study(ticker, interactive=interactive,
+                                                      data_dir=args.data_dir)
+                               if pre_earnings_vol_study else None)}
+        except Exception as e:
+            notes.append(f"vol setup unavailable ({type(e).__name__}).")
+
+    # LONG CALL VIABILITY (--call; S46) — the directional instrument's carry math, cached.
+    callq = None
+    if args.call and call_quote is not None:
+        try:
+            callq = call_quote(ticker, earnings_date=(earn or {}).get("date"),
+                               ex_div_date=(exd or {}).get("date"),
+                               interactive=interactive, data_dir=args.data_dir,
+                               force=args.live)
+        except Exception as e:
+            notes.append(f"call viability unavailable ({type(e).__name__}).")
+        else:
+            if callq is None:
+                notes.append("call viability unavailable (no Tradier token or no chain data).")
+            elif callq.get("cached") and callq.get("stale"):
+                notes.append(f"call quote cached {callq['age_str']} and stale — run in a terminal to refresh.")
+
+    # chain liquidity grade (S46) — default-on, ZERO network: reads the freshest --call cache.
+    liq = cached_liquidity(ticker, data_dir=args.data_dir) if cached_liquidity is not None else None
+
+    # known binary catalysts (S46) — surfaces catalysts.csv (PDUFA/trial dates) in the lens.
+    cats = upcoming_catalysts(ticker) if upcoming_catalysts is not None else []
+
+    # SHORT POSITIONING / SQUEEZE (--squeeze; S41) — reuses the lens' own profile + pc flow.
+    sqz = None
+    if args.squeeze and gather_squeeze is not None:
+        rvol_1d = ((reads.get("1D") or {}).get("_vol") or {}).get("rvol")
+        sqz = gather_squeeze(ticker, daily=frames.get("1D"), rvol=rvol_1d, pc=pc,
+                             profile=profile, data_dir=args.data_dir)
+        if sqz is None:
+            notes.append("short-positioning data unavailable (NASDAQ/FINRA fetch failed).")
+
+    # INSIDER ACTIVITY (--insider; S42) — SEC EDGAR Form 4 open-market flow, cached.
+    ins = None
+    if args.insider and gather_insider is not None:
+        ins = gather_insider(ticker, data_dir=args.data_dir)
+        if ins is None:
+            notes.append("insider activity unavailable (EDGAR fetch failed / unknown ticker).")
+
+    # SETUP CHECK (S41; default-on, best-effort) — pure synthesis + one RS benchmark fetch.
+    setup = None
+    if setup_check is not None and reads:
+        try:
+            macro_t1 = None
+            if next_event_per_series is not None:
+                ev = next_event_per_series(data_dir=args.data_dir)
+                t1 = [days for name, (d, days) in ev.items()
+                      if name in TIER1_MACRO and days is not None]
+                macro_t1 = min(t1) if t1 else None
+            rs = (fetch_rs(ticker, frames["1D"], data_dir=args.data_dir)
+                  if (fetch_rs is not None and "1D" in frames) else None)
+            beta = (fetch_beta(ticker, frames["1D"])
+                    if (fetch_beta is not None and "1D" in frames) else None)
+            setup = setup_check(reads, profile=profile, ctx=ctx, earn=earn,
+                                macro_tier1_days=macro_t1, rs=rs, beta=beta, ex_div=exd)
+        except Exception as e:
+            notes.append(f"setup check unavailable ({type(e).__name__}).")
+
+    last_bar, as_of, panel_bars = None, None, None
+    if "1D" in frames:
+        d = frames["1D"]
+        row = d.iloc[-1]
+        prev_close = float(d["Close"].iloc[-2]) if len(d) > 1 else float(row["Open"])
+        last_bar = {"open": float(row["Open"]), "high": float(row["High"]),
+                    "low": float(row["Low"]), "close": float(row["Close"]),
+                    "prev_close": prev_close}
+        as_of = d.index[-1].date().isoformat()
+        tail = d.iloc[-(max(0, args.prev) + 1):]
+        pcs = d["Close"].shift(1)                  # prior close per bar → hollow-candle colour
+        panel_bars = [(idx.date().isoformat(), float(rw["Open"]), float(rw["High"]),
+                       float(rw["Low"]), float(rw["Close"]),
+                       float(pcs.loc[idx]) if pd.notna(pcs.loc[idx]) else float(rw["Open"]))
+                      for idx, rw in tail.iterrows()]
+
+    print_report(ticker, reads, divs, summary, profile, notes, last_bar=last_bar, as_of=as_of,
+                 ctx=ctx, backdrop=backdrop, thesis=args.thesis, level=args.level, color=use_color,
+                 candle_style=args.candle, panel_bars=panel_bars, candle_px=args.candle_px,
+                 geo=geo, pcoi=pc, vol=vol, live=live_bar, setup=setup, squeeze=sqz,
+                 insider=ins, callq=callq, liq=liq, cats=cats)
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Multi-timeframe market-structure & risk lens.")
     ap.add_argument("--ticker", nargs="+", help="One or more tickers (skips the prompt; e.g. --ticker QQQ JPM F).")
@@ -1014,7 +1251,7 @@ if __name__ == "__main__":
     ap.add_argument("--no-vix", action="store_true", help="Skip the options/vol + VIX context block.")
     ap.add_argument("--geo", action="store_true", help="Add a cross-asset / geopolitical stress backdrop (oil/OVX/gold/DXY, credit & rates, geo-sensitive sectors, EPU/GPR). Network; cached ~6h.")
     ap.add_argument("--no-color", action="store_true", help="Disable ANSI colour on the candle (auto-off when piped/redirected).")
-    ap.add_argument("--candle", choices=["box", "braille", "sixel"], default="sixel", help="Candle style: sixel true-pixel image (default; Sixel-capable terminal only, falls back to braille when piped/--no-color), box, or braille.")
+    ap.add_argument("--candle", choices=["box", "braille", "sixel", "none"], default="sixel", help="Candle style: sixel true-pixel image (default; Sixel-capable terminal only, falls back to braille when piped/--no-color), box, braille, or none (skip the candle panel — lens_web.py uses this and draws a real chart).")
     ap.add_argument("--candle-px", type=int, default=128, help="Sixel candle pixel height — the resolution knob (default 128; taller = finer).")
     ap.add_argument("--prev", type=int, default=10, help="Previous candles to show beside today's (default 10).")
     ap.add_argument("--data-dir", default="data")
@@ -1063,220 +1300,7 @@ if __name__ == "__main__":
             print("  No ticker entered."); sys.exit(1)
         tickers = [t]
 
-    backdrop_base = market_backdrop(args.data_dir)   # SPY tide — same for all tickers, computed once
-    if fetch_breadth is not None:                    # equal-weight breadth (S45) — market-level, cached ~6h
-        br = fetch_breadth(data_dir=args.data_dir)
-        segs = []
-        for lbl, d in ((br or {}).get("pairs") or {}).items():
-            pct = f" [{d['pct']:.0%}ile]" if d.get("pct") is not None else ""
-            segs.append(f"{lbl} {d['rel_20d']:+.1%}{pct} {d['tag']}")
-        if segs:
-            seg = "breadth(20d) " + " · ".join(segs)
-            backdrop_base = f"{backdrop_base}  |  {seg}" if backdrop_base else seg
-    if fetch_fng is not None:                        # CNN Fear & Greed (S41) — market-level, cached ~6h
-        fng = fetch_fng(data_dir=args.data_dir)
-        if fng and fng.get("score") is not None:
-            pct = f" [{fng['pct']:.0%}ile]" if fng.get("pct") is not None else ""
-            seg = f"F&G {fng['score']:.0f} {fng['rating']}{pct}"
-            backdrop_base = f"{backdrop_base}  |  {seg}" if backdrop_base else seg
-
+    backdrop_base = build_backdrop(args.data_dir)
+    interactive = sys.stdin.isatty()
     for ticker in tickers:
-        if not args.no_refresh:
-            csv_missing = not os.path.exists(
-                os.path.join(args.data_dir, f"{ticker.lower()}_indicators.csv"))
-            if args.refresh or csv_missing or _indicators_stale(ticker, args.data_dir):
-                print(f"  ↻ {ticker}: {'building' if csv_missing else 'refreshing'} indicators data…")
-                _refresh_indicators(ticker, args.data_dir)
-        try:
-            frames, reads, divs, summary, profile, notes, live_bar = analyze(
-                ticker, include_intraday=not args.no_intraday, data_dir=args.data_dir,
-                live=args.live)
-        except FileNotFoundError as e:
-            print(f"  Could not load data for {ticker}: {e}")
-            continue
-
-        ctx = None
-        if not args.no_vix and gather_context is not None:
-            try:
-                ctx = gather_context(ticker, data_dir=args.data_dir, with_vix=True)
-            except Exception as e:
-                notes.append(f"options/vol context unavailable ({type(e).__name__}).")
-
-        # --live: real-time ATM IV from Tradier (smv), shown beside the harvested gauge so
-        # "IV now" and "IV's place in its history" are both visible intraday.
-        live_iv = None
-        if args.live and get_atm_iv is not None:
-            try:
-                spot_now = float(frames["1D"]["Close"].iloc[-1]) if "1D" in frames else None
-                live_iv = get_atm_iv(ticker, current_price=spot_now)
-            except Exception:
-                live_iv = None
-            if live_iv and ctx and ctx.get("gauges"):
-                gs = ctx["gauges"]
-                pos = next((i + 1 for i, x in enumerate(gs) if x.get("name") == "ATM IV (30d)"), 0)
-                gs.insert(pos, {"group": "OPTIONS", "name": "ATM IV (live)", "value": live_iv["iv"],
-                                "fmt": "{:.1%}", "label": f"Tradier now, {live_iv['dte']}d",
-                                "pct": None})
-
-        backdrop = backdrop_base
-        if ctx and ctx.get("regime") and ctx["regime"] != "n/a" and backdrop:
-            backdrop = f"{backdrop_base}  |  VIX regime: {ctx['regime']}"
-
-        geo = None
-        if args.geo and gather_geo_context is not None:
-            try:
-                geo = gather_geo_context(data_dir=args.data_dir)
-            except Exception as e:
-                notes.append(f"geopolitical backdrop unavailable ({type(e).__name__}).")
-
-        pc = None
-        if args.pc_oi is not None and gather_pc_oi is not None:   # [] (bare = all) is falsy → test is-not-None
-            toks = set(args.pc_oi)
-            monthly = "monthly" in toks
-            tenor = "near" if "near" in toks else "leaps" if "leaps" in toks else "all"
-            try:
-                pc = gather_pc_oi(ticker, preset=tenor, monthly=monthly,
-                                  interactive=sys.stdin.isatty(), data_dir=args.data_dir,
-                                  force=args.live)
-            except Exception as e:
-                notes.append(f"put/call OI unavailable ({type(e).__name__}).")
-            else:
-                if pc is None:
-                    notes.append("put/call OI unavailable (no Tradier token or no chain data).")
-                elif pc.get("cached") and pc.get("stale"):
-                    notes.append(f"put/call OI cached {pc['age_str']} and stale — run in a terminal to refresh.")
-
-        # earnings date — shared by the --vol block and the SETUP CHECK (S41)
-        earn = None
-        if next_earnings is not None:
-            try:
-                earn = next_earnings(ticker, daily=frames.get("1D"))
-            except Exception:
-                earn = None
-
-        # next ex-dividend (S46) — shared by the SETUP CHECK catalyst row and the --call block
-        exd = None
-        if next_ex_dividend is not None:
-            try:
-                exd = next_ex_dividend(ticker)
-            except Exception:
-                exd = None
-
-        # earnings-window capture guard (S44): inside the pre-earnings window, a missed daily IV
-        # harvest is UNRECOVERABLE for the vol study (Massive history is trades-only — thin names
-        # can't be backfilled). Surface a missing harvest the same day instead of post-print.
-        if earn and earn.get("days") is not None and 0 <= earn["days"] <= 10:
-            try:
-                _csv = os.path.join(args.data_dir, f"{ticker.lower()}_indicators.csv")
-                _iv = pd.read_csv(_csv, index_col=0, parse_dates=True)["atm_iv_30d"].dropna()
-                _last_iv = _iv.index.max() if len(_iv) else None
-                if _last_iv is None or pd.Timestamp(_last_iv).normalize() < _expected_last_session():
-                    notes.append(f"earnings in {earn['days']}d and the latest session's IV harvest is "
-                                 f"missing — run `indicators.py --ticker {ticker}` (missed pre-earnings "
-                                 f"sessions cannot be backfilled).")
-            except Exception:
-                pass
-
-        vol = None
-        if args.vol and vol_setup is not None:
-            try:
-                spot = float(frames["1D"]["Close"].iloc[-1]) if "1D" in frames else None
-                squeeze = {tf: read_squeeze(frames[tf]) for tf in frames}
-                # --live: prefer the real-time Tradier IV for the expected move (spot is already
-                # live via the provisional today-bar); the scorecard percentile stays harvest-based.
-                # The live IV carries its own tenor — scale the move by that DTE, not a fixed 30.
-                live_ok = bool((live_iv or {}).get("iv"))
-                em_iv = live_iv["iv"] if live_ok else gauge_val(ctx, "ATM IV (30d)")
-                em_dte = (live_iv.get("dte") or 30) if live_ok else 30
-                em = expected_move(spot, em_iv, dte=em_dte,
-                                   hv=gauge_val(ctx, "HV-20 (annualized)"))
-                vol = {"squeeze": squeeze, "em": em, "earnings": earn,
-                       "setup": vol_setup(reads, squeeze, ctx, earnings=earn, em=em),
-                       "quote": (straddle_quote(ticker, earnings_date=(earn or {}).get("date"),
-                                                interactive=sys.stdin.isatty(),
-                                                data_dir=args.data_dir,
-                                                force=args.live) if straddle_quote else None),
-                       "history": (pre_earnings_vol_study(ticker, interactive=sys.stdin.isatty(),
-                                                          data_dir=args.data_dir)
-                                   if pre_earnings_vol_study else None)}
-            except Exception as e:
-                notes.append(f"vol setup unavailable ({type(e).__name__}).")
-
-        # LONG CALL VIABILITY (--call; S46) — the directional instrument's carry math, cached.
-        callq = None
-        if args.call and call_quote is not None:
-            try:
-                callq = call_quote(ticker, earnings_date=(earn or {}).get("date"),
-                                   ex_div_date=(exd or {}).get("date"),
-                                   interactive=sys.stdin.isatty(), data_dir=args.data_dir,
-                                   force=args.live)
-            except Exception as e:
-                notes.append(f"call viability unavailable ({type(e).__name__}).")
-            else:
-                if callq is None:
-                    notes.append("call viability unavailable (no Tradier token or no chain data).")
-                elif callq.get("cached") and callq.get("stale"):
-                    notes.append(f"call quote cached {callq['age_str']} and stale — run in a terminal to refresh.")
-
-        # chain liquidity grade (S46) — default-on, ZERO network: reads the freshest --call cache.
-        liq = cached_liquidity(ticker, data_dir=args.data_dir) if cached_liquidity is not None else None
-
-        # known binary catalysts (S46) — surfaces catalysts.csv (PDUFA/trial dates) in the lens.
-        cats = upcoming_catalysts(ticker) if upcoming_catalysts is not None else []
-
-        # SHORT POSITIONING / SQUEEZE (--squeeze; S41) — reuses the lens' own profile + pc flow.
-        sqz = None
-        if args.squeeze and gather_squeeze is not None:
-            rvol_1d = ((reads.get("1D") or {}).get("_vol") or {}).get("rvol")
-            sqz = gather_squeeze(ticker, daily=frames.get("1D"), rvol=rvol_1d, pc=pc,
-                                 profile=profile, data_dir=args.data_dir)
-            if sqz is None:
-                notes.append("short-positioning data unavailable (NASDAQ/FINRA fetch failed).")
-
-        # INSIDER ACTIVITY (--insider; S42) — SEC EDGAR Form 4 open-market flow, cached.
-        ins = None
-        if args.insider and gather_insider is not None:
-            ins = gather_insider(ticker, data_dir=args.data_dir)
-            if ins is None:
-                notes.append("insider activity unavailable (EDGAR fetch failed / unknown ticker).")
-
-        # SETUP CHECK (S41; default-on, best-effort) — pure synthesis + one RS benchmark fetch.
-        setup = None
-        if setup_check is not None and reads:
-            try:
-                macro_t1 = None
-                if next_event_per_series is not None:
-                    ev = next_event_per_series(data_dir=args.data_dir)
-                    t1 = [days for name, (d, days) in ev.items()
-                          if name in TIER1_MACRO and days is not None]
-                    macro_t1 = min(t1) if t1 else None
-                rs = (fetch_rs(ticker, frames["1D"], data_dir=args.data_dir)
-                      if (fetch_rs is not None and "1D" in frames) else None)
-                beta = (fetch_beta(ticker, frames["1D"])
-                        if (fetch_beta is not None and "1D" in frames) else None)
-                setup = setup_check(reads, profile=profile, ctx=ctx, earn=earn,
-                                    macro_tier1_days=macro_t1, rs=rs, beta=beta, ex_div=exd)
-            except Exception as e:
-                notes.append(f"setup check unavailable ({type(e).__name__}).")
-
-        last_bar, as_of, panel_bars = None, None, None
-        if "1D" in frames:
-            d = frames["1D"]
-            row = d.iloc[-1]
-            prev_close = float(d["Close"].iloc[-2]) if len(d) > 1 else float(row["Open"])
-            last_bar = {"open": float(row["Open"]), "high": float(row["High"]),
-                        "low": float(row["Low"]), "close": float(row["Close"]),
-                        "prev_close": prev_close}
-            as_of = d.index[-1].date().isoformat()
-            tail = d.iloc[-(max(0, args.prev) + 1):]
-            pcs = d["Close"].shift(1)                  # prior close per bar → hollow-candle colour
-            panel_bars = [(idx.date().isoformat(), float(rw["Open"]), float(rw["High"]),
-                           float(rw["Low"]), float(rw["Close"]),
-                           float(pcs.loc[idx]) if pd.notna(pcs.loc[idx]) else float(rw["Open"]))
-                          for idx, rw in tail.iterrows()]
-
-        print_report(ticker, reads, divs, summary, profile, notes, last_bar=last_bar, as_of=as_of,
-                     ctx=ctx, backdrop=backdrop, thesis=args.thesis, level=args.level, color=use_color,
-                     candle_style=args.candle, panel_bars=panel_bars, candle_px=args.candle_px,
-                     geo=geo, pcoi=pc, vol=vol, live=live_bar, setup=setup, squeeze=sqz,
-                     insider=ins, callq=callq, liq=liq, cats=cats)
+        render_ticker(ticker, args, use_color, interactive, backdrop_base)

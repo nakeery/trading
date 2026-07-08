@@ -341,6 +341,98 @@ calendar month; post-S31 calendar-feature skepticism), news/social sentiment (no
 source — S41 rejection stands). 31 smoke tests (30 = callquote pure helpers; 31 =
 beta/ex-div-estimator/catalysts filters).
 
+S47: **ATM IV (180d) — the LEAPS-tenor gauge** (user: "I don't buy 30d options; add a ~6mo IV
+reading" + "is the 30d reading real IV?" — answer: YES, quote-based Massive harvest; the
+labeled `(HV-proxy)` gauges are the only synthetic ones). Long-dated IV moves far less than the
+event-bid front (CRSP curve read 70.2% at 10d vs 67.0% at 101d while 30d sat at the 97
+percentile), so the front percentile can scream "expensive" while the tenor the user actually
+buys is merely elevated — the 180d gauge + ITS OWN percentile is the number that prices a LEAPS
+entry. Implementation: third narrow-strike fetch in `massive.get_chain_summary` (dte 150–240,
+own failure domain — a thin long chain never costs the front harvest; pure `_atm_at_tenor` pick,
+test 32) → `atm_iv_180d`/`atm_dte_180d` in new `IV_LONG_COLS` ⊂ `IV_META_COLS` (S44 pattern:
+auto-excluded/merged/stamped); "ATM IV (180d)" OPTIONS gauge (sentiment.py) with a "N.NNx front"
+tenor-ratio label + S43 stale flag; percentile FORWARD-ONLY (~63 harvests ≈ 3 months — no
+backfill; long-dated contracts are too thin for the trades-only inversion). `--call` IV curve
+extended to the LEAPS tenors (CURVE_MAX_DTE 150→400, 7 expiries, YY-MM-DD labels, SCOPEKEY
+call1→call2) and its paying-up caution now cites the 180d percentile beside the 30d when
+available. Model/scorecard side untouched (IV/HV gate + vol_setup factor stay 30d — tenor-matched
+to HV-20 / near-dated straddles). **Display convention (user rule, permanent): "percentile"
+written in full, never "%ile"** — full sweep done (lens/volsetup/shortint/market_context header +
+test assertions; format specs `{x*100:.0f} percentile`); saved to auto-memory
+(feedback_percentile_display.md). 32 smoke tests.
+
+S48: **lens_web.py — the Lens as a local web page** (user: "interactive window with a search bar
+for the ticker"). Shape decision: Streamlit chosen over (a) a Textual TUI — screen-owning
+frameworks repaint the terminal as a character grid and destroy raw sixel; Textual+textual-image
+(image-widget candles via the terminal graphics protocol) recorded as the deferred TUI
+alternative — and (b) a prompt_toolkit bottom-prompt shell (sixel-safe but not a window). KEY
+FINDING: in a browser sixel is unnecessary — a real interactive Plotly candlestick (hover OHLC,
+zoom) supersedes it.
+- **Core refactor (pure move, verified byte-identical on a piped QQQ run)**: the per-ticker body
+  of lens.py's `__main__` is now module-level `render_ticker(ticker, args, use_color,
+  interactive, backdrop_base)`; the SPY/breadth/F&G assembly is `build_backdrop(data_dir)`;
+  `interactive` param replaces the four scattered `sys.stdin.isatty()` calls. Done via a
+  deterministic transformation script (200-line re-indent), not hand-retyping.
+- **`--candle none`** style (argparse + print_report): skips the candle panel; lens_web uses it.
+- **lens_web.py**: ticker text box + quick-pick pills (scanned from data/*_indicators.csv),
+  checkbox blocks (vol/call/squeeze/insider/geo/live + pc-oi scope select), optional
+  thesis/level, Plotly candlestick (last ~120 daily bars via timeframes._load_daily), report
+  captured from render_ticker (redirect_stdout, use_color=True, interactive=False → stale caches
+  reused; "live" checkbox clears the cache) and rendered via ansi2html **inside `st.html`** —
+  st.markdown was tried first and FAILED: CommonMark ends an HTML block at the first blank line,
+  shredding the <pre> and the monospace alignment (verified in the browser via preview tooling,
+  then fixed). Run: `.\trade\Scripts\python.exe -m streamlit run lens_web.py` → localhost:8501.
+- Deps added to requirements.txt + venv: streamlit, ansi2html, plotly. `.claude/launch.json`
+  gained a `lens-web` entry (preview/verification tooling). CLI behavior unchanged.
+- **Rerun-model fix (same day, user-reported)**: Streamlit reruns the WHOLE script on any
+  interaction and on the menu's Rerun/R-hotkey; a button reads True only in the run its click
+  happened in — gating the display on the click made menu-Rerun BLANK the page. Fixed: the
+  rendered report lives in `st.session_state` and is redrawn every rerun; regeneration triggers
+  on (ticker, flags)-key change (flag toggles now auto-run, no Run click needed) or an explicit
+  Run click (busts the 2-min cache = force-fresh). Verified in-browser: R-hotkey rerun preserves
+  the report; ticking `vol` auto-adds the VOLATILITY SETUP block.
+- **2s argument debounce (user request)**: a changed (ticker, flags) key starts a settle timer
+  (`DEBOUNCE_S=2.0`; sleep-remainder + `st.rerun()` loop); another click during the wait arrives
+  as a NEW key and restarts it, so rapid toggles collapse into ONE regeneration. Run bypasses the
+  wait. A "⏳ applying in Ns" caption shows during the window. Verified in-browser: vol+call
+  clicked 400ms apart → single fetch containing BOTH blocks.
+- **Continuous live chart (user request)**: with the `live` flag on the DISPLAYED report,
+  the chart renders inside `st.fragment(run_every=LIVE_CHART_EVERY_S=10)` — the fragment reruns
+  ONLY itself: one Tradier quote per tick → provisional today-bar via
+  `fetch_live_bar`/`append_live_bar` (the CLI --live machinery), 🔴 LIVE price/timestamp caption
+  ("session in progress/closed"), daily tail cached (`load_daily_tail`, ttl 600 — keeps the
+  yfinance-fallback path from re-downloading per tick). The heavy report is never re-fetched by
+  the timer. Verified in-browser mid-session: 10s apart the caption moved 15:09:05→15:09:15 AND
+  the price $60.68→$60.56 — a real CRSP tick.
+- **Price line + indicator overlays (user request)**: dotted price line at last close (static) /
+  the live quote (rides each tick; verified annotation == caption price 60.52 mid-session), and
+  display-only checkboxes MA20/MA50 (default on) / MA200 / EMA9 / BB(20,2σ) / volume pane /
+  price line. Overlays are computed on a warm-up-extended tail (CHART_WARMUP=200 extra bars) then
+  sliced to the 120-bar window so MA200/BB are formed at the left edge. The checkboxes live
+  INSIDE the chart section (fragment scope, own st.session_state keys, NOT part of the flags
+  key) → toggling redraws only the chart, never triggers the report debounce/regeneration.
+  Volume pane = make_subplots row 2, bars colored by close-vs-prior-close.
+- **Chart fidelity fixes (user-reported)**: (1) price-tag label was clipped — now anchored
+  xanchor="left" at x=1.0 extending into a widened right margin (r=64); NB `add_hline` appends
+  " domain" to the annotation xref ITSELF — passing xref explicitly produced "x domain domain"
+  and a silent ValueError that blanked the whole chart (the try/except ate it; reproduced
+  offline to find it). (2) Candles now follow the lens' TWO-AXIS hollow-candle convention
+  (COLOR = close vs PRIOR close, FILL = close vs open) — plotly's single trace can only key on
+  close-vs-open, so bars are split into FOUR style-group traces (green/red × hollow/solid);
+  within a group close-vs-open is uniform so increasing/decreasing styles are set identically.
+  CRSP window: 19/120 bars (7 green-filled + 12 red-hollow) had been drawn wrong before.
+- **Volume-profile chart overlay (user request)**: a `vol profile` checkbox reveals aspect pills
+  (value area / POC / HVN / LVN / histogram, default all). `volume_profile` gained an opt-in
+  `with_hist=True` (returns hist_centers/hist_volumes — backwards compatible). Rendering:
+  add_hrect value-area band, POC amber line + inside-left tag, HVN dashed / LVN dotted level
+  lines (POC excluded from the HVN list — it duplicates), and the volume-at-price HISTOGRAM as
+  horizontal bars on an overlaying reversed x-axis (`xaxis3`, range [max*3.5, 0] → bars hug the
+  RIGHT edge, ~28% width). Profile = daily bars, lookback 252 (~1y), cached ttl 600; caption
+  notes the report's own profile may differ (1h bars, ~6mo). Verified in-browser on CRSP:
+  histogram bulge peaks at the POC line (54.77), 50 bins, band+LVN lines render, price tag
+  unaffected.
+33 smoke tests (33 = candle-none render path).
+
 S45 (same working day): **equal-weight BREADTH on the MARKET BACKDROP** (`modules/breadth.py`),
 answering "is the equal-weighted S&P worth checking?" — yes: "SPY: up" is cap-weighted (top ~10
 mega-caps ≈ 35–40%), so the headline can rise while the MEDIAN stock falls. RSP−SPY (and
@@ -432,7 +524,10 @@ Operational notes
   re-trigger every run). Best-effort/non-fatal — on failure it proceeds on whatever exists (yfinance
   fallback if still no CSV). `--no-refresh` opts out (skips build+refresh); `--refresh` forces even if
   current. indicators.py gained a non-interactive CLI (`--ticker/--start/--end/--no-chart/--data-dir`).
-- Smoke: `.\trade\Scripts\python.exe -m pytest tests/ -q` (31 tests, offline, ~2-7s).
+- Smoke: `.\trade\Scripts\python.exe -m pytest tests/ -q` (33 tests, offline, ~2-7s).
+- Web lens: `.\trade\Scripts\python.exe -m streamlit run lens_web.py` → localhost:8501 (S48).
+- Display convention (user rule): "percentile" written in full in ALL output — never "%ile";
+  number without a % sign (`{x*100:.0f} percentile`).
 - Harmless: `Select-Object -First N` truncating a lens pipe gives exit 255 (SIGPIPE), not a crash.
 
 Outstanding / backlog

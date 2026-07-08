@@ -1,7 +1,7 @@
 """
 Smoke tests for the options trading ML pipeline.
 
-31 regression guards:
+33 regression guards:
   1. Signal hierarchy (backtest CSV) — STRONG ENTRY > CAUTION > STAY OUT by avg return
   2. STRONG ENTRY baseline sanity (backtest CSV) — count/return/win-rate loose bounds
   3. Vol thresholds range (QQQ indicators CSV) — positive values in expected ranges
@@ -54,6 +54,11 @@ Smoke tests for the options trading ML pipeline.
  31. beta_corr (2x-levered clone → β≈2 corr≈1; independent → low corr; short → None),
      estimate_next_ex_div cadence estimator (quarterly → +~91d; irregular/thin → None),
      upcoming_catalysts window + ticker filter (S46, offline)
+ 32. massive _atm_at_tenor — the ~180d LEAPS-tenor ATM pick: nearest-to-target expiry dominates
+     strike distance, iv=20 placeholder rejected, empty → None (S47, offline)
+ 33. lens print_report candle_style="none" — the candle panel is skipped (lens_web draws a real
+     chart instead) while the header/sections still render; guards the S48 render_ticker
+     extraction's print path (offline)
 """
 
 
@@ -721,14 +726,14 @@ def test_vol_setup_factors():
     # factors (squeeze off-horizon, earnings priced → note), one short-vol factor, no clear edge.
     s = vol_setup(None, sq_4h, ctx(iv_pct=0.97), earnings=earn)
     assert s["long_vol"] == [], f"expected no long-vol factors, got {s['long_vol']}"
-    assert len(s["short_vol"]) == 1 and "97%ile" in s["short_vol"][0]
+    assert len(s["short_vol"]) == 1 and "97 percentile" in s["short_vol"][0]
     assert s["notes"] and "premium likely priced" in s["notes"][0]
     assert "no clear vol edge" in s["net"]
 
     # (b) Cheap real IV + daily squeeze + earnings → three long-vol factors, BUY verdict,
     # S38-aligned hint (exit before the print, not "size for the crush").
     s = vol_setup(None, sq_1d, ctx(iv_pct=0.20), earnings=earn)
-    assert len(s["long_vol"]) == 3 and any("20%ile" in f for f in s["long_vol"])
+    assert len(s["long_vol"]) == 3 and any("20 percentile" in f for f in s["long_vol"])
     assert any("squeeze ON (1D)" in f for f in s["long_vol"])
     assert s["short_vol"] == [] and s["notes"] == []
     assert "BUYING vol" in s["net"] and "exit BEFORE the print" in s["hint"]
@@ -1035,6 +1040,61 @@ def test_beta_exdiv_catalysts():
     cats = upcoming_catalysts("CRSP", within_days=45, data_dir=d, today="2026-07-07")
     assert len(cats) == 1 and cats[0][0] == "2026-07-20" and cats[0][1] == 13
     assert upcoming_catalysts("CRSP", data_dir=os.path.join(d, "missing")) == []
+
+
+# ─── Test 32: long-tenor ATM IV pick (offline) ────────────────────────────────
+def test_atm_at_tenor():
+    """massive._atm_at_tenor (S47): the ~180d LEAPS-tenor ATM pick — expiry proximity to the
+    target dominates strike distance (×10 weight), the iv=20 placeholder is rejected, puts are
+    ignored, empty chains → None. Pure, no network."""
+    import datetime
+    from modules.massive import _atm_at_tenor
+
+    def p(typ, strike, dte, iv):
+        return {"type": typ, "strike": strike, "dte": dte, "iv": iv,
+                "expiry": datetime.date(2026, 7, 7) + datetime.timedelta(days=dte)}
+
+    parsed = [
+        p("call", 60.0, 101, 0.67),      # too near the front — expiry distance dominates
+        p("call", 62.5, 192, 0.64),      # ~target tenor, slightly OTM
+        p("call", 60.0, 192, 20),        # ~target tenor ATM but placeholder iv → rejected
+        p("call", 60.0, 374, 0.61),      # too far out
+        p("put",  60.0, 192, 0.66),      # puts ignored
+    ]
+    atm = _atm_at_tenor(parsed, underlying_price=60.2, target_dte=180)
+    assert atm and atm["dte"] == 192 and atm["strike"] == 62.5 and atm["iv"] == 0.64
+    assert _atm_at_tenor([p("put", 60.0, 192, 0.66)], 60.2, 180) is None
+    assert _atm_at_tenor([], 60.2, 180) is None
+
+
+# ─── Test 33: candle_style="none" render path (offline) ──────────────────────
+def test_print_report_candle_none():
+    """lens.print_report with candle_style='none' (S48): the candle panel is skipped entirely
+    (lens_web draws a real Plotly chart instead) while the header, OHLC line and sections still
+    render. Also a light guard on the render path after the S48 render_ticker extraction."""
+    import contextlib
+    import io
+    from lens import print_report
+
+    last_bar = {"open": 100.0, "high": 103.0, "low": 99.0, "close": 102.0, "prev_close": 100.5}
+    panel = [("2026-07-06", 100.0, 103.0, 99.0, 102.0, 100.5),
+             ("2026-07-07", 102.0, 104.0, 101.0, 103.0, 102.0)]
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        print_report("TEST", reads={}, divs={}, summary={"synthesis": "mixed — fixture"},
+                     profile=None, notes=[], last_bar=last_bar, as_of="2026-07-07",
+                     color=False, candle_style="none", panel_bars=panel)
+    out = buf.getvalue()
+    assert "LENS — TEST" in out and "MULTI-TIMEFRAME" in out
+    assert "███" not in out and "├─┤" not in out          # no box-candle glyphs
+    assert "⠀" not in out                                  # no braille canvas
+    # same fixtures with box style DO render the panel — proves the skip is the style, not the data
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        print_report("TEST", reads={}, divs={}, summary={"synthesis": "mixed — fixture"},
+                     profile=None, notes=[], last_bar=last_bar, as_of="2026-07-07",
+                     color=False, candle_style="box", panel_bars=panel)
+    assert "│" in buf2.getvalue()
 
 
 # ─── Test 22: shortint parsers + squeeze scorecard (offline) ──────────────────

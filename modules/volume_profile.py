@@ -21,7 +21,7 @@ HVN_NEAR_PCT = 0.05     # near_hvn_above/below only report a shelf within ±5% o
                         # in the risk scorecard means genuinely near, not the nearest at any distance (S43)
 
 
-def volume_profile(ohlcv, lookback=None, bins=50, ref_price=None):
+def volume_profile(ohlcv, lookback=None, bins=50, ref_price=None, with_hist=False):
     df = ohlcv.tail(lookback) if lookback else ohlcv
     df = df.dropna(subset=["High", "Low", "Close", "Volume"])
     if len(df) < 5 or df["Volume"].sum() == 0:
@@ -74,10 +74,14 @@ def volume_profile(ohlcv, lookback=None, bins=50, ref_price=None):
     hvn_above = min((h for h in hvns if price < h <= price * (1 + HVN_NEAR_PCT)), default=None)
     hvn_below = max((h for h in hvns if price * (1 - HVN_NEAR_PCT) <= h < price), default=None)
 
-    return {
+    out = {
         "poc": poc, "va_low": va_lo, "va_high": va_hi,
         "price": price, "price_location": location,
         "hvns": sorted(hvns), "lvns": sorted(lvns),
         "near_hvn_above": hvn_above, "near_hvn_below": hvn_below,
         "n_bars": len(df),
     }
+    if with_hist:   # raw volume-at-price curve for chart rendering (S48 lens_web overlay)
+        out["hist_centers"] = [float(c) for c in centers]
+        out["hist_volumes"] = [float(v) for v in vap]
+    return out

@@ -7,3 +7,6 @@ lxml
 numpy
 pytest
 xlrd>=2.0.1  # read the GPR .xls (geopolitical-risk index) in modules/geocontext.py
+streamlit    # lens_web.py — the Lens as a local web page (S48)
+ansi2html    # lens_web.py — terminal-color report → HTML
+plotly       # lens_web.py — interactive candlestick (supersedes sixel in the browser)

@@ -27,7 +27,14 @@ IV_FEATURE_COLS = ["atm_iv_30d", "iv_skew_25d", "term_structure"]
 #                   modules/vol_history.py — the constant-maturity 30d gauge blunts the true
 #                   front-expiry pre-earnings ramp (S39 caveat). Never a model feature (meta).
 IV_EVENT_COLS   = ["atm_iv_event", "event_expiry", "event_dte"]
-IV_META_COLS    = ["atm_strike", "atm_expiry", "atm_dte", "put_call_oi_ratio"] + IV_EVENT_COLS
+#   IV_LONG_COLS — ~180d ATM IV, harvested daily alongside the 30d gauge (S47): the tenor the
+#                  user's LEAPS entries actually price (sizing.py MIN_DTE=180). Long-dated vol
+#                  blends event weeks with quiet weeks, so it moves far less than the event-bid
+#                  front. Percentile accumulates FORWARD-ONLY (no backfill — long-dated
+#                  contracts trade too thinly historically for the trades-only inversion).
+IV_LONG_COLS    = ["atm_iv_180d", "atm_dte_180d"]
+IV_META_COLS    = (["atm_strike", "atm_expiry", "atm_dte", "put_call_oi_ratio"]
+                   + IV_EVENT_COLS + IV_LONG_COLS)
 IV_COLS         = IV_FEATURE_COLS + IV_META_COLS
 #   IV_INDICATOR_COLS — binary missing-indicators added by features.impute_iv_features()
 #                     (present only under --iv-features). Treated like IV_FEATURE_COLS:
@@ -40,6 +47,9 @@ BACK_MONTH_MIN_DTE  = 55    # back-month tenor for term-structure denominator
 EVENT_EARN_WINDOW   = 45    # stamp event-expiry IV only when earnings ≤ this many days out
                             # (mirrors volquote.EARN_WINDOW — the pre-earnings long-vol horizon)
 EVENT_MAX_AFTER     = 21    # search window: expiries up to this many days past the report
+LONG_TENOR_TARGET   = 180   # ~6mo ATM IV gauge (S47) — the LEAPS-entry tenor
+LONG_TENOR_MIN_DTE  = 150   # …searched in this expiry window (monthlies/LEAPS are sparse
+LONG_TENOR_MAX_DTE  = 240   #  out here, so the window is wide)
 MAX_PAGES                = 5     # cap pagination — 5 × 250 = 1250 contracts per call
 PAGE_LIMIT               = 250
 # MAX_INVERT_PER_CATEGORY removed — all contracts are tried (no cap)
@@ -208,6 +218,22 @@ def get_chain_summary(ticker, underlying_price, target_dte=30):
     put_oi  = sum(p["oi"] for p in puts_all)
     pc_oi   = (put_oi / call_oi) if call_oi > 0 else None
 
+    # ~180d ATM IV (S47) — the LEAPS-entry tenor; separate fetch + separate failure domain so a
+    # thin long-dated chain never costs the front-tenor harvest.
+    long_atm = None
+    try:
+        long_rows = _fetch_chain(
+            ticker,
+            dte_min=LONG_TENOR_MIN_DTE,
+            dte_max=LONG_TENOR_MAX_DTE,
+            strike_min=underlying_price * 0.97,
+            strike_max=underlying_price * 1.03,
+        )
+        long_atm = _atm_at_tenor(_parse_snapshot_rows(long_rows), underlying_price,
+                                 LONG_TENOR_TARGET)
+    except Exception:
+        pass
+
     return {
         "atm_iv_30d":        float(atm["iv"]),
         "atm_strike":        atm["strike"],
@@ -216,6 +242,8 @@ def get_chain_summary(ticker, underlying_price, target_dte=30):
         "iv_skew_25d":       skew,
         "term_structure":    term,
         "put_call_oi_ratio": pc_oi,
+        "atm_iv_180d":       long_atm["iv"] if long_atm else None,
+        "atm_dte_180d":      long_atm["dte"] if long_atm else None,
     }
 
 
@@ -237,6 +265,19 @@ def _parse_snapshot_rows(rows, today=None):
         out.append({"type": d.get("contract_type"), "strike": strike, "expiry": exp,
                     "dte": (exp - today).days, "iv": r.get("implied_volatility")})
     return out
+
+
+def _atm_at_tenor(parsed, underlying_price, target_dte):
+    """PURE (S47): the ATM call nearest `target_dte` — same combined dte+strike scoring as
+    get_chain_summary's atm_score (×10 dte weight so expiry choice dominates strike choice).
+    Rejects the iv=20 placeholder. Returns {"iv", "dte", "strike"} or None."""
+    calls = [p for p in parsed
+             if p["type"] == "call" and p["iv"] is not None and p["iv"] != 20]
+    if not calls:
+        return None
+    atm = min(calls, key=lambda p: abs(p["dte"] - target_dte) * 10
+              + abs(p["strike"] - underlying_price))
+    return {"iv": float(atm["iv"]), "dte": atm["dte"], "strike": atm["strike"]}
 
 
 def pick_event_atm(parsed, underlying_price):

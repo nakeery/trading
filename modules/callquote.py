@@ -22,11 +22,11 @@ import time
 from modules.tradier import TRADIER_TOKEN, get_current_price, get_expirations, get_chain
 from modules.pc_oi import _cache_path, cache_stale, _cache_age, _hhmm, is_monthly_expiry
 
-SCOPEKEY = "call1"           # bumped when the cached payload shape changes
+SCOPEKEY = "call2"           # bumped when the cached payload shape changes (S47: LEAPS-reach curve)
 TARGET_DTES = (45, 90)       # research consensus: 45–60d+ slows theta; ~90d = swing tenor
 OTM_DELTA = 0.375            # midpoint of the 0.35–0.40Δ trend band
-CURVE_MAX_DTE = 150          # IV-by-expiry curve horizon
-CURVE_MAX_EXPIRIES = 5       # …and its API-call budget (1 chain call per expiry)
+CURVE_MAX_DTE = 400          # IV-by-expiry curve horizon — reaches the LEAPS tenors (S47)
+CURVE_MAX_EXPIRIES = 7       # …and its API-call budget (1 chain call per expiry)
 # Liquidity-grade bands — ATM region = the 5 strikes nearest spot, calls + puts:
 LIQ_TIGHT_SPR = 0.01         # median spread ≤1% of mid (and OI ≥ LIQ_TIGHT_OI) → "tight"
 LIQ_OK_SPR    = 0.03         # ≤3% → "ok"
@@ -213,7 +213,7 @@ def _fetch(ticker, earnings_date=None, ex_div_date=None):
                                 f"deep-ITM early-exercise risk into ex-div")
         blocks.append(blk)
         if cand.get("iv"):
-            curve_pts.append((e[5:], d, float(cand["iv"])))
+            curve_pts.append((e[2:], d, float(cand["iv"])))   # YY-MM-DD — LEAPS need the year (S47)
         if grade is None:
             grade = liquidity_grade(rows, spot)
     if not blocks:
@@ -232,7 +232,7 @@ def _fetch(ticker, earnings_date=None, ex_div_date=None):
         except Exception:
             continue
         if atm and atm.get("iv"):
-            curve_pts.append((e[5:], d, float(atm["iv"])))
+            curve_pts.append((e[2:], d, float(atm["iv"])))
 
     return {"spot": spot, "earn_days": earn_days, "quotes": blocks,
             "curve": curve_read(curve_pts), "liquidity": grade}

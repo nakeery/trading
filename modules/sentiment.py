@@ -158,6 +158,7 @@ def gather_context(ticker, data_dir="data", with_vix=True):
         return f" (stale {age}d)"
 
     atm_iv, atm_iv_d = last_valid("atm_iv_30d")
+    atm_iv_l, atm_iv_l_d = last_valid("atm_iv_180d")
     skew,   skew_d   = last_valid("iv_skew_25d")
     term,   term_d   = last_valid("term_structure")
     pc_oi,  pc_oi_d  = last_valid("put_call_oi_ratio")
@@ -177,6 +178,15 @@ def gather_context(ticker, data_dir="data", with_vix=True):
                        "label": iv_stale.strip(), "pct": percentile_of(df["atm_iv_30d"], atm_iv)})
     else:
         notes.append("atm_iv_30d NaN — options-IV block skipped (re-run indicators.py to harvest).")
+
+    # ~180d ATM IV (S47) — the LEAPS-entry tenor. Label shows the ratio to the front tenor
+    # (long-dated vol blends quiet weeks, so an event-bid front reads >1x its 180d). Percentile
+    # accumulates forward-only (column added S47; no backfill possible at long tenors).
+    if atm_iv_l is not None:
+        ratio_lbl = f"{atm_iv_l / atm_iv:.2f}x front" if atm_iv else ""
+        gauges.append({"group": "OPTIONS", "name": "ATM IV (180d)", "value": atm_iv_l,
+                       "fmt": "{:.1%}", "label": (ratio_lbl + _stale(atm_iv_l_d)).strip(),
+                       "pct": percentile_of(df["atm_iv_180d"], atm_iv_l)})
 
     if skew is not None:
         gauges.append({"group": "OPTIONS", "name": "25Δ skew (P-C)", "value": skew, "fmt": "{:+.3f}",
