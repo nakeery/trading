@@ -32,6 +32,12 @@ from modules.structure import (
 from modules.volume_profile import volume_profile
 
 try:
+    from modules.sentiment import ordinal_percentile
+except Exception:                                     # sentiment unavailable → plain fallback
+    def ordinal_percentile(pct, word=True):
+        return "" if pct is None else f"{pct * 100:.0f}" + (" percentile" if word else "")
+
+try:
     from modules.sentiment import gather_context
 except Exception:
     gather_context = None
@@ -479,6 +485,11 @@ def analyze(ticker, include_intraday=True, data_dir="data", live=False):
     return frames, reads, divs, summary, profile, notes, live_bar
 
 
+# "not supplied" sentinel for print_report's macro_events kwarg (S49) — distinguishes an
+# unsupplied value (compute inside, the pre-S49 behavior) from a computed-but-None/empty one.
+_UNSET = object()
+
+
 def _section(title, color=True, w=78):
     """Section headline embedded in a dimmed single rule — visual separation between the lens
     blocks (the top header keeps its double line): `── TITLE ─────…` (S42)."""
@@ -490,7 +501,8 @@ def _section(title, color=True, w=78):
 def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as_of=None,
                  ctx=None, backdrop=None, thesis=None, level=None, color=True, candle_style="box",
                  panel_bars=None, candle_px=128, geo=None, pcoi=None, vol=None, live=None,
-                 setup=None, squeeze=None, insider=None, callq=None, liq=None, cats=None):
+                 setup=None, squeeze=None, insider=None, callq=None, liq=None, cats=None,
+                 risk=None, macro_events=_UNSET):
     w = 78
     print(f"\n{'═'*w}")
     hdr = f"  LENS — {ticker}"
@@ -621,8 +633,10 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         print(f"                 below price: {_levels(below)}")
         print(f"    LVN gaps:    {_levels(lvns)}")
 
-    # 5. RALLY vs DRAWDOWN RISK
-    risk = rally_drawdown_risk(reads, profile=profile, ctx=ctx, divergences=divs)
+    # 5. RALLY vs DRAWDOWN RISK  (S49: precomputed when supplied — gather_report lifts this so
+    # the web app can render it natively; unsupplied = compute here, the pre-S49 behavior)
+    if risk is None:
+        risk = rally_drawdown_risk(reads, profile=profile, ctx=ctx, divergences=divs)
     _section("RALLY vs DRAWDOWN RISK  (current conditions, not a forecast)", color)
     print(f"    NET: {risk['net']}")
     if risk["drawdown"]:
@@ -647,7 +661,7 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         for g in ctx["gauges"]:
             if g["group"] in ("OPTIONS", "VOL", "MARKET"):
                 val = g["fmt"].format(g["value"])
-                pct = f"  [{int(round(g['pct']*100))} percentile]" if g.get("pct") is not None else ""
+                pct = f"  [{ordinal_percentile(g['pct'])}]" if g.get("pct") is not None else ""
                 lab = f"  {g['label']}" if g.get("label") else ""
                 print(f"    {g['name']:<20}{val:>9}{lab}{pct}")
         if liq:
@@ -673,7 +687,7 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
                   f"(NYSE tickers return no data)")
         sv = squeeze.get("svr") or {}
         if sv.get("now") is not None:
-            pct = f"  [{sv['pct'] * 100:.0f} percentile of {sv['n']} sessions]" if sv.get("pct") is not None else ""
+            pct = f"  [{ordinal_percentile(sv['pct'])} of {sv['n']} sessions]" if sv.get("pct") is not None else ""
             avgs = ""
             if sv.get("avg5") is not None and sv.get("avg20") is not None:
                 avgs = f" · 5d avg {sv['avg5']:.0%} · 20d avg {sv['avg20']:.0%}"
@@ -870,8 +884,8 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         ivp = gauge_pct(ctx, "ATM IV (30d)") if gauge_pct is not None else None
         if ivp is not None and ivp >= 0.70:
             ivl = gauge_pct(ctx, "ATM IV (180d)") if gauge_pct is not None else None
-            l180 = f" (180d tenor at {ivl * 100:.0f} percentile)" if ivl is not None else ""
-            print(f"      ⚠ ATM IV (30d) at {ivp * 100:.0f} percentile of its history{l180} — "
+            l180 = f" (180d tenor at the {ordinal_percentile(ivl)})" if ivl is not None else ""
+            print(f"      ⚠ ATM IV (30d) at the {ordinal_percentile(ivp)} of its history{l180} — "
                   f"paying up for a direction bet; debit spreads cut the vega/theta bill")
         print("      guide: more DTE = slower theta · 0.35–0.40Δ in trends, lower Δ in chop · "
               "BE move must be plausible within the tenor")
@@ -885,7 +899,7 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
                 print(f"    {g['group']}:")
                 last_grp = g["group"]
             tag = f"  {g['label']}" if g.get("label") else ""
-            pct = f"  [{int(round(g['pct']*100))} percentile]" if g.get("pct") is not None else ""
+            pct = f"  [{ordinal_percentile(g['pct'])}]" if g.get("pct") is not None else ""
             print(f"      {g['name']:<18}{g['fmt'].format(g['value']):>9}{tag}{pct}")
         print(f"    NET: {geo['composite']}")
         for n in geo.get("notes", []):
@@ -898,11 +912,15 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         for d, days, typ, desc in cats:
             print(f"    {d} ({days}d)  {typ}: {desc}")
 
-    # 7. MACRO
-    if next_event_per_series:
+    # 7. MACRO  (S49: macro_events precomputed when supplied; _UNSET = fetch here as before)
+    if macro_events is _UNSET:
         try:
-            ev = next_event_per_series(data_dir="data")
-            soon = [(name, d, days) for name, (d, days) in ev.items()
+            macro_events = next_event_per_series(data_dir="data") if next_event_per_series else None
+        except Exception:
+            macro_events = None
+    if macro_events:
+        try:
+            soon = [(name, d, days) for name, (d, days) in macro_events.items()
                     if d is not None and days is not None and days <= 10]
             if soon:
                 _section("MACRO (next 10d): " +
@@ -1017,7 +1035,7 @@ def build_backdrop(data_dir="data"):
         br = fetch_breadth(data_dir=data_dir)
         segs = []
         for lbl, d in ((br or {}).get("pairs") or {}).items():
-            pct = f" [{d['pct'] * 100:.0f} percentile]" if d.get("pct") is not None else ""
+            pct = f" [{ordinal_percentile(d['pct'])}]" if d.get("pct") is not None else ""
             segs.append(f"{lbl} {d['rel_20d']:+.1%}{pct} {d['tag']}")
         if segs:
             seg = "breadth(20d) " + " · ".join(segs)
@@ -1025,17 +1043,20 @@ def build_backdrop(data_dir="data"):
     if fetch_fng is not None:                        # CNN Fear & Greed (S41) — market-level, cached ~6h
         fng = fetch_fng(data_dir=data_dir)
         if fng and fng.get("score") is not None:
-            pct = f" [{fng['pct'] * 100:.0f} percentile]" if fng.get("pct") is not None else ""
+            pct = f" [{ordinal_percentile(fng['pct'])}]" if fng.get("pct") is not None else ""
             seg = f"F&G {fng['score']:.0f} {fng['rating']}{pct}"
             backdrop_base = f"{backdrop_base}  |  {seg}" if backdrop_base else seg
     return backdrop_base
 
 
-def render_ticker(ticker, args, use_color, interactive, backdrop_base):
-    """Run the full lens for ONE ticker and print the report (S48 — extracted from __main__
-    so the CLI and lens_web.py share it). `args` is the argparse namespace (or an equivalent
-    object); `interactive` gates the TTY cache-refresh prompts (False under capture/server).
-    Pure move of the original loop body — no behavior change."""
+def gather_report(ticker, args, interactive, backdrop_base):
+    """COMPUTE phase of the lens (S49 — split out of render_ticker so lens_web.py can render
+    the same data natively). Assembles everything print_report needs into one picklable payload
+    dict — plain dicts/lists/scalars only, NO DataFrames (lens_web caches the payload via
+    st.cache_data, which pickles it; everything frame-derived is materialized here). The two
+    reads print_report used to compute itself (rally/drawdown risk, macro events) are lifted
+    here so a non-print renderer gets them without re-running module I/O. Returns None when
+    data can't load (the error line is printed, matching the old inline behavior)."""
     if not args.no_refresh:
         csv_missing = not os.path.exists(
             os.path.join(args.data_dir, f"{ticker.lower()}_indicators.csv"))
@@ -1235,11 +1256,47 @@ def render_ticker(ticker, args, use_color, interactive, backdrop_base):
                        float(pcs.loc[idx]) if pd.notna(pcs.loc[idx]) else float(rw["Open"]))
                       for idx, rw in tail.iterrows()]
 
-    print_report(ticker, reads, divs, summary, profile, notes, last_bar=last_bar, as_of=as_of,
-                 ctx=ctx, backdrop=backdrop, thesis=args.thesis, level=args.level, color=use_color,
-                 candle_style=args.candle, panel_bars=panel_bars, candle_px=args.candle_px,
-                 geo=geo, pcoi=pc, vol=vol, live=live_bar, setup=setup, squeeze=sqz,
-                 insider=ins, callq=callq, liq=liq, cats=cats)
+    # lifted from print_report (S49): rally/drawdown risk + macro events, so the payload is
+    # complete and print_report does zero compute/IO when rendering it. The macro fetch keeps
+    # print_report's hardcoded data_dir="data" (pre-existing quirk) for byte-identical output.
+    risk = rally_drawdown_risk(reads, profile=profile, ctx=ctx, divergences=divs)
+    macro_events = None
+    if next_event_per_series is not None:
+        try:
+            macro_events = next_event_per_series(data_dir="data")
+        except Exception:
+            macro_events = None
+
+    return {"ticker": ticker, "reads": reads, "divs": divs, "summary": summary,
+            "profile": profile, "notes": notes, "last_bar": last_bar, "as_of": as_of,
+            "panel_bars": panel_bars, "ctx": ctx, "backdrop": backdrop, "geo": geo,
+            "pcoi": pc, "vol": vol, "live": live_bar, "setup": setup, "squeeze": sqz,
+            "insider": ins, "callq": callq, "liq": liq, "cats": cats, "risk": risk,
+            "macro_events": macro_events, "thesis": args.thesis, "level": args.level,
+            "live_iv": live_iv}
+
+
+def render_payload(p, use_color=True, candle_style="box", candle_px=128):
+    """FORMAT phase — print the CLI report from a gather_report payload (S49)."""
+    print_report(p["ticker"], p["reads"], p["divs"], p["summary"], p["profile"], p["notes"],
+                 last_bar=p["last_bar"], as_of=p["as_of"], ctx=p["ctx"], backdrop=p["backdrop"],
+                 thesis=p["thesis"], level=p["level"], color=use_color,
+                 candle_style=candle_style, panel_bars=p["panel_bars"], candle_px=candle_px,
+                 geo=p["geo"], pcoi=p["pcoi"], vol=p["vol"], live=p["live"], setup=p["setup"],
+                 squeeze=p["squeeze"], insider=p["insider"], callq=p["callq"], liq=p["liq"],
+                 cats=p["cats"], risk=p["risk"], macro_events=p["macro_events"])
+
+
+def render_ticker(ticker, args, use_color, interactive, backdrop_base):
+    """Run the full lens for ONE ticker and print the report (S48 — extracted from __main__ so
+    the CLI and lens_web.py share it; S49 — split into gather_report + render_payload so
+    lens_web.py can render the payload natively). `args` is the argparse namespace (or an
+    equivalent object); `interactive` gates the TTY cache-refresh prompts (False under
+    capture/server)."""
+    p = gather_report(ticker, args, interactive, backdrop_base)
+    if p is None:
+        return
+    render_payload(p, use_color=use_color, candle_style=args.candle, candle_px=args.candle_px)
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@ widget interactions don't refetch — the module-level JSON caches still dedupe 
 import contextlib
 import io
 import os
+import re
 import time
 from types import SimpleNamespace
 
@@ -25,6 +26,7 @@ import streamlit as st
 from ansi2html import Ansi2HTMLConverter
 
 import lens
+import lens_web_sections
 from modules.timeframes import _load_daily, fetch_live_bar, append_live_bar
 from modules.volume_profile import volume_profile
 
@@ -61,15 +63,26 @@ def make_args(flags):
 
 
 @st.cache_data(ttl=120, show_spinner=False)
-def generate_report(ticker, flags_key):
-    """Captured ANSI report for one ticker. `flags_key` is a hashable dict-as-tuple so the cache
-    keys on the exact flag combination; `live` runs bypass this via a unique key upstream."""
+def generate_payload(ticker, flags_key):
+    """One compute, two renderings (S49): gather_report produces the structured payload the
+    native sections render from, then render_payload prints the CLI-identical ANSI report from
+    that same payload (zero extra I/O — risk/macro ride the payload) for the expander.
+    Returns (payload, preamble, ansi): `preamble` is whatever the compute phase printed
+    (refresh/progress noise, or the load-error line when payload is None). `flags_key` is a
+    hashable dict-as-tuple so the cache keys on the exact flag combination."""
     flags = dict(flags_key)
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
-        lens.render_ticker(ticker, make_args(flags), use_color=True, interactive=False,
-                           backdrop_base=lens.build_backdrop(DATA_DIR))
-    return buf.getvalue()
+        payload = lens.gather_report(ticker, make_args(flags), interactive=False,
+                                     backdrop_base=lens.build_backdrop(DATA_DIR))
+    preamble = buf.getvalue()
+    ansi = ""
+    if payload is not None:
+        buf2 = io.StringIO()
+        with contextlib.redirect_stdout(buf2):
+            lens.render_payload(payload, use_color=True, candle_style="none")
+        ansi = buf2.getvalue()
+    return payload, preamble, ansi
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -334,7 +347,7 @@ run_clicked = st.button("Run", type="primary", use_container_width=False)
 # and a button reads True only during the run its click happened in. So the rendered report must
 # live in session_state and be redrawn on EVERY rerun — gating the display on the click made the
 # menu Rerun blank the page. Regenerate only when the (ticker, flags) key changes or Run is
-# clicked; otherwise redisplay the stored result (generate_report's 2-min cache absorbs repeats).
+# clicked; otherwise redisplay the stored result (generate_payload's 2-min cache absorbs repeats).
 flags = {"vol": vol, "call": call, "squeeze": squeeze, "insider": insider,
          "geo": geo, "live": live, "pc_oi": pc_oi,
          "thesis": None if thesis == "none" else thesis,
@@ -370,22 +383,27 @@ if should_generate:
     with st.spinner(f"running the lens on {ticker}…"):
         if live or run_clicked:
             # explicit Run / live mode = fetch fresh — clear THIS entry only, not every ticker's
-            generate_report.clear(ticker, flags_key)
+            generate_payload.clear(ticker, flags_key)
         try:
-            report = generate_report(ticker, flags_key)
+            payload, preamble, ansi = generate_payload(ticker, flags_key)
         except Exception as e:
             st.error(f"lens failed for {ticker}: {type(e).__name__}: {e}")
-            report = None
-    if report:
+            payload, preamble, ansi = None, "", ""
+    if payload is not None:
         st.session_state["last_key"] = key
-        st.session_state["last_report"] = report
+        st.session_state["last_payload"] = payload
+        st.session_state["last_ansi"] = preamble + ansi
         # the generate may have auto-refreshed the indicators CSV (new close stamped) — drop the
         # chart caches so the candles/profile always match the report's data vintage
         load_daily_tail.clear()
         load_profile.clear()
+    elif preamble:
+        # gather printed the load-error line instead of returning a payload; the subprocess
+        # noise in it can carry ANSI escapes — strip them (st.error shows them raw)
+        st.error(re.sub(r"\x1b\[[0-9;]*m", "", preamble).strip())
 
 # ── display (every rerun, from session state) ────────────────────────────────
-if st.session_state.get("last_report"):
+if st.session_state.get("last_payload"):
     shown_ticker = st.session_state["last_key"][0]
     shown_live = bool(dict(st.session_state["last_key"][1]).get("live"))
     if shown_live:
@@ -394,15 +412,18 @@ if st.session_state.get("last_report"):
         st.fragment(run_every=LIVE_CHART_EVERY_S)(draw_chart)(shown_ticker, True)
     else:
         draw_chart(shown_ticker, False)
-    html = Ansi2HTMLConverter(inline=True, dark_bg=True).convert(
-        st.session_state["last_report"], full=False)
-    # st.html, NOT st.markdown — markdown ends an HTML block at the first blank line, which
-    # shredded the <pre> (the report is full of blank lines) and broke monospace alignment.
-    st.html(
-        f'<div style="background:#0e1117;border:1px solid #2a2f3a;border-radius:8px;'
-        f'padding:14px;overflow-x:auto;">'
-        f'<pre style="font-family:Cascadia Mono,Consolas,monospace;font-size:13px;'
-        f'line-height:1.35;color:#d8dee9;margin:0;">{html}</pre></div>')
+    # native section renderers (S49) — same payload the ANSI report below is printed from
+    lens_web_sections.render_all(st.session_state["last_payload"])
+    with st.expander("full text report (CLI-identical)", expanded=False):
+        html = Ansi2HTMLConverter(inline=True, dark_bg=True).convert(
+            st.session_state.get("last_ansi", ""), full=False)
+        # st.html, NOT st.markdown — markdown ends an HTML block at the first blank line, which
+        # shredded the <pre> (the report is full of blank lines) and broke monospace alignment.
+        st.html(
+            f'<div style="background:#0e1117;border:1px solid #2a2f3a;border-radius:8px;'
+            f'padding:14px;overflow-x:auto;">'
+            f'<pre style="font-family:Cascadia Mono,Consolas,monospace;font-size:13px;'
+            f'line-height:1.35;color:#d8dee9;margin:0;">{html}</pre></div>')
 else:
     st.info("Type a ticker (or pick one above) to run the lens. "
             "Checkbox blocks mirror the CLI flags; quotes are cached per session like the CLI.")

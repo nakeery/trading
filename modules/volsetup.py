@@ -10,6 +10,8 @@ those ingredients and lists every firing factor, mirroring structure.rally_drawd
 
 import math
 
+from modules.sentiment import ordinal_percentile
+
 
 def expected_move(spot, iv, dte=30, hv=None):
     """1-σ expected move from annualized IV over `dte` calendar days: spot × iv × √(dte/365).
@@ -68,10 +70,10 @@ def vol_setup(reads, squeeze, ctx, earnings=None, em=None, macro_days=None):
     # case).
     if iv_pct is not None:
         if iv_pct <= IV_PCT_LOW:
-            long_v.append(f"ATM IV at {iv_pct * 100:.0f} percentile of its history — "
+            long_v.append(f"ATM IV at the {ordinal_percentile(iv_pct)} of its history — "
                           f"vol cheap, expansion-prone")
         elif iv_pct >= IV_PCT_HIGH:
-            short_v.append(f"ATM IV at {iv_pct * 100:.0f} percentile of its history — "
+            short_v.append(f"ATM IV at the {ordinal_percentile(iv_pct)} of its history — "
                            f"vol elevated, contraction-prone")
     elif hv_rank is not None:
         if hv_rank <= IV_PCT_LOW:
@@ -94,7 +96,7 @@ def vol_setup(reads, squeeze, ctx, earnings=None, em=None, macro_days=None):
     else:
         d = (squeeze or {}).get("1D", {})
         if d.get("ok") and d.get("bb_width_pctile") is not None and d["bb_width_pctile"] <= 0.20:
-            long_v.append(f"1D Bollinger width {d['bb_width_pctile'] * 100:.0f} percentile — coiled")
+            long_v.append(f"1D Bollinger width at the {ordinal_percentile(d['bb_width_pctile'])} — coiled")
 
     # term structure
     if term is not None:
@@ -113,7 +115,7 @@ def vol_setup(reads, squeeze, ctx, earnings=None, em=None, macro_days=None):
         hm = f", typ. ±{earnings['hist_move']:.1%}" if earnings.get("hist_move") else ""
         if iv_pct is not None and iv_pct >= IV_PCT_HIGH:
             notes.append(f"earnings in {earnings['days']}d ({earnings['date']}{hm}) but ATM IV already "
-                         f"at the {iv_pct * 100:.0f} percentile — event premium likely priced; "
+                         f"at the {ordinal_percentile(iv_pct)} — event premium likely priced; "
                          f"ramp mostly done")
         else:
             long_v.append(f"earnings in {earnings['days']}d ({earnings['date']}{hm}) — known vol catalyst")

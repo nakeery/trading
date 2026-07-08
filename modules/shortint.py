@@ -29,7 +29,7 @@ import pandas as pd
 import requests
 
 from modules.pc_oi import cache_stale
-from modules.sentiment import percentile_of
+from modules.sentiment import percentile_of, ordinal_percentile
 
 CACHE_SUBDIR = "shortint_cache"
 NASDAQ_URL = "https://api.nasdaq.com/api/quote/{sym}/short-interest?assetClass=stocks"
@@ -201,9 +201,9 @@ def squeeze_read(dtc=None, si_chg=None, settle_date=None, settle_age=None,
     if svr_pct is not None and svr_now is not None:
         n = f" of {svr_n} sessions" if svr_n else ""
         if svr_pct >= SVR_HIGH_PCT:
-            fuel.append(f"short-volume ratio {svr_now:.0%} at {svr_pct * 100:.0f} percentile{n} — heavy recent shorting")
+            fuel.append(f"short-volume ratio {svr_now:.0%} at the {ordinal_percentile(svr_pct)}{n} — heavy recent shorting")
         elif svr_pct <= SVR_LOW_PCT:
-            counter.append(f"short-volume ratio {svr_now:.0%} at {svr_pct * 100:.0f} percentile{n} — pressure subdued")
+            counter.append(f"short-volume ratio {svr_now:.0%} at the {ordinal_percentile(svr_pct)}{n} — pressure subdued")
         if svr_pct >= UNDERWATER_PCT and chg_5d is not None and chg_5d >= UNDERWATER_CHG:
             fuel.append(f"elevated short volume INTO a {chg_5d:+.0%} 5-session rally — fresh shorts underwater")
 

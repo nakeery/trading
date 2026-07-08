@@ -93,6 +93,20 @@ def percentile_of(series, value, window=IV_RANK_WINDOW):
     return float((prior < value).mean())
 
 
+_SUP = {"st": "ˢᵗ", "nd": "ⁿᵈ", "rd": "ʳᵈ", "th": "ᵗʰ"}
+
+
+def ordinal_percentile(pct, word=True):
+    """0–1 fraction → '97ᵗʰ percentile' (S49 display convention: ordinal number, Unicode
+    superscript suffix — renders in terminals and in st.dataframe cells, which escape HTML —
+    the word 'percentile' in full, no % sign). 11/12/13 take ᵗʰ. None → ''."""
+    if pct is None:
+        return ""
+    n = int(round(pct * 100))
+    suf = "th" if 11 <= n % 100 <= 13 else {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+    return f"{n}{_SUP[suf]}" + (" percentile" if word else "")
+
+
 # ─────────────────────────────────────────────────────────────────────────────
 # Context assembly
 # ─────────────────────────────────────────────────────────────────────────────

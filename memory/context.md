@@ -20,6 +20,15 @@ Run:
 - Both share `lens.render_ticker(ticker, args, use_color, interactive, backdrop_base)` +
   `build_backdrop(data_dir)` (S48 extraction, byte-identical to the old CLI). `interactive`
   gates TTY cache-refresh prompts (web passes False → session caches reused; "live" forces).
+- **S49 compute/format split**: `render_ticker` = `gather_report(...)` (one picklable payload
+  dict — all section data, NO DataFrames; the risk scorecard + macro events lifted out of
+  print_report via `risk=`/`macro_events=` kwargs with compute-if-absent defaults) +
+  `render_payload(p, ...)` (prints the CLI report from the payload). CLI byte-identical
+  (verified by diff + tests 34/35). The web renders the payload NATIVELY.
+- **Percentile display (S49 user convention)**: ordinal + Unicode superscript — "97ᵗʰ
+  percentile" — via `sentiment.ordinal_percentile(pct, word=)`; applied in lens.py print
+  sites, volsetup/shortint factor strings, and all web renderers. Any new display string
+  must use the helper.
 - Auto-refresh (S36): a missing/stale indicators CSV triggers `indicators.py --ticker SYM
   --no-chart` (builds from scratch when absent) — so both tools harvest IV daily as a side
   effect of use. Needs MASSIVE_API_KEY in the launching shell or IV columns write NaN.
@@ -33,7 +42,16 @@ market beta vs SPY, location, vol regime, catalyst timing + ex-div) · OPTIONS &
 gauges with trailing percentiles + cached liquidity line · KNOWN CATALYSTS (catalysts.csv) ·
 macro ≤10d · optional blocks per flag (below).
 
-lens_web.py specifics (S48):
+lens_web.py specifics (S48, +S49 native visuals):
+- **S49**: `generate_payload(ticker, flags_key)` (st.cache_data ttl=120) returns
+  `(payload, preamble, ansi)` — gather once, then the ANSI text is printed FROM the payload
+  (one compute, two renderings). `lens_web_sections.render_all(payload)` renders native
+  sections in print order (styled multi-TF dataframe reusing the CLI heat/tint ramp, gauge
+  tables with ordinal percentiles, two-sided risk/setup panels, put/call OI grouped bars,
+  quote tables, IV curve); each renderer mirrors print_report's guards, failures degrade to a
+  warning. The full ANSI report sits in a collapsed "full text report" expander (preamble
+  prepended); payload-None → st.error with ANSI stripped. Debounce/live-fragment/session-state
+  wiring unchanged.
 - Ticker search box (`key="ticker_input"` = single source of truth) + recent-data pills that are
   ONE-SHOT events (on_change copies pick into the box then deselects — persistent pill selection
   silently overrode typed tickers before). Flag checkboxes auto-run with a 2s DEBOUNCE

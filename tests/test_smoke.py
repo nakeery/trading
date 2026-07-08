@@ -1,7 +1,7 @@
 """
 Smoke tests for the options trading ML pipeline.
 
-33 regression guards:
+36 regression guards:
   1. Signal hierarchy (backtest CSV) — STRONG ENTRY > CAUTION > STAY OUT by avg return
   2. STRONG ENTRY baseline sanity (backtest CSV) — count/return/win-rate loose bounds
   3. Vol thresholds range (QQQ indicators CSV) — positive values in expected ranges
@@ -59,6 +59,12 @@ Smoke tests for the options trading ML pipeline.
  33. lens print_report candle_style="none" — the candle panel is skipped (lens_web draws a real
      chart instead) while the header/sections still render; guards the S48 render_ticker
      extraction's print path (offline)
+ 34. lens render_payload — byte-equal to a direct print_report call from the same payload;
+     guards the S49 compute/format split's forwarding (offline)
+ 35. print_report risk=/macro_events= kwargs — supplied vs unsupplied byte-equal; guards the
+     S49 lifted-compute defaults (offline)
+ 36. gather_report payload contract — full key set, no pandas objects (the web payload is
+     pickled by st.cache_data); network helpers monkeypatched off (S49, offline)
 """
 
 
@@ -494,7 +500,18 @@ def test_sentiment_labels():
     import pandas as pd
     from modules.sentiment import (
         iv_hv_label, iv_regime_label, skew_label, term_label, pc_label, percentile_of,
+        ordinal_percentile,
     )
+
+    # ordinal-superscript percentile display (S49): 1→ˢᵗ 2→ⁿᵈ 3→ʳᵈ, 11/12/13→ᵗʰ, None→''
+    assert ordinal_percentile(0.97) == "97ᵗʰ percentile"
+    assert ordinal_percentile(0.21) == "21ˢᵗ percentile"
+    assert ordinal_percentile(0.42) == "42ⁿᵈ percentile"
+    assert ordinal_percentile(0.43) == "43ʳᵈ percentile"
+    assert ordinal_percentile(0.11) == "11ᵗʰ percentile"
+    assert ordinal_percentile(0.13) == "13ᵗʰ percentile"
+    assert ordinal_percentile(0.03, word=False) == "3ʳᵈ"
+    assert ordinal_percentile(None) == ""
 
     assert iv_hv_label(0.80) == "cheap"
     assert iv_hv_label(1.00) == "fair"
@@ -726,14 +743,14 @@ def test_vol_setup_factors():
     # factors (squeeze off-horizon, earnings priced → note), one short-vol factor, no clear edge.
     s = vol_setup(None, sq_4h, ctx(iv_pct=0.97), earnings=earn)
     assert s["long_vol"] == [], f"expected no long-vol factors, got {s['long_vol']}"
-    assert len(s["short_vol"]) == 1 and "97 percentile" in s["short_vol"][0]
+    assert len(s["short_vol"]) == 1 and "97ᵗʰ percentile" in s["short_vol"][0]
     assert s["notes"] and "premium likely priced" in s["notes"][0]
     assert "no clear vol edge" in s["net"]
 
     # (b) Cheap real IV + daily squeeze + earnings → three long-vol factors, BUY verdict,
     # S38-aligned hint (exit before the print, not "size for the crush").
     s = vol_setup(None, sq_1d, ctx(iv_pct=0.20), earnings=earn)
-    assert len(s["long_vol"]) == 3 and any("20 percentile" in f for f in s["long_vol"])
+    assert len(s["long_vol"]) == 3 and any("20ᵗʰ percentile" in f for f in s["long_vol"])
     assert any("squeeze ON (1D)" in f for f in s["long_vol"])
     assert s["short_vol"] == [] and s["notes"] == []
     assert "BUYING vol" in s["net"] and "exit BEFORE the print" in s["hint"]
@@ -1261,3 +1278,94 @@ def test_insider_form4():
     rd2 = insider_read([sell])
     assert "sales only" in rd2["net"]
     assert insider_read([])["net"].startswith("no open-market")
+
+
+# ─── Test 34: render_payload == print_report on the same payload (S49, offline) ──
+def test_render_payload_matches_print_report():
+    """lens.render_payload must be a pure forwarding of the payload into print_report — the web
+    expander's ANSI text and a direct print_report call from the same data are byte-equal."""
+    import contextlib
+    import io
+    from lens import print_report, render_payload, rally_drawdown_risk
+
+    last_bar = {"open": 100.0, "high": 103.0, "low": 99.0, "close": 102.0, "prev_close": 100.5}
+    panel = [("2026-07-06", 100.0, 103.0, 99.0, 102.0, 100.5),
+             ("2026-07-07", 102.0, 104.0, 101.0, 103.0, 102.0)]
+    risk = rally_drawdown_risk({}, profile=None, ctx=None, divergences={})
+    payload = {"ticker": "TEST", "reads": {}, "divs": {}, "summary": {"synthesis": "mixed — fixture"},
+               "profile": None, "notes": ["fixture note"], "last_bar": last_bar,
+               "as_of": "2026-07-07", "panel_bars": panel, "ctx": None, "backdrop": "SPY: fixture",
+               "geo": None, "pcoi": None, "vol": None, "live": None, "setup": None,
+               "squeeze": None, "insider": None, "callq": None, "liq": None, "cats": [],
+               "risk": risk, "macro_events": {}, "thesis": "bullish", "level": 100.0,
+               "live_iv": None}
+
+    buf1 = io.StringIO()
+    with contextlib.redirect_stdout(buf1):
+        render_payload(payload, use_color=False, candle_style="none")
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        print_report("TEST", reads={}, divs={}, summary={"synthesis": "mixed — fixture"},
+                     profile=None, notes=["fixture note"], last_bar=last_bar, as_of="2026-07-07",
+                     backdrop="SPY: fixture", thesis="bullish", level=100.0, color=False,
+                     candle_style="none", panel_bars=panel, cats=[],
+                     risk=risk, macro_events={})
+    assert buf1.getvalue() == buf2.getvalue()
+    assert "THESIS CHECK" in buf1.getvalue()          # thesis flowed through the payload
+
+
+# ─── Test 35: risk/macro_events kwargs preserve print_report output (S49, offline) ──
+def test_print_report_risk_kwarg_identity():
+    """Supplying risk= and macro_events= (the two computes S49 lifted into gather_report) must
+    produce byte-identical output vs the unsupplied path where print_report computes them itself
+    — this is the CLI byte-identity guard for the compute/format split."""
+    import contextlib
+    import io
+    from lens import print_report, rally_drawdown_risk
+    from modules.econ_calendar import next_event_per_series
+
+    last_bar = {"open": 100.0, "high": 103.0, "low": 99.0, "close": 102.0, "prev_close": 100.5}
+    kw = dict(reads={}, divs={}, summary={"synthesis": "mixed — fixture"}, profile=None,
+              notes=[], last_bar=last_bar, as_of="2026-07-07", color=False,
+              candle_style="none", thesis="bullish")
+
+    buf1 = io.StringIO()
+    with contextlib.redirect_stdout(buf1):
+        print_report("TEST", **kw)                     # unsupplied → computes internally
+    risk = rally_drawdown_risk({}, profile=None, ctx=None, divergences={})
+    try:
+        ev = next_event_per_series(data_dir="data")    # same call/params print_report uses
+    except Exception:
+        ev = None
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        print_report("TEST", **kw, risk=risk, macro_events=ev)
+    assert buf1.getvalue() == buf2.getvalue()
+
+
+# ─── Test 36: gather_report payload contract (S49, offline via monkeypatch) ──────
+def test_gather_payload_keys(monkeypatch):
+    """gather_report returns the full payload key set with NO pandas objects (st.cache_data
+    pickles the payload — DataFrames would bloat the web cache). Network-touching best-effort
+    helpers are monkeypatched off; the QQQ indicators CSV drives the frames."""
+    import pandas as pd
+    from types import SimpleNamespace
+    import lens
+
+    for name in ("next_earnings", "next_ex_dividend", "fetch_rs", "fetch_beta"):
+        monkeypatch.setattr(lens, name, None, raising=False)
+
+    args = SimpleNamespace(ticker=None, thesis=None, level=None, no_intraday=True, no_vix=True,
+                           geo=False, no_color=True, candle="none", candle_px=128, prev=10,
+                           data_dir="data", no_refresh=True, refresh=False, pc_oi=None,
+                           insider=False, squeeze=False, live=False, vol=False, call=False)
+    payload = lens.gather_report("QQQ", args, interactive=False, backdrop_base=None)
+    assert payload is not None
+
+    expected = {"ticker", "reads", "divs", "summary", "profile", "notes", "last_bar", "as_of",
+                "panel_bars", "ctx", "backdrop", "geo", "pcoi", "vol", "live", "setup",
+                "squeeze", "insider", "callq", "liq", "cats", "risk", "macro_events",
+                "thesis", "level", "live_iv"}
+    assert set(payload.keys()) == expected
+    assert not any(isinstance(v, (pd.DataFrame, pd.Series)) for v in payload.values())
+    assert payload["reads"] and payload["risk"] is not None      # frames were read + risk lifted
