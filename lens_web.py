@@ -27,8 +27,14 @@ from ansi2html import Ansi2HTMLConverter
 
 import lens
 import lens_web_sections
+from modules.features import compute_hv_features
 from modules.timeframes import _load_daily, fetch_live_bar, append_live_bar
 from modules.volume_profile import volume_profile
+
+try:
+    from modules.setupcheck import TIER1_MACRO
+except Exception:                                     # pragma: no cover — optional dep path
+    TIER1_MACRO = {"FOMC", "CPI", "NFP", "PCE"}
 
 DATA_DIR = "data"
 CHART_BARS = 120
@@ -105,12 +111,274 @@ def load_profile(ticker):
         return None
 
 
-def _candle_fig(df, overlays=(), show_volume=False, price_line=None, vprofile=None):
+@st.cache_data(ttl=600, show_spinner=False)
+def load_iv_history(ticker, bars=252):
+    """Trailing IV/HV history for the chart under the candles (S50) — ZERO network: indicators
+    CSV only (None for yfinance-fallback tickers / CSVs without the harvested IV columns).
+    HV_20 is computed on load exactly as the gauges do (compute_hv_features)."""
+    path = os.path.join(DATA_DIR, f"{ticker.lower()}_indicators.csv")
+    if not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_csv(path, index_col=0, parse_dates=True)
+        if "atm_iv_30d" not in df.columns or "Close" not in df.columns:
+            return None
+        t = compute_hv_features(df).tail(bars)
+
+        def col(name):
+            if name not in t.columns:
+                return [None] * len(t)
+            return [None if pd.isna(v) else float(v) for v in t[name]]
+
+        out = {"dates": [d.date().isoformat() for d in t.index],
+               "iv30": col("atm_iv_30d"), "iv_event": col("atm_iv_event"),
+               "hv20": col("HV_20")}
+        return out if any(v is not None for v in out["iv30"]) else None
+    except Exception:
+        return None
+
+
+def _iv_fig(hist):
+    """IV-vs-HV history figure: harvested ATM IV (30d) vs realized HV-20, the event-tenor IV
+    where stamped, and shaded pre-earnings windows (contiguous runs of the S44 atm_iv_event
+    stamp — earnings markers with no network call). Returns None when it can't build."""
+    try:
+        import plotly.graph_objects as go
+        d, iv, hv, ev = hist["dates"], hist["iv30"], hist["hv20"], hist["iv_event"]
+        if len(d) < 2:
+            return None
+        fig = go.Figure()
+        start = None
+        for i, v in enumerate(ev + [None]):                # sentinel closes a trailing run
+            if v is not None and start is None:
+                start = i
+            elif v is None and start is not None:
+                fig.add_vrect(x0=d[start], x1=d[i - 1],
+                              fillcolor="rgba(224,166,58,0.08)", line_width=0)
+                start = None
+        fig.add_trace(go.Scatter(x=d, y=hv, name="HV-20 (realized)", mode="lines",
+                                 line=dict(color="#4ea3d8", width=1.2)))
+        fig.add_trace(go.Scatter(x=d, y=iv, name="ATM IV (30d)", mode="lines",
+                                 line=dict(color="#e0a63a", width=1.4)))
+        if any(v is not None for v in ev):
+            fig.add_trace(go.Scatter(x=d, y=ev, name="event-expiry IV", mode="markers",
+                                     marker=dict(color="#d6ba2e", size=3)))
+        fig.update_layout(height=230, margin=dict(l=10, r=10, t=10, b=10),
+                          template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
+                          plot_bgcolor="rgba(14,17,23,1)", yaxis=dict(tickformat=".0%"),
+                          legend=dict(orientation="h", y=1.12, x=0, font=dict(size=11)))
+        return fig
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_ledger(ticker, rows=30):
+    """Tail of entry.py's forward signal ledger (S30 — one row per as-of run date) — zero
+    network; None when the ticker has no ledger yet."""
+    path = os.path.join(DATA_DIR, f"{ticker.lower()}_signal_ledger.csv")
+    if not os.path.exists(path):
+        return None
+    try:
+        df = pd.read_csv(path)
+        return df.tail(rows) if len(df) else None
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_econ_calendar():
+    """Two-month econ-release window + per-series coverage + cache age for the calendar
+    expander (S51; S52 adds per-event URL + the headline result string once the print is
+    out) — ZERO network: reads data/econ_calendar.csv + econ_results.json; the refresh button
+    is the only network path. None when the module/cache is unavailable."""
+    try:
+        from modules.econ_calendar import (events_in_range, coverage_end_per_series,
+                                           load_results, headline_result, ALL_SERIES,
+                                           HEADLINE_SERIES)
+        today = pd.Timestamp.today().normalize()
+        start = today.replace(day=1)
+        end = start + pd.offsets.MonthBegin(2) - pd.Timedelta(days=1)   # last day of next month
+        ev = events_in_range(start, end)
+        results, _fetched = load_results(DATA_DIR)
+        rid = {name: r for name, r, _ in ALL_SERIES}
+        events = []
+        for d, s, t, rn in zip(ev["date"], ev["series"], ev["tier"], ev["release_name"]):
+            s = str(s)
+            # chip → the FRED GRAPH of the headline data series (the /series/ page opens on
+            # the interactive chart; FOMC lands on the DFEDTARU target-rate step chart);
+            # release page only as a fallback for series without a headline mapping
+            url = (f"https://fred.stlouisfed.org/series/{HEADLINE_SERIES[s][0]}"
+                   if s in HEADLINE_SERIES
+                   else f"https://fred.stlouisfed.org/release?rid={rid[s]}" if s in rid
+                   else None)
+            res = headline_result(s, d, results.get(s) or [])
+            events.append((d.date().isoformat(), s, int(t), url, res, str(rn)))
+        cov = {k: (v.date().isoformat() if v is not None else None)
+               for k, v in coverage_end_per_series().items()}
+        path = os.path.join(DATA_DIR, "econ_calendar.csv")
+        mtime = os.path.getmtime(path) if os.path.exists(path) else None
+        return {"events": events, "coverage": cov, "mtime": mtime,
+                "grid_end": end.date().isoformat()}
+    except Exception:
+        return None
+
+
+ECON_TIER_STYLE = {1: ("rgba(224,166,58,0.18)", "#e0a63a"),    # Tier 1 — amber (FOMC/CPI/NFP/PCE)
+                   2: ("rgba(78,163,216,0.15)", "#9fb4d0")}    # Tier 2 — blue-gray
+
+
+def _chip_html(s, t, url, res, rn):
+    """One release chip: tier-colored, linked to the official release page (new tab), with
+    the headline print as a second line once it's out (and the full release name + result in
+    the hover tooltip)."""
+    import html as _html
+    bg, fg = ECON_TIER_STYLE.get(t, ECON_TIER_STYLE[2])
+    tip = _html.escape(rn + (f" — {res}" if res else " — scheduled"), quote=True)
+    body = _html.escape(s)
+    if res:
+        body += (f'<div style="color:#d8dee9;font-size:0.92em;font-weight:400;">'
+                 f'{_html.escape(res)}</div>')
+    chip = (f'<div title="{tip}" style="background:{bg};color:{fg};border-radius:4px;'
+            f'font-size:0.7em;padding:0 3px;margin-top:2px;text-align:center;'
+            f'overflow:hidden;">{body}</div>')
+    if url:
+        return f'<a href="{url}" target="_blank" style="text-decoration:none;">{chip}</a>'
+    return chip
+
+
+def _month_grid_html(year, month, events_by_day, today_iso):
+    """One month as a Mon–Fri HTML grid (releases never land on weekends): day number +
+    tier-colored release chips (linked, with headline results once out — S52), today
+    outlined. Themed like the report panels."""
+    import calendar as _cal
+    th = "".join(f'<th style="color:#8b95a7;font-size:0.7em;font-weight:400;'
+                 f'padding:2px;">{d}</th>' for d in ("Mon", "Tue", "Wed", "Thu", "Fri"))
+    rows = []
+    for week in _cal.monthcalendar(year, month):
+        cells = []
+        for day in week[:5]:
+            if day == 0:
+                cells.append('<td style="border:1px solid transparent;"></td>')
+                continue
+            iso = f"{year:04d}-{month:02d}-{day:02d}"
+            chips = "".join(_chip_html(s, t, url, res, rn)
+                            for s, t, url, res, rn in events_by_day.get(iso, ()))
+            border = "1.5px solid #e8c547" if iso == today_iso else "1px solid #2a2f3a"
+            cells.append(f'<td style="border:{border};vertical-align:top;padding:3px;'
+                         f'height:54px;"><div style="color:#8b95a7;font-size:0.7em;">{day}'
+                         f'</div>{chips}</td>')
+        rows.append("<tr>" + "".join(cells) + "</tr>")
+    return (f'<div style="color:#d8dee9;font-size:0.88em;margin:2px 0 4px;">'
+            f'{_cal.month_name[month]} {year}</div>'
+            f'<table style="border-collapse:collapse;width:100%;table-layout:fixed;">'
+            f'<thead><tr>{th}</tr></thead><tbody>{"".join(rows)}</tbody></table>')
+
+
+def render_econ_calendar():
+    """Econ-calendar expander (S51) — market-level, independent of the ticker report. Where it
+    appears on the page = where this is CALLED in the script run (Streamlit renders top-to-
+    bottom in execution order): currently right below the header tiles' 'state characterization'
+    caption, and after the empty-state message when no report has run yet."""
+    with st.expander("📅 economic calendar — FRED release dates"):
+        try:
+            from modules.econ_calendar import refresh_if_stale, fetch_release_results
+        except Exception:
+            refresh_if_stale = None
+        bcol, ccol = st.columns([1, 3])
+        if refresh_if_stale is not None and bcol.button("↻ refresh from FRED"):
+            with st.spinner("refreshing release dates + results from FRED…"):
+                # max_age_days=-1 is a TRUE force (age is integer days, so 0 <= 0 would count a
+                # same-day cache as fresh); refresh_if_stale never raises, never overwrites a
+                # good cache with a worse one, and reports no-key/failure cleanly. stdout is
+                # captured: the module prints per-series progress with ✓ marks, which
+                # UnicodeEncodeError under a cp1252 console (streamlit without -X utf8).
+                # fetch_release_results (S52) rides the same click — headline prints for the
+                # past chips; no default-on network.
+                with contextlib.redirect_stdout(io.StringIO()):
+                    status, msg = refresh_if_stale(max_age_days=-1)
+                    _r_status, r_msg = fetch_release_results(DATA_DIR)
+            load_econ_calendar.clear()
+            (st.success if status == "refreshed"
+             else st.error if ("failed" in status or "missing" in status)
+             else st.warning)(f"{msg} · {r_msg}")
+        cal = load_econ_calendar()
+        if cal is None:
+            st.warning("econ calendar unavailable (module import / cache read failed)")
+            return
+        if cal["mtime"]:
+            age_d = (time.time() - cal["mtime"]) / 86400
+            ccol.caption(f"cache refreshed {age_d:.1f}d ago · amber = Tier 1 (FOMC/CPI/NFP/PCE), "
+                         f"blue = Tier 2 · chips link to the FRED graph of the headline series; "
+                         f"past chips show the headline print (several numbers ride each "
+                         f"release — this is the market's shorthand) · the price chart marks "
+                         f"Tier-1 dates ≤{EVENT_HORIZON_D}d")
+        if not cal["events"]:
+            st.warning("no release dates in the two-month window — the cache has likely gone "
+                       "stale; refresh from FRED (needs $env:FRED_API_KEY, weekly cadence)")
+        events_by_day = {}
+        for iso, s, t, url, res, rn in cal["events"]:
+            events_by_day.setdefault(iso, []).append((s, t, url, res, rn))
+        today = pd.Timestamp.today().normalize()
+        nxt = today.replace(day=1) + pd.offsets.MonthBegin(1)
+        today_iso = today.date().isoformat()
+        m1, m2 = st.columns(2)
+        with m1:
+            st.html(_month_grid_html(today.year, today.month, events_by_day, today_iso))
+        with m2:
+            st.html(_month_grid_html(nxt.year, nxt.month, events_by_day, today_iso))
+        short = [f"{k}: {v or 'no data'}" for k, v in sorted(cal["coverage"].items())
+                 if v is None or v < cal["grid_end"]]
+        if short:
+            st.caption("series whose forward coverage ends inside the grid — "
+                       + " · ".join(short))
+
+
+EVENT_HORIZON_D = 30   # chart event markers: only events this close — further dates would
+                       # stretch the x-axis and squeeze the candles
+
+
+def _event_markers(p, horizon_days=EVENT_HORIZON_D):
+    """[(date_iso, label, color)] of upcoming events from payload data the report already
+    carries (S50): earnings (`earn`), ex-div (`exd`, '~' when cadence-estimated), Tier-1 macro
+    (`macro_events`), and catalysts.csv binary events (`cats`, e.g. PDUFA)."""
+    if not p:
+        return []
+    out = []
+    earn = p.get("earn")
+    if earn and earn.get("date") and earn.get("days") is not None \
+            and 0 <= earn["days"] <= horizon_days:
+        out.append((earn["date"], "earnings", "#e0a63a"))
+    exd = p.get("exd")
+    if exd and exd.get("date") and exd.get("days") is not None \
+            and 0 <= exd["days"] <= horizon_days:
+        out.append((exd["date"], "ex-div" + ("~" if exd.get("est") else ""), "#9aa4b2"))
+    for name, val in (p.get("macro_events") or {}).items():
+        try:
+            d, days = val
+        except Exception:
+            continue
+        if name in TIER1_MACRO and d is not None and days is not None \
+                and 0 <= days <= horizon_days:
+            out.append((pd.Timestamp(d).date().isoformat(), name, "#8b95a7"))
+    for c in p.get("cats") or []:
+        try:
+            d_iso, days, typ = c[0], c[1], c[2]
+        except Exception:
+            continue
+        if 0 <= days <= horizon_days:
+            out.append((d_iso, typ or "catalyst", "#d83c34"))
+    return sorted(out)
+
+
+def _candle_fig(df, overlays=(), show_volume=False, price_line=None, vprofile=None,
+                events=()):
     """Plotly candlestick from a daily OHLCV frame + optional indicator overlays
-    [(name, series, color, dash), …], a volume sub-pane, a dotted last/live price line, and
+    [(name, series, color, dash), …], a volume sub-pane, a dotted last/live price line,
     volume-profile aspects (`vprofile` = profile dict + an "aspects" set: value area band, POC
-    line, HVN/LVN levels, right-edge volume-at-price histogram). Returns None when it can't
-    build."""
+    line, HVN/LVN levels, right-edge volume-at-price histogram), and upcoming-event markers
+    (`events` = [(date_iso, label, color), …] — dashed vlines, S50). Returns None when it
+    can't build."""
     try:
         import plotly.graph_objects as go
         from plotly.subplots import make_subplots
@@ -143,7 +411,8 @@ def _candle_fig(df, overlays=(), show_volume=False, price_line=None, vprofile=No
             fig.add_trace(go.Scatter(x=series.index, y=series, name=name, mode="lines",
                                      line=dict(color=color, width=1.2, dash=dash)), row=1, col=1)
         if show_volume:
-            up = (df["Close"] >= df["Close"].shift(1)).fillna(True)
+            # same COLOR axis as the candles (close vs prior close, first bar falls back to
+            # its open) — `up` from the candle masks above already encodes it
             colors = ["rgba(94,196,94,0.55)" if u else "rgba(216,60,52,0.55)" for u in up]
             fig.add_trace(go.Bar(x=df.index, y=df["Volume"], marker_color=colors,
                                  showlegend=False, name="volume"), row=2, col=1)
@@ -205,6 +474,20 @@ def _candle_fig(df, overlays=(), show_volume=False, price_line=None, vprofile=No
                     fig.update_layout(xaxis3=dict(overlaying="x", range=[max(vols) * 3.5, 0],
                                                   showgrid=False, showticklabels=False,
                                                   visible=False))
+        if events:
+            # upcoming events (earnings/ex-div/Tier-1 macro/catalysts) as dashed vlines; an
+            # invisible marker at the furthest date pulls the x-range forward so future events
+            # are visible right of the last candle
+            for d_iso, label, color in events:
+                fig.add_vline(x=d_iso, line_dash="dot", line_width=1, line_color=color,
+                              row=1, col=1,
+                              annotation=dict(text=label, textangle=-90, showarrow=False,
+                                              font=dict(color=color, size=9)))
+            furthest = max(e[0] for e in events)
+            if furthest > df.index[-1].date().isoformat():
+                fig.add_trace(go.Scatter(x=[furthest], y=[float(df["Close"].iloc[-1])],
+                                         mode="markers", marker=dict(opacity=0),
+                                         showlegend=False, hoverinfo="skip"), row=1, col=1)
         if price_line is not None:
             # price-tag style: label anchored LEFT at the plot's right edge, extending into the
             # widened right margin — never clipped by the plot area
@@ -224,16 +507,19 @@ def _candle_fig(df, overlays=(), show_volume=False, price_line=None, vprofile=No
         return None
 
 
-def draw_chart(ticker, live=False):
+def draw_chart(ticker, live=False, payload=None):
     """Chart section. In live mode the latest Tradier quote becomes a provisional today-bar
     (same fetch_live_bar/append_live_bar machinery as the CLI --live; display-only) with a
     LIVE price/timestamp caption — this function runs inside a st.fragment on a timer, and the
-    live price line rides each tick. Indicator checkboxes are DISPLAY-ONLY: they rerun just this
-    section (fragment scope), never the report or its debounce."""
+    live price line AND the header metric tiles beneath the chart ride each tick (render_all
+    skips sec_header in live mode; `payload` is the fallback when the quote is unavailable).
+    Indicator checkboxes are DISPLAY-ONLY: they rerun just this section (fragment scope), never
+    the report or its debounce."""
     df = load_daily_tail(ticker).copy()
     live_last = None
+    bar = None
+    prev = None
     if live:
-        bar = None
         try:
             bar = fetch_live_bar(ticker)
         except Exception:
@@ -296,9 +582,26 @@ def draw_chart(ticker, live=False):
     price = live_last if live_last is not None else float(view["Close"].iloc[-1])
     fig = _candle_fig(view, overlays=[(n, s.tail(CHART_BARS), c, d) for n, s, c, d in ov],
                       show_volume=vol_pane, price_line=price if pline else None,
-                      vprofile=vprofile)
+                      vprofile=vprofile, events=_event_markers(payload))
     if fig is not None:
         st.plotly_chart(fig, use_container_width=True, key=f"chart_{ticker}")
+
+    if live:
+        # header metric tiles ride the same quote as the chart (render_all skips sec_header in
+        # live mode); payload-shaped dict so sec_header's LIVE/close labeling is reused as-is
+        try:
+            if bar:
+                lens_web_sections.sec_header({
+                    "ticker": ticker, "as_of": str(df.index[-1].date()),
+                    "last_bar": {"close": live_last, "prev_close": prev, "open": bar["Open"],
+                                 "high": bar["High"], "low": bar["Low"]},
+                    "live": {"applied": True, "in_progress": bar.get("in_progress"),
+                             "hhmm": bar.get("hhmm")}})
+            elif payload:
+                lens_web_sections.sec_header(payload)   # no quote — tiles hold the last close
+        except Exception as e:
+            st.caption(f"header tiles unavailable ({type(e).__name__}: {e}) — "
+                       f"see the full text report below")
 
 
 # ── controls ─────────────────────────────────────────────────────────────────
@@ -365,7 +668,10 @@ if ticker and run_clicked:
     st.session_state.pop("pending_key", None)
 elif run_clicked and not ticker:
     st.warning("enter a ticker first (or pick one from the recent-data pills)")
-elif ticker and key != st.session_state.get("last_key"):
+elif ticker and key != st.session_state.get("last_key") \
+        and key != st.session_state.get("failed_key"):
+    # failed_key: a key whose generate failed doesn't auto-retry on every rerun (each overlay
+    # toggle would otherwise eat the 2s debounce + re-error); Run retries it explicitly
     now = time.time()
     if st.session_state.get("pending_key") != key:
         st.session_state["pending_key"] = key
@@ -393,27 +699,60 @@ if should_generate:
         st.session_state["last_key"] = key
         st.session_state["last_payload"] = payload
         st.session_state["last_ansi"] = preamble + ansi
+        st.session_state.pop("failed_key", None)
         # the generate may have auto-refreshed the indicators CSV (new close stamped) — drop the
-        # chart caches so the candles/profile always match the report's data vintage
+        # chart caches so the candles/profile/IV-history always match the report's data vintage
         load_daily_tail.clear()
         load_profile.clear()
-    elif preamble:
-        # gather printed the load-error line instead of returning a payload; the subprocess
-        # noise in it can carry ANSI escapes — strip them (st.error shows them raw)
-        st.error(re.sub(r"\x1b\[[0-9;]*m", "", preamble).strip())
+        load_iv_history.clear()
+        load_ledger.clear()
+    else:
+        st.session_state["failed_key"] = key
+        if preamble:
+            # gather printed the load-error line instead of returning a payload; the subprocess
+            # noise in it can carry ANSI escapes — strip them (st.error shows them raw)
+            st.error(re.sub(r"\x1b\[[0-9;]*m", "", preamble).strip())
 
 # ── display (every rerun, from session state) ────────────────────────────────
 if st.session_state.get("last_payload"):
     shown_ticker = st.session_state["last_key"][0]
     shown_live = bool(dict(st.session_state["last_key"][1]).get("live"))
     if shown_live:
-        # continuous live chart: st.fragment reruns ONLY this section every N seconds —
-        # one Tradier quote per tick; the report below stays as rendered.
-        st.fragment(run_every=LIVE_CHART_EVERY_S)(draw_chart)(shown_ticker, True)
+        # continuous live chart + header tiles: st.fragment reruns ONLY this section every N
+        # seconds — one Tradier quote per tick; the report below stays as rendered (its own
+        # sec_header is skipped — the fragment renders the live tiles beneath the chart).
+        st.fragment(run_every=LIVE_CHART_EVERY_S)(draw_chart)(
+            shown_ticker, True, st.session_state["last_payload"])
     else:
-        draw_chart(shown_ticker, False)
-    # native section renderers (S49) — same payload the ANSI report below is printed from
-    lens_web_sections.render_all(st.session_state["last_payload"])
+        draw_chart(shown_ticker, False, st.session_state["last_payload"])
+        # header tiles drawn here rather than via render_all (mirrors live mode, where the
+        # fragment draws them) so the calendar below slots in right under the header's
+        # 'state characterization' caption in BOTH modes
+        try:
+            lens_web_sections.sec_header(st.session_state["last_payload"])
+        except Exception as e:
+            st.caption(f"header tiles unavailable ({type(e).__name__}: {e}) — "
+                       f"see the full text report below")
+    render_econ_calendar()
+    # IV vs realized-vol history (S50) — zero network (indicators CSV); skipped silently for
+    # tickers without harvested IV columns
+    hist = load_iv_history(shown_ticker)
+    fig_iv = _iv_fig(hist) if hist else None
+    if fig_iv is not None:
+        lens_web_sections._sec("IV vs REALIZED VOL — trailing year")
+        st.plotly_chart(fig_iv, use_container_width=True, key=f"ivhist_{shown_ticker}")
+        st.caption("ATM IV (30d, harvested) vs HV-20 (realized) · shaded spans = pre-earnings "
+                   "event-IV stamp windows (S44) · gaps = sessions with no harvest")
+    # native section renderers (S49) — same payload the ANSI report below is printed from;
+    # the header is always drawn above (fragment in live mode, direct call otherwise)
+    lens_web_sections.render_all(st.session_state["last_payload"], skip_header=True)
+    ledger = load_ledger(shown_ticker)
+    if ledger is not None:
+        with st.expander(f"signal ledger — entry.py forward ledger, last {len(ledger)} rows "
+                         f"(unscored)"):
+            st.dataframe(ledger, hide_index=True, width="stretch")
+            st.caption("one row per as-of run date (S30); not yet joined to realized returns — "
+                       "the standing scorer TODO")
     with st.expander("full text report (CLI-identical)", expanded=False):
         html = Ansi2HTMLConverter(inline=True, dark_bg=True).convert(
             st.session_state.get("last_ansi", ""), full=False)
@@ -427,3 +766,5 @@ if st.session_state.get("last_payload"):
 else:
     st.info("Type a ticker (or pick one above) to run the lens. "
             "Checkbox blocks mirror the CLI flags; quotes are cached per session like the CLI.")
+    render_econ_calendar()      # still reachable before the first report
+

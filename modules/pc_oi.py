@@ -171,14 +171,37 @@ def is_monthly_expiry(d):
 # ─────────────────────────────────────────
 # FETCH — sum put/call OI and volume per future expiry off the live chain
 # ─────────────────────────────────────────
+def strike_profile(chain, spot=None, band=0.20):
+    """Per-strike OI aggregation of ONE expiry's chain (pure — unit-testable): returns
+    [[strike, call_oi, put_oi], …] sorted by strike, filtered to spot·(1±band) when `spot` is
+    given (uncapped otherwise). [] when the chain lacks a strike column. Feeds the web UI's
+    OI-walls profile (S50) — the per-strike dimension pc_by_expiry otherwise sums away."""
+    if chain is None or getattr(chain, "empty", True) or "strike" not in chain.columns:
+        return []
+    strikes = pd.to_numeric(chain["strike"], errors="coerce")
+    ok = strikes.notna()
+    if spot:
+        ok &= (strikes >= spot * (1 - band)) & (strikes <= spot * (1 + band))
+    if not ok.any():
+        return []
+    oi = pd.to_numeric(chain["open_interest"], errors="coerce").fillna(0)[ok]
+    strikes, types = strikes[ok], chain["option_type"][ok]
+    calls = oi.where(types == "call", 0.0).groupby(strikes).sum()
+    puts  = oi.where(types == "put", 0.0).groupby(strikes).sum()
+    return [[float(k), float(calls.get(k, 0.0)), float(puts.get(k, 0.0))]
+            for k in sorted(set(calls.index) | set(puts.index))]
+
+
 def pc_by_expiry(ticker, date_filter=None, dte_min=None, dte_max=None,
-                 monthly_only=False, quiet=False):
+                 monthly_only=False, quiet=False, spot=None):
     """
     Returns a list of dicts sorted by DTE:
-      {expiry, dte, call_oi, put_oi, pc, call_vol, put_vol, pc_vol}
+      {expiry, dte, call_oi, put_oi, pc, call_vol, put_vol, pc_vol, by_strike}
     One Tradier chain call per expiry. Narrowing (date_filter / dte range / monthly_only) is
     applied to the expiry list BEFORE fetching, so it also cuts the number of network calls.
-    `quiet` suppresses the per-expiry progress prints (used by lens.py).
+    `quiet` suppresses the per-expiry progress prints (used by lens.py). `spot` bounds the
+    per-strike by_strike capture to ±20% of it (S50; consumers must .get() it — cached rows
+    from before S50 don't carry the key).
     """
     today = datetime.date.today()
 
@@ -243,7 +266,8 @@ def pc_by_expiry(ticker, date_filter=None, dte_min=None, dte_max=None,
 
         rows.append({"expiry": exp, "dte": dte,
                      "call_oi": call_oi, "put_oi": put_oi, "pc": pc,
-                     "call_vol": call_vol, "put_vol": put_vol, "pc_vol": pc_vol})
+                     "call_vol": call_vol, "put_vol": put_vol, "pc_vol": pc_vol,
+                     "by_strike": strike_profile(chain, spot)})
     return rows
 
 
@@ -304,7 +328,7 @@ def gather_pc_oi(ticker, preset="all", monthly=False, interactive=False, data_di
     try:
         price = get_current_price(ticker)
         rows  = pc_by_expiry(ticker, dte_min=dte_min, dte_max=dte_max,
-                             monthly_only=monthly, quiet=quiet)
+                             monthly_only=monthly, quiet=quiet, spot=price)
     except Exception:
         if cache is not None:                              # fetch failed → fall back to cache
             return _result(cache.get("price"), _rehydrate(cache["rows"]), cache["as_of"], stale, True)

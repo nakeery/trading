@@ -93,6 +93,19 @@ def percentile_of(series, value, window=IV_RANK_WINDOW):
     return float((prior < value).mean())
 
 
+def spark_of(series, window=IV_RANK_WINDOW, points=60):
+    """Trailing-`window` slice of a gauge's own series downsampled to ≤`points` floats — the
+    sparkline behind the percentile (S50 web UI). Same ≥63-obs floor as percentile_of so a spark
+    never appears without its percentile. Sampled from the END backwards so the latest value
+    always survives. Plain list (payload stays picklable); [] when too thin."""
+    s = pd.Series(series).dropna()
+    if len(s) < 63:
+        return []
+    s = s.iloc[-window:]
+    step = max(1, -(-len(s) // points))                # ceil → result never exceeds `points`
+    return [float(v) for v in s.iloc[::-1][::step][::-1]]
+
+
 _SUP = {"st": "ˢᵗ", "nd": "ⁿᵈ", "rd": "ʳᵈ", "th": "ᵗʰ"}
 
 
@@ -187,9 +200,11 @@ def gather_context(ticker, data_dir="data", with_vix=True):
         iv_stale = _stale(atm_iv_d)
         gauges.append({"group": "OPTIONS", "name": "IV/HV ratio", "value": ratio, "fmt": "{:.2f}",
                        "label": iv_hv_label(ratio) + iv_stale,
-                       "pct": percentile_of(ratio_series, ratio)})
+                       "pct": percentile_of(ratio_series, ratio),
+                       "spark": spark_of(ratio_series)})
         gauges.append({"group": "OPTIONS", "name": "ATM IV (30d)", "value": atm_iv, "fmt": "{:.1%}",
-                       "label": iv_stale.strip(), "pct": percentile_of(df["atm_iv_30d"], atm_iv)})
+                       "label": iv_stale.strip(), "pct": percentile_of(df["atm_iv_30d"], atm_iv),
+                       "spark": spark_of(df["atm_iv_30d"])})
     else:
         notes.append("atm_iv_30d NaN — options-IV block skipped (re-run indicators.py to harvest).")
 
@@ -200,20 +215,24 @@ def gather_context(ticker, data_dir="data", with_vix=True):
         ratio_lbl = f"{atm_iv_l / atm_iv:.2f}x front" if atm_iv else ""
         gauges.append({"group": "OPTIONS", "name": "ATM IV (180d)", "value": atm_iv_l,
                        "fmt": "{:.1%}", "label": (ratio_lbl + _stale(atm_iv_l_d)).strip(),
-                       "pct": percentile_of(df["atm_iv_180d"], atm_iv_l)})
+                       "pct": percentile_of(df["atm_iv_180d"], atm_iv_l),
+                       "spark": spark_of(df["atm_iv_180d"])})
 
     if skew is not None:
         gauges.append({"group": "OPTIONS", "name": "25Δ skew (P-C)", "value": skew, "fmt": "{:+.3f}",
                        "label": skew_label(skew) + _stale(skew_d),
-                       "pct": percentile_of(df["iv_skew_25d"], skew)})
+                       "pct": percentile_of(df["iv_skew_25d"], skew),
+                       "spark": spark_of(df["iv_skew_25d"])})
     if term is not None:
         gauges.append({"group": "OPTIONS", "name": "Term structure", "value": term, "fmt": "{:.2f}",
                        "label": term_label(term) + _stale(term_d),
-                       "pct": percentile_of(df["term_structure"], term)})
+                       "pct": percentile_of(df["term_structure"], term),
+                       "spark": spark_of(df["term_structure"])})
     if pc_oi is not None:
         gauges.append({"group": "OPTIONS", "name": "Put/Call OI", "value": pc_oi, "fmt": "{:.2f}",
                        "label": pc_label(pc_oi) + _stale(pc_oi_d),
-                       "pct": percentile_of(df["put_call_oi_ratio"], pc_oi)})
+                       "pct": percentile_of(df["put_call_oi_ratio"], pc_oi),
+                       "spark": spark_of(df["put_call_oi_ratio"])})
     if stale_ages:
         notes.append(f"harvested options gauges lag the CSV by up to {max(stale_ages)} sessions "
                      f"(flagged 'stale') — re-run indicators.py to refresh the Massive harvest.")
@@ -226,7 +245,8 @@ def gather_context(ticker, data_dir="data", with_vix=True):
     # ── VOLATILITY (HV-derived, full history) ──
     if hv_20 is not None:
         gauges.append({"group": "VOL", "name": "HV-20 (annualized)", "value": hv_20, "fmt": "{:.1%}",
-                       "label": "", "pct": percentile_of(df["HV_20"], hv_20)})
+                       "label": "", "pct": percentile_of(df["HV_20"], hv_20),
+                       "spark": spark_of(df["HV_20"])})
     # NOTE: IV_rank/IV_pct are the HV-20 PROXY (features.py) — realized vol's position in its own
     # 1y range, NOT the harvested ATM IV's. Named accordingly so they can't be read as real IV (S40).
     if iv_rank is not None:
@@ -252,7 +272,8 @@ def gather_context(ticker, data_dir="data", with_vix=True):
                 vlab = ("stress (>=25)" if vix >= REGIME_VIX_STRESS
                         else "calm (<18)" if vix < REGIME_VIX_NORMAL else "normal")
                 gauges.append({"group": "MARKET", "name": "VIX", "value": vix, "fmt": "{:.1f}",
-                               "label": vlab, "pct": percentile_of(dfx["VIX"], vix)})
+                               "label": vlab, "pct": percentile_of(dfx["VIX"], vix),
+                               "spark": spark_of(dfx["VIX"])})
             if v9 is not None:
                 gauges.append({"group": "MARKET", "name": "VIX9D / VIX", "value": v9, "fmt": "{:.2f}",
                                "label": ("near-term fear" if v9 >= 1.0 else "calm front"), "pct": None})

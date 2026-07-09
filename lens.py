@@ -1273,7 +1273,10 @@ def gather_report(ticker, args, interactive, backdrop_base):
             "pcoi": pc, "vol": vol, "live": live_bar, "setup": setup, "squeeze": sqz,
             "insider": ins, "callq": callq, "liq": liq, "cats": cats, "risk": risk,
             "macro_events": macro_events, "thesis": args.thesis, "level": args.level,
-            "live_iv": live_iv}
+            "live_iv": live_iv,
+            # S50: earnings/ex-div scalars for the web chart's event markers — already computed
+            # above for the setup check; ISO-date/int/bool dicts, so the payload stays picklable
+            "earn": earn, "exd": exd}
 
 
 def render_payload(p, use_color=True, candle_style="box", candle_px=128):

@@ -14,8 +14,10 @@ List releases:   python -m modules.econ_calendar --list-releases
 
 import argparse
 import datetime
+import json
 import os
 import sys
+import time
 
 import pandas as pd
 import requests
@@ -288,6 +290,131 @@ def coverage_end_per_series(data_dir="data"):
         s = cal[cal["series"] == name]["date"]
         out[name] = s.max().normalize() if not s.empty else None
     return out
+
+
+# ── release RESULTS (S52) ────────────────────────────────────────────────────
+# The headline observation series behind each release — the ONE number the market quotes for
+# the print. NB most releases carry several market-relevant numbers (core vs headline, m/m vs
+# y/y, the unemployment rate riding NFP, revisions); this is the shorthand, and FRED carries
+# only released values — no consensus estimates, so no "surprise" can be shown.
+# Format: series_name → (fred_series_id, freq, kind, lag)
+#   freq: "m" monthly · "q" quarterly · "w" weekly · "d" daily (FOMC target rate)
+#   kind: "pct" m/m % change of the index · "chg_k" m/m change (series in thousands) ·
+#         "value" the obs IS the headline % · "level_m"/"level_k" level display ·
+#         "rate" FOMC target upper bound: post-meeting level + move vs pre-meeting
+#   lag:  reference-period lag in periods (JOLTS publishes TWO months back, the rest one)
+HEADLINE_SERIES = {
+    "FOMC":   ("DFEDTARU",        "d", "rate",    0),
+    "CPI":    ("CPIAUCSL",        "m", "pct",     1),
+    "NFP":    ("PAYEMS",          "m", "chg_k",   1),
+    "PCE":    ("PCEPI",           "m", "pct",     1),
+    "PPI":    ("PPIFIS",          "m", "pct",     1),
+    "GDP":    ("A191RL1Q225SBEA", "q", "value",   1),
+    "Retail": ("RSAFS",           "m", "pct",     1),
+    "JOLTS":  ("JTSJOL",          "m", "level_m", 2),
+    "Claims": ("ICSA",            "w", "level_k", 1),
+}
+RESULTS_CACHE = "econ_results.json"
+_RESULTS_LIMIT = {"d": 250, "w": 12, "m": 8, "q": 5}   # obs per fetch, by frequency
+
+
+def fetch_release_results(data_dir="data"):
+    """Fetch recent observations of every HEADLINE series from FRED → data/econ_results.json.
+    Returns (status, message); never raises. One API call per series (9). Values exist only
+    AFTER a release, so this rides the calendar's explicit refresh — never default-on."""
+    if not FRED_API_KEY:
+        return ("no_key", "FRED_API_KEY unset — release results not fetched")
+    out, misses = {}, []
+    for name, (sid, freq, _kind, _lag) in HEADLINE_SERIES.items():
+        try:
+            data = _get("series/observations",
+                        {"series_id": sid, "sort_order": "desc",
+                         "limit": _RESULTS_LIMIT[freq]})
+            obs = sorted((o["date"], float(o["value"]))
+                         for o in data.get("observations", [])
+                         if o.get("value") not in (None, ".", ""))
+            out[name] = obs
+            if not obs:
+                misses.append(name)
+        except Exception:
+            out[name] = []
+            misses.append(name)
+    try:
+        with open(os.path.join(data_dir, RESULTS_CACHE), "w", encoding="utf-8") as f:
+            json.dump({"fetched_at": time.time(), "series": out}, f)
+    except Exception as e:
+        return ("failed", f"release-results cache write failed ({type(e).__name__})")
+    ok = len(out) - len(misses)
+    return ("ok", f"release results fetched for {ok}/{len(out)} series"
+            + (f" (missing: {', '.join(misses)})" if misses else ""))
+
+
+def load_results(data_dir="data"):
+    """({series: [(period_iso, value), …]}, fetched_at) from the results cache — ({}, None)
+    when absent/unreadable. Zero network."""
+    try:
+        with open(os.path.join(data_dir, RESULTS_CACHE), encoding="utf-8") as f:
+            d = json.load(f)
+        return ({k: [(p, float(v)) for p, v in rows]
+                 for k, rows in d.get("series", {}).items()}, d.get("fetched_at"))
+    except Exception:
+        return {}, None
+
+
+def headline_result(series, release_date, observations):
+    """Short display string for the headline print published ON `release_date` — or None when
+    the matching observation isn't in `observations` (future release / thin cache / fetch
+    miss). Pure and offline-testable. Reference-period mapping:
+      monthly   → data month = release month − lag (JOLTS lags 2, the rest 1)
+      quarterly → data quarter = release quarter − 1 (all three GDP estimates map there)
+      weekly    → latest week ending ≤8d before the release (Claims Thu covers prior Sat)
+      daily FOMC→ target-rate level on/after the meeting vs the day before it
+    """
+    if series not in HEADLINE_SERIES or not observations:
+        return None
+    _sid, freq, kind, lag = HEADLINE_SERIES[series]
+    rd = pd.Timestamp(release_date).normalize()
+    obs = sorted((pd.Timestamp(p).normalize(), v) for p, v in observations)
+
+    def at(ts):
+        return next((v for p, v in obs if p == ts), None)
+
+    if freq == "m":
+        ref = rd.replace(day=1) - pd.offsets.MonthBegin(lag)
+        prev = ref - pd.offsets.MonthBegin(1)
+        v, vp = at(ref), at(prev)
+    elif freq == "q":
+        ref = (rd.to_period("Q") - lag).start_time
+        prev = (rd.to_period("Q") - lag - 1).start_time
+        v, vp = at(ref), at(prev)
+    elif freq == "w":
+        cands = [(p, x) for p, x in obs if p <= rd and (rd - p).days <= 8]
+        v, vp = (cands[-1][1], None) if cands else (None, None)
+    else:                                                    # "d" — FOMC target rate
+        after = next((x for p, x in obs if p >= rd), None)
+        before = next((x for p, x in reversed(obs) if p < rd), None)
+        if after is None or before is None:
+            return None
+        move = after - before
+        return f"{after:.2f}% ({'hold' if abs(move) < 1e-9 else f'{move:+.2f}'})"
+
+    if v is None:
+        return None
+    if kind == "pct":
+        if vp is None:
+            return None
+        return f"{(v / vp - 1) * 100:+.1f}% m/m"
+    if kind == "chg_k":
+        if vp is None:
+            return None
+        return f"{v - vp:+,.0f}k jobs"
+    if kind == "value":
+        return f"{v:+.1f}% q/q ann."
+    if kind == "level_m":
+        return f"{v / 1000:.1f}M open"
+    if kind == "level_k":
+        return f"{v / 1000:.0f}k claims"
+    return None
 
 
 def refresh_if_stale(max_age_days=7, data_dir="data"):

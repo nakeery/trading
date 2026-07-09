@@ -284,7 +284,9 @@ def sec_setup(p):
 
 def _gauge_table(gauges, groups=None):
     """Shared gauge renderer (OPTIONS & VOL CONTEXT + GEO): value pre-formatted via the
-    gauge's own fmt, read label, ordinal percentile."""
+    gauge's own fmt, read label, ordinal percentile, and — when a gauge carries its trailing
+    series (`spark`, S50) — a native sparkline column showing the shape behind the percentile
+    (grinding up vs spiking reads differently; the number alone can't say which)."""
     rows = []
     for g in gauges:
         if groups is not None and g.get("group") not in groups:
@@ -292,10 +294,16 @@ def _gauge_table(gauges, groups=None):
         rows.append({"Group": g.get("group", ""), "Gauge": g["name"],
                      "Value": g["fmt"].format(g["value"]),
                      "Read": g.get("label") or "",
-                     "Percentile": _pct_txt(g.get("pct"))})
-    if rows:
-        _df(pd.DataFrame(rows))
-    return bool(rows)
+                     "Percentile": _pct_txt(g.get("pct")),
+                     "1y": g.get("spark") or None})
+    if not rows:
+        return False
+    if any(r["1y"] for r in rows):
+        _df(pd.DataFrame(rows),
+            **{"1y": st.column_config.LineChartColumn("1y", width="small")})
+    else:
+        _df(pd.DataFrame(rows).drop(columns=["1y"]))
+    return True
 
 
 def sec_options(p):
@@ -386,21 +394,94 @@ def sec_pcoi(p):
     if any(r.get("call_oi") is not None or r.get("put_oi") is not None for r in rows):
         try:
             import plotly.graph_objects as go
+            from plotly.subplots import make_subplots
             x = [f"{r['expiry']}{' *' if LEAPS_MIN_DTE <= r['dte'] <= LEAPS_MAX_DTE else ''}"
                  for r in rows]
-            fig = go.Figure()
+            has_vol = any(r.get("call_vol") is not None or r.get("put_vol") is not None
+                          for r in rows)
+            fig = make_subplots(rows=2 if has_vol else 1, cols=1, shared_xaxes=True,
+                                vertical_spacing=0.07,
+                                row_heights=[0.62, 0.38] if has_vol else None)
             fig.add_trace(go.Bar(x=x, y=[r.get("call_oi") for r in rows], name="Call OI",
-                                 marker_color=GREEN, marker_line_width=0))
+                                 marker_color=GREEN, marker_line_width=0), row=1, col=1)
             fig.add_trace(go.Bar(x=x, y=[r.get("put_oi") for r in rows], name="Put OI",
-                                 marker_color=RED, marker_line_width=0))
-            fig.update_layout(barmode="group", bargroupgap=0.08, height=280,
+                                 marker_color=RED, marker_line_width=0), row=1, col=1)
+            if has_vol:
+                # latest-session FLOW beneath the POSITIONING pane — same green/red but
+                # translucent (the price chart's volume-pane convention) so the two panes
+                # aren't misread as one scale
+                fig.add_trace(go.Bar(x=x, y=[r.get("call_vol") for r in rows], name="Call Vol",
+                                     marker_color="rgba(94,196,94,0.55)", marker_line_width=0),
+                              row=2, col=1)
+                fig.add_trace(go.Bar(x=x, y=[r.get("put_vol") for r in rows], name="Put Vol",
+                                     marker_color="rgba(216,60,52,0.55)", marker_line_width=0),
+                              row=2, col=1)
+                fig.update_yaxes(title_text="volume", title_font_size=11, row=2, col=1)
+            fig.update_yaxes(title_text="open interest", title_font_size=11, row=1, col=1)
+            fig.update_layout(barmode="group", bargroupgap=0.08,
+                              height=390 if has_vol else 280,
                               margin=dict(l=10, r=10, t=10, b=10), template="plotly_dark",
                               paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(14,17,23,1)",
-                              legend=dict(orientation="h", y=1.08, x=0, font=dict(size=11)),
-                              yaxis_title="open interest")
+                              legend=dict(orientation="h", y=1.08, x=0, font=dict(size=11)))
             st.plotly_chart(fig, width="stretch")
         except Exception:
             pass
+
+    # OI-by-strike walls (S50): per-strike OI captured by pc_by_expiry (spot ±20%), summed
+    # across the fetched scope — where the heavy positioning sits relative to spot. Old caches
+    # predate the capture (no by_strike key) → caption instead of a chart.
+    strikes = {}
+    for r in rows:
+        for k, c_oi, p_oi in (r.get("by_strike") or []):
+            agg = strikes.setdefault(float(k), [0.0, 0.0])
+            agg[0] += c_oi
+            agg[1] += p_oi
+    if strikes:
+        try:
+            import plotly.graph_objects as go
+            spot = pc.get("price")
+            ks = sorted(strikes)
+            if spot and len(ks) > 40:                       # densest names: 40 strikes nearest spot
+                ks = sorted(sorted(ks, key=lambda k: abs(k - spot))[:40])
+            calls = [strikes[k][0] for k in ks]
+            puts = [-strikes[k][1] for k in ks]             # negative x → diverging left
+            fig = go.Figure()
+            fig.add_trace(go.Bar(y=ks, x=calls, orientation="h", name="Call OI",
+                                 marker_color=GREEN, marker_line_width=0,
+                                 hovertemplate="%{y}: %{x:,.0f} calls<extra></extra>"))
+            fig.add_trace(go.Bar(y=ks, x=puts, orientation="h", name="Put OI",
+                                 marker_color=RED, marker_line_width=0,
+                                 customdata=[abs(v) for v in puts],
+                                 hovertemplate="%{y}: %{customdata:,.0f} puts<extra></extra>"))
+            if spot:
+                fig.add_hline(y=spot, line_dash="dot", line_width=1, line_color="#e8c547",
+                              annotation=dict(text=f"spot {spot:,.2f}", x=1.0, xanchor="left",
+                                              font=dict(color="#e8c547", size=10),
+                                              showarrow=False))
+            wall_c = ks[calls.index(max(calls))]
+            wall_p = ks[puts.index(min(puts))]
+            for w, lbl, col in ((wall_c, "call wall", GREEN), (wall_p, "put wall", RED)):
+                fig.add_annotation(y=w, x=0, text=f"{lbl} {w:g}", showarrow=False,
+                                   xanchor="center", font=dict(color=col, size=10),
+                                   bgcolor="rgba(14,17,23,0.75)")
+            fig.update_layout(barmode="relative", bargap=0.15,
+                              height=max(300, 11 * len(ks)),
+                              margin=dict(l=10, r=64, t=10, b=10), template="plotly_dark",
+                              paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(14,17,23,1)",
+                              legend=dict(orientation="h", y=1.04, x=0, font=dict(size=11)),
+                              xaxis=dict(showticklabels=False,
+                                         title=dict(text="← puts   ·   calls →",
+                                                    font=dict(size=11))),
+                              yaxis=dict(title=dict(text="strike", font=dict(size=11))))
+            st.plotly_chart(fig, width="stretch")
+            st.caption(f"open interest by strike (±20% of spot), summed across the "
+                       f"{len(rows)} fetched expiries — walls mark the heaviest strikes")
+        except Exception:
+            pass
+    else:
+        st.caption("strike-level OI appears after the next chain refresh "
+                   "(tick live, or Run after a market close)")
+
     tbl = [{"Expiry": r["expiry"], "DTE": r["dte"],
             "P/C OI": f"{r['pc']:.2f}" if r.get("pc") is not None else "n/a",
             "P/C Vol": f"{r['pc_vol']:.2f}" if r.get("pc_vol") is not None else "n/a",
@@ -414,8 +495,8 @@ def sec_pcoi(p):
                     "P/C Vol": f"{t['pc_vol']:.2f}" if t.get("pc_vol") is not None else "n/a",
                     "Positioning": pc_label(t.get("pc"))})
     _df(pd.DataFrame(tbl))
-    st.caption("P/C OI = put OI / call OI (positioning) · P/C Vol = latest-session flow · "
-               "* = LEAPS tenor")
+    st.caption("P/C OI = put OI / call OI (positioning) · P/C Vol = latest-session flow "
+               "(lower pane) · * = LEAPS tenor")
 
 
 def _quote_caveats(cb):
@@ -661,10 +742,14 @@ _SECTIONS = [sec_header, sec_backdrop, sec_multi_tf, sec_divergences, sec_volume
              sec_vol, sec_call, sec_geo, sec_catalysts, sec_macro, sec_thesis, sec_notes]
 
 
-def render_all(p):
+def render_all(p, skip_header=False):
     """Render every section from the payload (print_report order). A failing section shows a
-    warning instead of killing the page — the ANSI expander below is the lossless fallback."""
+    warning instead of killing the page — the ANSI expander below is the lossless fallback.
+    `skip_header` drops sec_header — live mode renders the tiles inside the chart fragment
+    instead, off each fresh Tradier tick."""
     for fn in _SECTIONS:
+        if skip_header and fn is sec_header:
+            continue
         try:
             fn(p)
         except Exception as e:

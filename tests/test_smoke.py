@@ -1,7 +1,7 @@
 """
 Smoke tests for the options trading ML pipeline.
 
-36 regression guards:
+39 regression guards:
   1. Signal hierarchy (backtest CSV) — STRONG ENTRY > CAUTION > STAY OUT by avg return
   2. STRONG ENTRY baseline sanity (backtest CSV) — count/return/win-rate loose bounds
   3. Vol thresholds range (QQQ indicators CSV) — positive values in expected ranges
@@ -65,6 +65,13 @@ Smoke tests for the options trading ML pipeline.
      S49 lifted-compute defaults (offline)
  36. gather_report payload contract — full key set, no pandas objects (the web payload is
      pickled by st.cache_data); network helpers monkeypatched off (S49, offline)
+ 37. pc_oi strike_profile — per-strike put/call OI aggregation, ±band spot filter, sort,
+     strike-less/empty degrade; feeds the web OI-walls chart (S50, offline)
+ 38. sentiment spark_of — gauge sparkline series: last value always sampled, ≥63-obs floor
+     mirrors percentile_of, NaNs dropped (S50, offline)
+ 39. econ_calendar headline_result — release-date → reference-period matching (monthly lag,
+     JOLTS 2-month lag, weekly ≤8d window, quarterly, FOMC pre/post rate) + display kinds;
+     future/missing obs → None (S52, offline)
 """
 
 
@@ -1365,7 +1372,85 @@ def test_gather_payload_keys(monkeypatch):
     expected = {"ticker", "reads", "divs", "summary", "profile", "notes", "last_bar", "as_of",
                 "panel_bars", "ctx", "backdrop", "geo", "pcoi", "vol", "live", "setup",
                 "squeeze", "insider", "callq", "liq", "cats", "risk", "macro_events",
-                "thesis", "level", "live_iv"}
+                "thesis", "level", "live_iv", "earn", "exd"}
     assert set(payload.keys()) == expected
     assert not any(isinstance(v, (pd.DataFrame, pd.Series)) for v in payload.values())
     assert payload["reads"] and payload["risk"] is not None      # frames were read + risk lifted
+
+
+# ─── Test 37: pc_oi strike_profile (S50, offline) ────────────────────────────────
+def test_strike_profile():
+    """Per-strike OI aggregation: put/call split by strike, ±band filter around spot, sorted;
+    strike-less/empty chains → []. Feeds the web UI's OI-walls chart."""
+    import pandas as pd
+    from modules.pc_oi import strike_profile
+
+    chain = pd.DataFrame({
+        "strike":        [90, 90, 100, 100, 110, 130],
+        "option_type":   ["call", "put", "call", "put", "call", "call"],
+        "open_interest": [10, 20, 30, 40, 0, 99],
+    })
+    prof = strike_profile(chain, spot=100, band=0.20)
+    assert prof == [[90.0, 10.0, 20.0], [100.0, 30.0, 40.0], [110.0, 0.0, 0.0]]  # 130 > +20% cut
+
+    assert strike_profile(chain, spot=None)[-1][0] == 130.0      # no spot → uncapped
+    assert strike_profile(chain.drop(columns=["strike"]), spot=100) == []
+    assert strike_profile(chain.iloc[0:0], spot=100) == []
+
+
+# ─── Test 38: sentiment spark_of (S50, offline) ──────────────────────────────────
+def test_spark_of():
+    """Gauge sparkline series: ≤points+1 floats sampled so the LAST value always survives;
+    same ≥63-obs floor as percentile_of; NaNs dropped."""
+    import numpy as np
+    import pandas as pd
+    from modules.sentiment import spark_of
+
+    s = pd.Series(np.linspace(0.0, 1.0, 300))
+    sp = spark_of(s, window=252, points=60)
+    assert 0 < len(sp) <= 60 and sp[-1] == 1.0
+    assert all(isinstance(v, float) for v in sp)
+
+    assert spark_of(pd.Series([1.0] * 10)) == []                 # thin history → no spark
+    noisy = pd.Series([1.0, np.nan] * 100)
+    assert spark_of(noisy) and all(v == 1.0 for v in spark_of(noisy))
+
+
+# ─── Test 39: econ_calendar headline_result (S52, offline) ───────────────────────
+def test_headline_result():
+    """Release-date → reference-period matching + headline display per kind: monthly m/m %
+    (lag 1), monthly change-in-thousands, JOLTS 2-month lag, weekly claims ≤8d window,
+    quarterly GDP value, FOMC rate hold/cut; future/missing obs → None."""
+    from modules.econ_calendar import headline_result
+
+    # CPI: July 14 release publishes JUNE data; +0.5% m/m off the index
+    cpi = [("2026-05-01", 320.0), ("2026-06-01", 321.6)]
+    assert headline_result("CPI", "2026-07-14", cpi) == "+0.5% m/m"
+    assert headline_result("CPI", "2026-08-12", cpi) is None     # July data not in obs yet
+
+    # NFP: PAYEMS in thousands → change printed as k jobs
+    nfp = [("2026-05-01", 159000.0), ("2026-06-01", 159140.0)]
+    assert headline_result("NFP", "2026-07-02", nfp) == "+140k jobs"
+
+    # JOLTS: Aug 4 release publishes JUNE data (2-month lag), level in thousands → M
+    jolts = [("2026-06-01", 7600.0)]
+    assert headline_result("JOLTS", "2026-08-04", jolts) == "7.6M open"
+
+    # Claims: Thursday release covers the week ending the prior Saturday (≤8d); stale obs → None
+    claims = [("2026-07-04", 228000.0)]
+    assert headline_result("Claims", "2026-07-09", claims) == "228k claims"
+    assert headline_result("Claims", "2026-07-30", claims) is None
+
+    # GDP: Q3 release publishes Q2 (obs dated at quarter start); value IS the headline %
+    gdp = [("2026-04-01", 2.8)]
+    assert headline_result("GDP", "2026-07-30", gdp) == "+2.8% q/q ann."
+
+    # FOMC: post-meeting level vs pre-meeting — hold and cut; future meeting → None
+    hold = [("2026-07-28", 4.50), ("2026-07-30", 4.50)]
+    cut = [("2026-07-28", 4.50), ("2026-07-30", 4.25)]
+    assert headline_result("FOMC", "2026-07-29", hold) == "4.50% (hold)"
+    assert headline_result("FOMC", "2026-07-29", cut) == "4.25% (-0.25)"
+    assert headline_result("FOMC", "2026-09-16", hold) is None
+
+    assert headline_result("NOPE", "2026-07-14", cpi) is None    # unmapped series
+    assert headline_result("CPI", "2026-07-14", []) is None      # empty obs
