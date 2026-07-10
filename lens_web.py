@@ -172,6 +172,52 @@ def _iv_fig(hist):
         return None
 
 
+def range52(df, window=252):
+    """52-week range read off the trailing daily bars (incl. a live provisional bar when
+    present): position in range + distance from high. None when history is too thin."""
+    try:
+        t = df.tail(window)
+        if len(t) < 200:
+            return None
+        hi, lo = float(t["High"].max()), float(t["Low"].min())
+        last = float(t["Close"].iloc[-1])
+        if hi <= lo:
+            return None
+        return {"hi": hi, "lo": lo, "pos": (last - lo) / (hi - lo), "off_hi": 1 - last / hi}
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_seasonality(ticker):
+    """Monthly seasonality base rates (S53) — zero network when the indicators CSV exists
+    (yfinance-fallback tickers reuse _load_daily's own fallback, cached here ~1h). Needs the
+    FULL history — decades, not the chart's 320-bar tail."""
+    try:
+        from modules.seasonality import monthly_seasonality
+        return monthly_seasonality(_load_daily(ticker, DATA_DIR)["Close"])
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def load_earnings_reactions(ticker, n=10):
+    """Realized post-print reactions (S53): gap/1d/5d + pre-print IV per past earnings —
+    indicators CSV + the same yfinance earnings-dates call the lens run already makes
+    (cached here ~1h). None for ETFs / no CSV / no usable prints."""
+    path = os.path.join(DATA_DIR, f"{ticker.lower()}_indicators.csv")
+    if not os.path.exists(path):
+        return None
+    try:
+        from modules.features import earnings_dates
+        from modules.vol_history import earnings_reactions
+        df = pd.read_csv(path, index_col=0, parse_dates=True).sort_index()
+        out = earnings_reactions(df, earnings_dates(ticker), n=n)
+        return out if out.get("status") == "ok" else None
+    except Exception:
+        return None
+
+
 @st.cache_data(ttl=600, show_spinner=False)
 def load_ledger(ticker, rows=30):
     """Tail of entry.py's forward signal ledger (S30 — one row per as-of run date) — zero
@@ -477,17 +523,38 @@ def _candle_fig(df, overlays=(), show_volume=False, price_line=None, vprofile=No
         if events:
             # upcoming events (earnings/ex-div/Tier-1 macro/catalysts) as dashed vlines; an
             # invisible marker at the furthest date pulls the x-range forward so future events
-            # are visible right of the last candle
+            # are visible right of the last candle. Weekend dates (e.g. a Saturday PDUFA) are
+            # snapped to the next trading day — the weekend rangebreak below would hide them.
+            snapped = []
             for d_iso, label, color in events:
-                fig.add_vline(x=d_iso, line_dash="dot", line_width=1, line_color=color,
+                ts = pd.Timestamp(d_iso)
+                if ts.weekday() >= 5:
+                    ts += pd.offsets.BDay(1)
+                d_plot = ts.strftime("%Y-%m-%d")
+                snapped.append(d_plot)
+                fig.add_vline(x=d_plot, line_dash="dot", line_width=1, line_color=color,
                               row=1, col=1,
                               annotation=dict(text=label, textangle=-90, showarrow=False,
                                               font=dict(color=color, size=9)))
-            furthest = max(e[0] for e in events)
+            furthest = max(snapped)
             if furthest > df.index[-1].date().isoformat():
                 fig.add_trace(go.Scatter(x=[furthest], y=[float(df["Close"].iloc[-1])],
                                          mode="markers", marker=dict(opacity=0),
                                          showlegend=False, hoverinfo="skip"), row=1, col=1)
+        # collapse non-trading gaps (S54): hide weekends + any missing weekdays inside the bar
+        # span (holidays), so candles on either side of a market close sit adjacent. Only dates
+        # WITHIN the data span count as holidays — future weekdays (the event-marker extension)
+        # must survive, or upcoming markers would collapse onto the last candle. Applied to the
+        # date axes only (x, and x2 when the volume pane exists) — x3 is the numeric
+        # volume-profile overlay and rangebreaks are a date-axis feature.
+        rb = [dict(bounds=["sat", "mon"])]
+        holidays = pd.bdate_range(df.index[0], df.index[-1]).difference(df.index.normalize())
+        if len(holidays):
+            rb.append(dict(values=[d.strftime("%Y-%m-%d") for d in holidays]))
+        ax_rb = {"xaxis": dict(rangebreaks=rb)}
+        if show_volume:
+            ax_rb["xaxis2"] = dict(rangebreaks=rb)
+        fig.update_layout(**ax_rb)
         if price_line is not None:
             # price-tag style: label anchored LEFT at the plot's right edge, extending into the
             # widened right margin — never clipped by the plot area
@@ -551,13 +618,23 @@ def draw_chart(ticker, live=False, payload=None):
     if vp_on:
         aspects = st.pills("profile aspects", VP_ASPECTS, selection_mode="multi",
                            default=VP_ASPECTS, key="ov_vp_aspects")
-        prof = load_profile(ticker)
+        # the REPORT's own profile (payload) — chart levels must match the Volume Profile
+        # section exactly (S54; recomputing here on daily/1y disagreed wildly on names like
+        # SOFI where the 1y value area spans an old high-price shelf). load_profile is only
+        # the fallback for payloads without one (thin data).
+        prof = (payload or {}).get("profile") or load_profile(ticker)
         if prof:
             vprofile = dict(prof)
             vprofile["aspects"] = set(aspects or [])
-            st.caption(f"profile: daily bars, ~1y · POC {prof['poc']:,.2f} · value area "
-                       f"{prof['va_low']:,.2f}–{prof['va_high']:,.2f} (the report's profile may "
-                       f"use finer 1h bars over ~6mo — levels can differ slightly)")
+            from_payload = bool((payload or {}).get("profile"))
+            src = ("report profile — matches the Volume Profile section (1h bars ~6mo when "
+                   "available, else daily ~1y)" if from_payload
+                   else "daily bars ~1y (fallback — report carried no profile)")
+            st.caption(f"profile: {src} · POC {prof['poc']:,.2f} · value area "
+                       f"{prof['va_low']:,.2f}–{prof['va_high']:,.2f}")
+            if "histogram" in (aspects or []) and not prof.get("hist_volumes"):
+                st.caption("histogram appears after the next Run (this report predates the "
+                           "chart/report profile unification)")
         else:
             st.caption("volume profile unavailable for this ticker")
 
@@ -596,9 +673,12 @@ def draw_chart(ticker, live=False, payload=None):
                     "last_bar": {"close": live_last, "prev_close": prev, "open": bar["Open"],
                                  "high": bar["High"], "low": bar["Low"]},
                     "live": {"applied": True, "in_progress": bar.get("in_progress"),
-                             "hhmm": bar.get("hhmm")}})
+                             "hhmm": bar.get("hhmm")},
+                    "range52": range52(df)})            # df includes the live bar → tile ticks
             elif payload:
-                lens_web_sections.sec_header(payload)   # no quote — tiles hold the last close
+                hdr = dict(payload)                     # shallow copy — never mutate the cache
+                hdr["range52"] = range52(df)
+                lens_web_sections.sec_header(hdr)       # no quote — tiles hold the last close
         except Exception as e:
             st.caption(f"header tiles unavailable ({type(e).__name__}: {e}) — "
                        f"see the full text report below")
@@ -706,6 +786,8 @@ if should_generate:
         load_profile.clear()
         load_iv_history.clear()
         load_ledger.clear()
+        load_seasonality.clear()
+        load_earnings_reactions.clear()
     else:
         st.session_state["failed_key"] = key
         if preamble:
@@ -729,7 +811,9 @@ if st.session_state.get("last_payload"):
         # fragment draws them) so the calendar below slots in right under the header's
         # 'state characterization' caption in BOTH modes
         try:
-            lens_web_sections.sec_header(st.session_state["last_payload"])
+            hdr = dict(st.session_state["last_payload"])   # shallow copy — payload is cached
+            hdr["range52"] = range52(load_daily_tail(shown_ticker))
+            lens_web_sections.sec_header(hdr)
         except Exception as e:
             st.caption(f"header tiles unavailable ({type(e).__name__}: {e}) — "
                        f"see the full text report below")
@@ -743,6 +827,82 @@ if st.session_state.get("last_payload"):
         st.plotly_chart(fig_iv, use_container_width=True, key=f"ivhist_{shown_ticker}")
         st.caption("ATM IV (30d, harvested) vs HV-20 (realized) · shaded spans = pre-earnings "
                    "event-IV stamp windows (S44) · gaps = sessions with no harvest")
+    # earnings reaction history (S53) — realized prints; skipped silently for ETFs/no data
+    rx = load_earnings_reactions(shown_ticker)
+    if rx:
+        with st.expander(f"📊 earnings reactions — last {len(rx['rows'])} prints"):
+            tbl = pd.DataFrame([{
+                "Print": r["date"],
+                "Gap": f"{r['gap']:+.1%}" if r["gap"] is not None else "—",
+                "1d": f"{r['d1']:+.1%}",
+                "5d": f"{r['d5']:+.1%}" if r["d5"] is not None else "—",
+                "pre-print IV": f"{r['pre_iv']:.0%}" if r["pre_iv"] is not None else "—",
+            } for r in rx["rows"]])
+
+            def _tint(_):
+                sty = pd.DataFrame("", index=tbl.index, columns=tbl.columns)
+                for i, r in enumerate(rx["rows"]):
+                    for cname, v in (("Gap", r["gap"]), ("1d", r["d1"]), ("5d", r["d5"])):
+                        if v is not None:
+                            sty.loc[i, cname] = (f"color: "
+                                                 f"{'#5ec45e' if v > 0 else '#d83c34'}; "
+                                                 f"font-weight: 600")
+                return sty
+
+            st.dataframe(tbl.style.apply(_tint, axis=None), hide_index=True, width="stretch")
+            line = (f"median |print move| {rx['med_abs_d1']:.1%} · up {rx['up']} / "
+                    f"down {rx['dn']}")
+            em = ((st.session_state["last_payload"].get("vol") or {}).get("em") or {})
+            if em.get("pct"):
+                line += f" · current expected move ±{em['pct']:.1%} (~{em.get('dte', '?')}d)"
+            st.caption(line + " · realized close-to-close moves; the --vol study covers the "
+                              "implied side (ramp/crush/straddle P&L)")
+    # seasonality (S53) — monthly base rates, DISPLAY-ONLY forever (calendar-time features
+    # are the S31 leak class; never a model input)
+    seas = load_seasonality(shown_ticker)
+    if seas and seas.get("status") == "ok":
+        with st.expander(f"📈 seasonality — monthly base rates over {seas['years']:.0f}y "
+                         f"(display-only)"):
+            import calendar as _cal
+            cur = pd.Timestamp.today().month
+            months, recent = seas["months"], seas["recent"]
+
+            def wintxt(s):
+                return f"{s['up']}/{s['n']}" if s["n"] else "—"
+
+            def medtxt(s):
+                return f"{s['median']:+.1%}" if s["median"] is not None else "—"
+
+            cols = [_cal.month_abbr[m] for m in range(1, 13)]
+            df_s = pd.DataFrame(
+                [[wintxt(s) for s in months], [medtxt(s) for s in months],
+                 [wintxt(s) for s in recent], [medtxt(s) for s in recent]],
+                index=[f"win ({seas['years']:.0f}y)", f"median ({seas['years']:.0f}y)",
+                       "win (10y)", "median (10y)"],
+                columns=cols)
+
+            def _style(_):
+                sty = pd.DataFrame("", index=df_s.index, columns=df_s.columns)
+                for j, (fs, rs) in enumerate(zip(months, recent)):
+                    for i, s in ((0, fs), (2, rs)):
+                        if s["win"] is not None:
+                            sty.iloc[i, j] = (f"color: {lens_web_sections._ramp_hex(s['win'])}"
+                                              f"; font-weight: 600")
+                    for i, s in ((1, fs), (3, rs)):
+                        if s["median"] is not None:
+                            t = 0.5 + max(-0.5, min(0.5, s["median"] / 0.08))
+                            sty.iloc[i, j] = f"color: {lens_web_sections._ramp_hex(t)}"
+                    if j + 1 == cur:                      # highlight the current month
+                        for i in range(4):
+                            sty.iloc[i, j] += "; background-color: rgba(232,197,71,0.10)"
+                return sty
+
+            st.dataframe(df_s.style.apply(_style, axis=None), width="stretch")
+            cs, cr = months[cur - 1], recent[cur - 1]
+            st.caption(f"{_cal.month_name[cur]} historically: {wintxt(cs)} up, median "
+                       f"{medtxt(cs)} (full) · {wintxt(cr)} up, median {medtxt(cr)} (last "
+                       f"10y — a month strong in both windows is a real prior; one that "
+                       f"flips is noise) · base rates, NOT edge; stays display-only (S31)")
     # native section renderers (S49) — same payload the ANSI report below is printed from;
     # the header is always drawn above (fragment in live mode, direct call otherwise)
     lens_web_sections.render_all(st.session_state["last_payload"], skip_header=True)

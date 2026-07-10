@@ -252,6 +252,63 @@ def _print_study(study):
         print(f"    · {c}")
 
 
+def earnings_reactions(df, earnings, n=10):
+    """Realized reaction stats for the last `n` past earnings prints (S53) — the REALIZED half
+    of the event picture (pre_earnings_vol_study covers the implied side). Pure and
+    offline-testable; never raises on well-formed frames.
+
+    yfinance earnings dates don't reliably carry AMC/BMO timing, so the reaction session R is
+    whichever of (first session ≥ E, the session after it) moved more close-to-close — the
+    same pragmatism as the study's session alignment.
+
+    Rows (newest first): {"date", "gap", "d1", "d5", "pre_iv"} where
+      gap = Open[R]/Close[R−1]−1 · d1 = Close[R]/Close[R−1]−1 ·
+      d5 = Close[R+4]/Close[R−1]−1 (None at the history edge) ·
+      pre_iv = atm_iv_event else atm_iv_30d on session R−1 (context column ONLY — no derived
+      implied-move math; implied-vs-realized straddle P&L lives in pre_earnings_vol_study).
+    Returns {"status": "ok"|"no_earnings"|"no_csv", "rows", "med_abs_d1", "up", "dn"}.
+    """
+    if df is None or len(df) == 0 or "Close" not in df.columns:
+        return {"status": "no_csv", "rows": []}
+    past = sorted(pd.Timestamp(e).normalize() for e in (earnings or []))
+    past = [e for e in past if e <= df.index[-1]]
+    if not past:
+        return {"status": "no_earnings", "rows": []}
+    idx, close = df.index, df["Close"]
+    rows = []
+    for e in reversed(past):
+        if len(rows) >= n:
+            break
+        pos = idx.searchsorted(e)                       # first session ≥ E
+        best = None                                     # (row, d1) with the larger |move|
+        for r in (pos, pos + 1):
+            if r <= 0 or r >= len(idx):
+                continue
+            d1 = close.iloc[r] / close.iloc[r - 1] - 1
+            if pd.isna(d1):
+                continue
+            if best is None or abs(d1) > abs(best[1]):
+                best = (r, float(d1))
+        if best is None:
+            continue
+        r, d1 = best
+        prev_close = float(close.iloc[r - 1])
+        gap = None
+        if "Open" in df.columns and not pd.isna(df["Open"].iloc[r]):
+            gap = float(df["Open"].iloc[r]) / prev_close - 1
+        d5 = float(close.iloc[r + 4]) / prev_close - 1 if r + 4 < len(idx) else None
+        pre_iv = next((float(df[c].iloc[r - 1]) for c in ("atm_iv_event", "atm_iv_30d")
+                       if c in df.columns and not pd.isna(df[c].iloc[r - 1])), None)
+        rows.append({"date": idx[r].date().isoformat(), "gap": gap, "d1": d1, "d5": d5,
+                     "pre_iv": pre_iv})
+    if not rows:
+        return {"status": "no_earnings", "rows": []}
+    d1s = [r["d1"] for r in rows]
+    return {"status": "ok", "rows": rows,
+            "med_abs_d1": float(pd.Series([abs(x) for x in d1s]).median()),
+            "up": sum(1 for x in d1s if x > 0), "dn": sum(1 for x in d1s if x <= 0)}
+
+
 def main():
     try:
         ticker = input("  Ticker [XYZ]: ").strip().upper()

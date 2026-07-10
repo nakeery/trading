@@ -1,7 +1,7 @@
 """
 Smoke tests for the options trading ML pipeline.
 
-39 regression guards:
+41 regression guards:
   1. Signal hierarchy (backtest CSV) — STRONG ENTRY > CAUTION > STAY OUT by avg return
   2. STRONG ENTRY baseline sanity (backtest CSV) — count/return/win-rate loose bounds
   3. Vol thresholds range (QQQ indicators CSV) — positive values in expected ranges
@@ -72,6 +72,12 @@ Smoke tests for the options trading ML pipeline.
  39. econ_calendar headline_result — release-date → reference-period matching (monthly lag,
      JOLTS 2-month lag, weekly ≤8d window, quarterly, FOMC pre/post rate) + display kinds;
      future/missing obs → None (S52, offline)
+ 40. seasonality monthly_seasonality — per-month win counts/medians on a synthetic 20y series
+     with a known monthly pattern, counts-not-percents, 10y recent window, in-progress-month
+     drop is structural, <10y → insufficient (S53, offline)
+ 41. vol_history earnings_reactions — gap/1d/5d math, AMC/BMO larger-|move| session pick,
+     d5 None at the history edge, atm_iv_event-over-30d pre_iv fallback, future dates
+     ignored, no-earnings/no-csv statuses (S53, offline)
 """
 
 
@@ -1454,3 +1460,76 @@ def test_headline_result():
 
     assert headline_result("NOPE", "2026-07-14", cpi) is None    # unmapped series
     assert headline_result("CPI", "2026-07-14", []) is None      # empty obs
+
+
+# ─── Test 40: seasonality monthly base rates (S53, offline) ──────────────────────
+def test_monthly_seasonality():
+    """Synthetic 20y series: Jan–Jun always up (+2%/mo), Jul–Dec always down (−1%/mo) —
+    win counts must be n/n and 0/n respectively; recent window ~10 obs; short series →
+    insufficient; counts (not just rates) are preserved."""
+    import pandas as pd
+    from modules.seasonality import monthly_seasonality
+
+    idx = pd.bdate_range("2000-01-03", "2019-12-31")
+    daily_up, daily_dn = 1.02 ** (1 / 21), 0.99 ** (1 / 21)
+    vals, price = [], 100.0
+    for d in idx:
+        price *= daily_up if d.month <= 6 else daily_dn
+        vals.append(price)
+    close = pd.Series(vals, index=idx)
+
+    out = monthly_seasonality(close)
+    assert out["status"] == "ok" and out["years"] > 19
+    assert len(out["months"]) == 12 and len(out["recent"]) == 12
+    jan, aug = out["months"][0], out["months"][7]
+    assert jan["n"] >= 18 and jan["up"] == jan["n"] and jan["win"] == 1.0
+    assert aug["up"] == 0 and aug["win"] == 0.0
+    assert jan["median"] is not None and jan["median"] > 0 > aug["median"]
+    r_jan = out["recent"][0]
+    assert 9 <= r_jan["n"] <= 11 and r_jan["up"] == r_jan["n"]   # trailing-10y window
+
+    thin = monthly_seasonality(close.tail(252 * 5))              # ~5y < 10y floor
+    assert thin["status"] == "insufficient" and thin["months"] == []
+    assert monthly_seasonality(None)["status"] == "insufficient"
+
+
+# ─── Test 41: earnings reaction history (S53, offline) ───────────────────────────
+def test_earnings_reactions():
+    """Synthetic frame with three prints: BMO (moves same session), AMC (moves the NEXT
+    session — larger-|move| pick), and one at the history edge (d5 None). pre_iv prefers
+    atm_iv_event over atm_iv_30d on the pre-print session; future dates are ignored."""
+    import pandas as pd
+    from modules.vol_history import earnings_reactions
+
+    idx = pd.bdate_range("2026-01-05", periods=40)
+    c = [100.0] * 10 + [110.0] * 4 + [112.0] * 12 + [100.8] * 12 + [106.848] * 2
+    df = pd.DataFrame({"Close": c}, index=idx)
+    df["Open"] = df["Close"].shift(1).fillna(100.0)              # gap 0 by default
+    df.loc[idx[10], "Open"] = 108.0                              # E1 gaps +8%
+    df.loc[idx[26], "Open"] = 103.0
+    df["atm_iv_30d"] = 0.5
+    df["atm_iv_event"] = float("nan")
+    df.loc[idx[9], "atm_iv_event"] = 0.8                         # pre-print session of E1
+
+    earnings = [idx[10],                                         # BMO: +10% ON the date
+                idx[25],                                         # AMC: −10% the NEXT session
+                idx[38],                                         # +6%, too close to the edge for d5
+                idx[-1] + pd.Timedelta(days=5)]                  # future → ignored
+    out = earnings_reactions(df, earnings)
+    assert out["status"] == "ok" and len(out["rows"]) == 3
+    e3, e2, e1 = out["rows"]                                     # newest first
+
+    assert e1["date"] == idx[10].date().isoformat()
+    assert abs(e1["d1"] - 0.10) < 1e-9 and abs(e1["gap"] - 0.08) < 1e-9
+    assert abs(e1["d5"] - 0.12) < 1e-9                           # Close[14]=112 vs 100
+    assert e1["pre_iv"] == 0.8                                   # event IV preferred
+
+    assert e2["date"] == idx[26].date().isoformat()              # AMC → next session picked
+    assert e2["d1"] < -0.09 and e2["pre_iv"] == 0.5              # 30d fallback
+
+    assert e3["d5"] is None and e3["d1"] > 0.05                  # history edge
+    assert out["up"] == 2 and out["dn"] == 1
+    assert abs(out["med_abs_d1"] - 0.10) < 1e-9
+
+    assert earnings_reactions(df, [])["status"] == "no_earnings"
+    assert earnings_reactions(None, earnings)["status"] == "no_csv"

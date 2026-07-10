@@ -48,6 +48,13 @@ GAUGES = [
     # Credit & rates stress
     {"name": "HY OAS (credit)","group": "CREDIT", "src": "fred", "sym": "BAMLH0A0HYM2","fmt": "{:.2f}", "stress": "high"},
     {"name": "MOVE (bond vol)","group": "CREDIT", "src": "yf",   "sym": "^MOVE",      "fmt": "{:.1f}", "stress": "high"},
+    # Rates & financial conditions (S53) — the long-duration-equity backdrop: growth names
+    # (most of this project's tickers) trade off real yields; curve inversion + tight
+    # conditions are the classic risk-off tells
+    {"name": "Curve 10y-2y",  "group": "RATES",  "src": "fred", "sym": "T10Y2Y",     "fmt": "{:+.2f}", "stress": "low"},
+    {"name": "10y real yield","group": "RATES",  "src": "fred", "sym": "DFII10",     "fmt": "{:.2f}", "stress": "high"},
+    {"name": "Breakeven 10y", "group": "RATES",  "src": "fred", "sym": "T10YIE",     "fmt": "{:.2f}", "stress": "high"},
+    {"name": "NFCI (fin cond)","group": "RATES", "src": "fred", "sym": "NFCI",       "fmt": "{:+.2f}", "stress": "high"},
     # Geo-sensitive sectors
     {"name": "Defense (ITA)", "group": "SECTORS", "src": "yf",   "sym": "ITA",        "fmt": "{:.2f}", "stress": "high"},
     {"name": "Semis (SOX)",   "group": "SECTORS", "src": "yf",   "sym": "^SOX",       "fmt": "{:.0f}", "stress": "low"},

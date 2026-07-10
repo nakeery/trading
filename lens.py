@@ -480,7 +480,10 @@ def analyze(ticker, include_intraday=True, data_dir="data", live=False):
     # from the 1D close — the 1h cache can lag it (stale-cache fallback), skewing price_location.
     lookback = 880 if "1h" in frames else 252
     ref = float(frames["1D"]["Close"].iloc[-1]) if "1D" in frames else None
-    profile = (volume_profile(prof_src, lookback=lookback, ref_price=ref)
+    # with_hist: lens_web renders THIS profile on the chart (S54 — the chart previously
+    # recomputed its own on daily/1y, which could disagree wildly with the report's 1h/6mo
+    # levels); the hist lists are plain floats, payload stays picklable, print ignores them
+    profile = (volume_profile(prof_src, lookback=lookback, ref_price=ref, with_hist=True)
                if prof_src is not None else None)
     return frames, reads, divs, summary, profile, notes, live_bar
 

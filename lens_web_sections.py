@@ -121,12 +121,17 @@ def sec_header(p):
             else f"close {p['as_of']}" if p.get("as_of") else "")
     rng = lb["high"] - lb["low"]
     rng_pct = (rng / lb["prev_close"] * 100) if lb["prev_close"] else 0.0
-    c = st.columns(5)
+    r52 = p.get("range52")                # web-side injection (S53) — absent in the raw payload
+    c = st.columns(6 if r52 else 5)
     c[0].metric(f"{p['ticker']}  ·  {when}", f"${lb['close']:,.2f}", f"{chg:+.2f} ({pct:+.2f}%)")
     c[1].metric("Open", f"${lb['open']:,.2f}")
     c[2].metric("High", f"${lb['high']:,.2f}")
     c[3].metric("Low", f"${lb['low']:,.2f}")
     c[4].metric("Range", f"${rng:,.2f}", f"{rng_pct:.2f}%", delta_color="off")
+    if r52:
+        c[5].metric("52w range", f"{r52['pos']:.0%} of range",
+                    "at 52w high" if r52["off_hi"] <= 0.001
+                    else f"−{r52['off_hi']:.1%} from high", delta_color="off")
     st.caption("state characterization, NOT a prediction")
 
 
