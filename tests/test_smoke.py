@@ -1378,7 +1378,7 @@ def test_gather_payload_keys(monkeypatch):
     expected = {"ticker", "reads", "divs", "summary", "profile", "notes", "last_bar", "as_of",
                 "panel_bars", "ctx", "backdrop", "geo", "pcoi", "gex", "vol", "live", "setup",
                 "squeeze", "insider", "callq", "liq", "cats", "risk", "macro_events",
-                "thesis", "level", "live_iv", "earn", "exd"}
+                "thesis", "level", "live_iv", "earn", "exd", "as_of_mode"}
     assert set(payload.keys()) == expected
     assert not any(isinstance(v, (pd.DataFrame, pd.Series)) for v in payload.values())
     assert payload["reads"] and payload["risk"] is not None      # frames were read + risk lifted
@@ -1722,3 +1722,82 @@ def test_web_snapshot_diff_and_slugs():
     assert _slug("OPTIONS & VOL CONTEXT  (regime: calm)") == "options-vol-context"
     assert _slug("SHORT POSITIONING / SQUEEZE  (context, not a prediction)") \
         == "short-positioning-squeeze"
+
+
+# ─── Test 46: as-of historical truncation (S57 backtest mode, offline) ───────────
+def test_as_of_truncation():
+    """The S57 date-range/backtest mode: build_timeframes truncates the SOURCE frames (the
+    forming week/month as of that date survives — truncating resampled labels would drop it),
+    gather_context reads every gauge/percentile off the truncated frame, last_bar_partial
+    honors the historical session via now_session, and an as-of before the data raises."""
+    import pandas as pd
+    import pytest
+    from modules.timeframes import build_timeframes, last_bar_partial
+    from modules.sentiment import gather_context
+
+    asof = "2024-06-27"                                     # a Thursday trading day
+    frames, _ = build_timeframes("QQQ", data_dir="data", include_intraday=False, as_of=asof)
+    cut = pd.Timestamp(asof)
+    assert frames["1D"].index.max() <= cut
+    # the forming week/month resample only from bars ≤ as-of → their close == the 1D close
+    d_last = float(frames["1D"]["Close"].iloc[-1])
+    for tf in ("1W", "1M"):
+        assert abs(float(frames[tf]["Close"].iloc[-1]) - d_last) < 1e-9
+    # Thursday as-of → 4-bar forming week clears the count heuristic (4 ≥ 0.7×5), so ONLY the
+    # calendar check can mark it partial — and that needs the HISTORICAL session, not the wall
+    # clock (against today the 2024 week-end label is long past). The override is load-bearing.
+    assert last_bar_partial(frames["1D"], "1W", now_session=frames["1D"].index[-1])
+    assert not last_bar_partial(frames["1D"], "1W")
+
+    ctx = gather_context("QQQ", data_dir="data", with_vix=False, as_of=asof)
+    assert ctx["as_of"] == "2024-06-27"                     # gauges read as of that session
+    assert all(g.get("value") is not None for g in ctx["gauges"])
+
+    with pytest.raises(FileNotFoundError):                  # as-of predating all data
+        build_timeframes("QQQ", data_dir="data", include_intraday=False, as_of="1970-01-02")
+
+
+# ─── Test 47: trend-regime read (S57 — "inside a rally" detection, offline) ──────
+def test_trend_regime():
+    """The overbought-can-stay-overbought fix: during an established trend the risk scorecard's
+    stretch factors fire continuously (accurately — but they read like a top call, the AMD
+    Mar–Apr 2026 run being the motivating case). trend_regime labels the trend from reads the
+    lens already computes; the factor tallies stay untouched (S43)."""
+    import numpy as np
+    import pandas as pd
+    from modules.structure import (trend_regime, read_timeframe, rally_drawdown_risk,
+                                   REGIME_MIN_RUN)
+
+    reads = {"1D": {"ok": True, "trend": "up", "ma20_run": 14,
+                    "_vol": {"ok": True, "tag": "up-confirmed", "price_chg_10": 0.31}},
+             "1W": {"ok": True, "trend": "up"}, "1M": {"ok": True, "trend": "up"}}
+    r = trend_regime(reads)
+    assert r and r["state"] == "up" and r["label"] == "ESTABLISHED UPTREND"
+    assert r["why"][0] == "1D+1W+1M trends aligned up"
+    assert "14 consecutive sessions above" in r["why"][1]
+    assert "PULLBACK" in r["note"] and "not a top call" in r["note"]
+
+    # a short MA20 run is a poke, not a regime; 1W disagreement kills it; empty reads → None
+    assert trend_regime({**reads, "1D": {**reads["1D"],
+                                         "ma20_run": REGIME_MIN_RUN - 1}}) is None
+    assert trend_regime({**reads, "1W": {"ok": True, "trend": "mixed"}}) is None
+    assert trend_regime({}) is None
+
+    # symmetric downtrend (the oversold-stays-oversold mirror); 1M disagrees → not listed
+    dn = {"1D": {"ok": True, "trend": "down", "ma20_run": -9, "_vol": {}},
+          "1W": {"ok": True, "trend": "down"}, "1M": {"ok": True, "trend": "up"}}
+    rd = trend_regime(dn)
+    assert rd["state"] == "down" and rd["why"][0] == "1D+1W trends aligned down"
+    assert "BOUNCE" in rd["note"]
+
+    # ma20_run wiring end-to-end: a steady ramp closes above a rising MA20 every bar → long
+    # positive run, and the regime rides rally_drawdown_risk's return (tallies untouched)
+    idx = pd.date_range("2025-01-01", periods=120, freq="B")
+    c = pd.Series(np.linspace(100, 200, 120), index=idx)
+    df = pd.DataFrame({"Open": c, "High": c * 1.01, "Low": c * 0.99, "Close": c,
+                       "Volume": 1e6}, index=idx)
+    rt = read_timeframe(df)
+    assert rt["ok"] and rt["trend"] == "up" and rt["ma20_run"] >= 90
+    risk = rally_drawdown_risk({"1D": rt, "1W": rt}, profile=None, ctx=None, divergences={})
+    assert risk["regime"] and risk["regime"]["state"] == "up"
+    assert rally_drawdown_risk({}, profile=None, ctx=None, divergences={})["regime"] is None

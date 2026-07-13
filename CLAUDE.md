@@ -80,6 +80,29 @@ python lens.py --ticker CRSP --squeeze      # SHORT POSITIONING / SQUEEZE block 
 # shared lens.render_ticker(). Non-interactive server mode: stale caches reused (tick "live" to force).
 .\trade\Scripts\python.exe -m streamlit run lens_web.py     # → http://localhost:8501
 
+python lens.py --ticker QQQ --as-of 2025-03-10   # AS-OF / BACKTEST mode (S57): the whole report
+# computed as of a PAST date — every frame truncated engine-side before the reads (forming W/M
+# bars resample from source ≤ as-of; last_bar_partial gets the historical session), so trend/
+# momentum/volume/profile/risk/setup/gauges/percentiles have NO LOOKAHEAD. Historically valid:
+# VIX complex (refetched for the window), SKEW/VVIX (≤2y), SPY tide backdrop, macro proximity
+# (econ cache has 5y history), catalysts.csv (today=as_of), as-of next-earnings (yfinance list,
+# trusted ≤120d), RS/beta (auto-degrade to n/a beyond the 6mo benchmark fetch), --vol scorecard/
+# expected move. Disabled with a note (current-only): live chain quotes (pc-oi/gex/vol quote/
+# call), squeeze, insider, geo, breadth/F&G/COT, ex-div, liquidity line, live. Purpose: backtest
+# YOUR OWN chart reads against what the lens would have said then. lens_web: "🕰 date range /
+# as-of backtest" expander (as-of date + optional chart-from window start — display-only, no
+# regenerate) + ?asof=YYYY-MM-DD&from=YYYY-MM-DD deep links; snapshots/diff/ledger suppressed
+# in as-of mode (no history pollution, no realized-outcome leakage).
+# S57 also adds a TREND REGIME line on the risk scorecard (structure.trend_regime — the
+# "overbought can stay overbought" fix, motivated by AMD's Mar–Apr 2026 run reading "DRAWDOWN
+# risk elevated 7v0" mid-rally): 1D+1W trend agreement (1M strengthens) + a ≥REGIME_MIN_RUN(5)-
+# session close streak on one side of the daily MA20 (`ma20_run`, new read_timeframe field) →
+# "ESTABLISHED UPTREND/DOWNTREND — …why…" + a which-lens-to-read-the-factors-through note
+# (stretch in an intact uptrend = PULLBACK timing, not a top call; washout in a downtrend =
+# BOUNCE risk, not a bottom call). Factor TALLIES untouched (S43 — trend-in-force would be
+# near-always-on during rallies). Rides risk["regime"]; web shows a pill + caption in the risk
+# panel and regime FLIPS surface in the "Δ what changed" diff.
+
 python lens.py --ticker QQQ --gex           # GAMMA EXPOSURE block (S56): dealer GEX by strike off
 # the live Tradier chain (expiries ≤60d via select_gex_expiries — nearest 5 + monthlies, capped 8;
 # session-stale cache like --pc-oi) — net GEX regime (dealers long/short gamma → stabilizing vs
@@ -117,7 +140,7 @@ Run smoke tests:
 
 ```powershell
 .\trade\Scripts\python.exe -m pytest tests/ -v
-# 45 tests, ~3-9s. Requires data/QQQ_indicators.csv + data/QQQ_backtest_results.csv.
+# 47 tests, ~3-9s. Requires data/QQQ_indicators.csv + data/QQQ_backtest_results.csv.
 ```
 
 ### Prompt counts per script (for piped input via Claude Code)
@@ -135,8 +158,8 @@ Run smoke tests:
 | modules/vol_history.py | 1 (ticker); run as `python -m modules.vol_history`. Pre-earnings vol study; TTY-gated backfill prompt if IV history is thin. Non-interactive when imported by `lens.py --vol`. |
 | econ_calendar_view.py | 0 (argparse flags only — no prompts) |
 | market_context.py | 1 (ticker) + argparse flags (--graphical / --save-only / --no-vix) |
-| lens.py | 1 (ticker; or `--ticker QQQ JPM …` to skip prompt) + argparse flags (--thesis / --level / --geo / --no-intraday / --no-vix / --no-color / --candle box\|braille\|sixel\|none / --candle-px N / --prev N / --no-refresh / --refresh / --pc-oi [all\|near\|leaps\|monthly …] / --vol / --call / --gex / --live / --squeeze / --insider) |
-| lens_web.py | 0 prompts — browser UI; run `.\trade\Scripts\python.exe -m streamlit run lens_web.py` (not for piped/Claude runs; use lens.py). Deep links: `?ticker=QQQ&gex=1` (S56) |
+| lens.py | 1 (ticker; or `--ticker QQQ JPM …` to skip prompt) + argparse flags (--thesis / --level / --geo / --no-intraday / --no-vix / --no-color / --candle box\|braille\|sixel\|none / --candle-px N / --prev N / --no-refresh / --refresh / --as-of YYYY-MM-DD / --pc-oi [all\|near\|leaps\|monthly …] / --vol / --call / --gex / --live / --squeeze / --insider) |
+| lens_web.py | 0 prompts — browser UI; run `.\trade\Scripts\python.exe -m streamlit run lens_web.py` (not for piped/Claude runs; use lens.py). Deep links: `?ticker=QQQ&gex=1` (S56), `&asof=2025-03-10&from=2024-06-03` (S57 backtest/date-range) |
 | score_ledger.py | 0 with `--ticker SYM`, else 1 (ticker; EOF-safe default QQQ) |
 
 ### Running scripts via Claude Code on Windows
@@ -194,7 +217,7 @@ cmd /c "(echo TICKER && echo.) | python -X utf8 script.py" 2>&1
 | `modules/breadth.py` | **(S45)** Equal-weight market breadth — RSP−SPY + QQQE−QQQ 20d/63d relative returns (cap-weighted "SPY up" can be a narrow mega-cap-led tape; the equal-weight twin reads the AVERAGE stock). Pure `read_breadth` (tags broad-led/narrow/mixed on a ±0.5% band; percentile off the rolling 20d-spread series — short horizons + own-series percentile sidestep the secular mega-cap drift) + `fetch_breadth` (one batched yfinance download, cached `data/breadth_cache.json` ~6h, stale fallback, never raises). Shown on the lens MARKET BACKDROP line + as market_context.py gauges. CONTEXT only — never a model feature, deliberately NOT a risk-scorecard factor (S43 lesson) | Imported by `lens.py` + `market_context.py` |
 | `modules/callquote.py` | **(S46)** Long-call viability quote for `lens.py --call` — the directional instrument's carry math off the live Tradier chain: nearest monthlies to 45/90 DTE (`_select_expiries`), ATM + ~0.375Δ candidates (`pick_call_candidates`; no-bid strikes skipped) with mid premium, breakeven move, **theta/day as % of premium**, OI/spread (+at-ask line when mid understates >3%), earnings- and ex-div-aware per-expiry notes, an ATM-IV-by-expiry curve (`curve_read`, ≤5 monthlies ≤150d) and a chain `liquidity_grade` (ATM-region median spread + OI → tight/ok/wide/dead). Cached session-stale like volquote (SCOPEKEY call1, `force=` under `--live`); `cached_liquidity` serves the grade zero-network to the default-on OPTIONS line | Imported by `lens.py` (`--call` + the default-on liquidity line) |
 | `modules/insider.py` | **(S42)** SEC EDGAR insider activity for `lens.py --insider`. Official free APIs: `company_tickers.json` ticker→CIK (7d cache) → `data.sec.gov` submissions → per-filing Form 4 XML (xsl prefix stripped; stdlib ElementTree). Non-derivative open-market P/S only; trailing-90d net $ flow + `cluster_buys` (≥2 DISTINCT insiders buying inside any 30d window — Lakonishok-Lee) + two-sided `insider_read` with always-printed caveats (sales = weak signal; Form 4 ≤2-day lag; 10b5-1 not separated). SEC fair-access: contact email in UA (`$env:SEC_CONTACT` overrides), 0.12s/req, ≤25 filings/run; summary cached session-stale under `data/insider_cache/` | Imported by `lens.py` (`--insider`) |
-| `tests/test_smoke.py` | 45 pytest regression guards (signal hierarchy, STRONG ENTRY baseline, vol thresholds, signal logic, S16 threshold-sensitivity, econ_calendar loads, Days_to_* bounds, days-to-specific-event, regime thresholds/gate/NaN, next_event/upcoming shape, sentiment labelers, S35 geocontext stress/composite, S38 volquote snap + expiry selection, S39 vol-history study, S40 vol_setup factors + live-bar append + intraday top-up merge, S41 shortint parsers/scorecard + setupcheck + fng parser, S42 insider Form 4 parse + cluster detection, S43 last_bar_partial calendar check + vol_setup em-factor removal, S44 backfill per-cell no-overwrite + event-expiry IV selection/tenor guard, S45 equal-weight breadth read, S46 callquote candidates/liquidity-grade/IV-curve + beta/ex-div/catalysts helpers, S47 long-tenor ATM pick, S48 candle-none render path, S49 render_payload/print_report byte-equality + lifted risk/macro kwargs identity + gather_report payload contract + ordinal-percentile display, S53 seasonality/earnings-reactions, S56 GEX math incl. zero-gamma/max-pain/unusual-activity + ledger scorer + COT/buzz/FINRA-SI parsers + lens_web snapshot-diff/anchor-slugs) | Run manually; requires `data/QQQ_*.csv` |
+| `tests/test_smoke.py` | 47 pytest regression guards (signal hierarchy, STRONG ENTRY baseline, vol thresholds, signal logic, S16 threshold-sensitivity, econ_calendar loads, Days_to_* bounds, days-to-specific-event, regime thresholds/gate/NaN, next_event/upcoming shape, sentiment labelers, S35 geocontext stress/composite, S38 volquote snap + expiry selection, S39 vol-history study, S40 vol_setup factors + live-bar append + intraday top-up merge, S41 shortint parsers/scorecard + setupcheck + fng parser, S42 insider Form 4 parse + cluster detection, S43 last_bar_partial calendar check + vol_setup em-factor removal, S44 backfill per-cell no-overwrite + event-expiry IV selection/tenor guard, S45 equal-weight breadth read, S46 callquote candidates/liquidity-grade/IV-curve + beta/ex-div/catalysts helpers, S47 long-tenor ATM pick, S48 candle-none render path, S49 render_payload/print_report byte-equality + lifted risk/macro kwargs identity + gather_report payload contract + ordinal-percentile display, S53 seasonality/earnings-reactions, S56 GEX math incl. zero-gamma/max-pain/unusual-activity + ledger scorer + COT/buzz/FINRA-SI parsers + lens_web snapshot-diff/anchor-slugs, S57 as-of truncation — source-frame truncate + forming-period survival + historical last_bar_partial + gather_context as-of, S57 trend_regime — established up/downtrend detection + ma20_run streak + tallies-untouched guard) | Run manually; requires `data/QQQ_*.csv` |
 
 All CSVs and PNGs are written to the `data/` subdirectory (must exist — create manually if missing).
 

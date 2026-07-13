@@ -55,6 +55,19 @@ def read_timeframe(ohlcv):
     lo, hi = c.iloc[-win:].min(), c.iloc[-win:].max()
     range_pos = (price - lo) / (hi - lo) if hi > lo else 0.5
 
+    # consecutive closes on ONE side of MA20 (S57 trend-regime read): +N above / −N below, 0
+    # unknown. Persistence is what separates "inside an established trend" from a one-bar poke.
+    ma20_run = 0
+    if m20 is not None:
+        rel, valid = c > ma20, ma20.notna()
+        last_side = bool(rel.iloc[-1])
+        for above, ok_ma in zip(rel.iloc[::-1], valid.iloc[::-1]):
+            if not ok_ma or bool(above) != last_side:
+                break
+            ma20_run += 1
+        if not last_side:
+            ma20_run = -ma20_run
+
     # States are None (not a definite label) when the underlying indicator is NaN — a 30–33-bar
     # frame has no MACD signal yet and used to print a confident "bearish" from it (S43).
     return {
@@ -70,6 +83,7 @@ def read_timeframe(ohlcv):
                        "overbought" if st >= 80 else "oversold" if st <= 20 else "neutral",
         "macd_state": None if (ml is None or ms is None) else "bullish" if ml > ms else "bearish",
         "range_pos": range_pos,
+        "ma20_run": ma20_run,
     }
 
 
@@ -205,9 +219,55 @@ def multi_timeframe_summary(reads):
             "rsi_conflict": rsi_conflict, "synthesis": synth}
 
 
+REGIME_MIN_RUN = 5      # consecutive daily closes on one side of MA20 before a trend counts as
+                        # "established" — shorter runs are pokes, not regimes
+
+
+def trend_regime(reads, min_run=REGIME_MIN_RUN):
+    """(S57) Are we INSIDE an established rally / decline right now? The 'overbought can stay
+    overbought' answer: during a strong trend the risk scorecard's stretch (or washout) factors
+    fire continuously — accurately, but they read like a top (bottom) call. This labels the
+    trend so those factors can be read as pullback/bounce TIMING instead. Transparent rule over
+    reads the lens already computes: 1D+1W trend agreement (1M strengthens it), a ≥min_run-
+    session close streak on the daily-MA20 side, and the 1D volume tag as texture. Returns
+    {state: up|down, label, why: [...], note} or None (no established regime). NOT a
+    prediction — regimes end without notice; the BREAK of the listed conditions is the tell."""
+    d, w, m = reads.get("1D") or {}, reads.get("1W") or {}, reads.get("1M") or {}
+    if not (d.get("ok") and w.get("ok")):
+        return None
+    run = d.get("ma20_run") or 0
+    vol = d.get("_vol") or {}
+    for side, sign in (("up", 1), ("down", -1)):
+        if d.get("trend") != side or w.get("trend") != side or sign * run < min_run:
+            continue
+        tfs = "1D+1W" + ("+1M" if m.get("trend") == side else "")
+        why = [f"{tfs} trends aligned {side}",
+               f"{abs(run)} consecutive sessions {'above' if sign > 0 else 'below'} the daily MA20"]
+        if vol.get("ok") and vol.get("tag"):
+            why.append(f"1D volume {vol['tag']}")
+        if vol.get("price_chg_10") is not None:
+            why.append(f"{vol['price_chg_10']:+.1%} over 10 sessions")
+        if side == "up":
+            note = ("stretch/overbought factors persist inside established uptrends — read the "
+                    "drawdown side as PULLBACK risk and add-timing, not a top call; the regime "
+                    "BREAK (daily MA20 loss, distribution volume, 1W trend flip) is the tell")
+        else:
+            note = ("washout/oversold factors persist inside established downtrends — read the "
+                    "rally side as BOUNCE risk, not a bottom call; the regime BREAK (daily MA20 "
+                    "reclaim, accumulation volume, 1W trend flip) is the tell")
+        return {"state": side,
+                "label": "ESTABLISHED UPTREND" if side == "up" else "ESTABLISHED DOWNTREND",
+                "why": why, "note": note}
+    return None
+
+
 def rally_drawdown_risk(reads, profile=None, ctx=None, divergences=None):
-    """Two-sided transparent scorecard. Returns {drawdown: [factors], rally: [factors], net}.
-    Each factor is a short string naming the condition + its source. NOT a forecast."""
+    """Two-sided transparent scorecard. Returns {drawdown: [factors], rally: [factors], net,
+    regime}. Each factor is a short string naming the condition + its source. NOT a forecast.
+    `regime` (S57) = trend_regime(reads): the factor TALLIES stay untouched (S43 — trend-in-
+    force would be a near-always-on tally member during rallies), but the regime line tells the
+    reader which lens to read them through — stretched-in-an-intact-trend is pullback timing,
+    stretched-and-cracking is the actual top-risk case."""
     dd, rally = [], []
     daily = reads.get("1D", {})
 
@@ -274,4 +334,6 @@ def rally_drawdown_risk(reads, profile=None, ctx=None, divergences=None):
     net = ("DRAWDOWN risk elevated" if len(dd) > len(rally)
            else "RALLY-favorable" if len(rally) > len(dd)
            else "balanced / no clear lean")
-    return {"drawdown": dd, "rally": rally, "net": f"{net}  ({len(dd)} drawdown vs {len(rally)} rally factors)"}
+    return {"drawdown": dd, "rally": rally,
+            "net": f"{net}  ({len(dd)} drawdown vs {len(rally)} rally factors)",
+            "regime": trend_regime(reads)}

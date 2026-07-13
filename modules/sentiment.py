@@ -154,7 +154,7 @@ def _net_read(atm_iv, hv_20, skew, term, pc_oi, regime):
             "size up, don't fade; see S21.)")
 
 
-def gather_context(ticker, data_dir="data", with_vix=True):
+def gather_context(ticker, data_dir="data", with_vix=True, as_of=None):
     """
     Assemble the consolidated market-context gauges for `ticker`.
 
@@ -163,8 +163,16 @@ def gather_context(ticker, data_dir="data", with_vix=True):
 
     group ∈ {OPTIONS, VOL, MARKET}; pct is the trailing-1y percentile (0-1) or None.
     Never raises on data gaps — missing blocks are skipped with a note.
+    `as_of` (S57 — historical/backtest mode): truncate the indicators frame to that date, so
+    every gauge, percentile, spark, and stale flag reads as it stood then (no lookahead). The
+    VIX complex refetches for the truncated window (decades of history — fully historical);
+    SKEW/VVIX only reach ~2y back (period-limited fetch) and drop out silently beyond that.
     """
     df = compute_hv_features(_load_indicators(ticker, data_dir))   # adds HV_20, IV_rank, IV_pct
+    if as_of is not None:
+        df = df.loc[:pd.Timestamp(as_of).normalize()]
+        if len(df) == 0:
+            raise ValueError(f"no {ticker} indicator rows on/before {as_of}")
     gauges, notes = [], []
     as_of = df.index[-1].date().isoformat()
 
@@ -298,6 +306,15 @@ def gather_context(ticker, data_dir="data", with_vix=True):
                                progress=False, auto_adjust=True)["Close"]
             sk = tail["^SKEW"].dropna() if "^SKEW" in tail else pd.Series(dtype=float)
             vv = tail["^VVIX"].dropna() if "^VVIX" in tail else pd.Series(dtype=float)
+            if as_of is not None:                      # 2y fetch window — empty beyond it → skipped
+                def _cut(s):
+                    if not len(s):
+                        return s
+                    c = pd.Timestamp(as_of).normalize()
+                    if getattr(s.index, "tz", None) is not None:
+                        c = c.tz_localize(s.index.tz)
+                    return s.loc[:c]
+                sk, vv = _cut(sk), _cut(vv)
             if len(sk):
                 v = float(sk.iloc[-1])
                 gauges.append({"group": "MARKET", "name": "SKEW (CBOE)", "value": v,

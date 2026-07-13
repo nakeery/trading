@@ -127,11 +127,20 @@ def _topup_intraday(h1, ticker, notes):
 
 
 def build_timeframes(ticker, data_dir=DATA_DIR, include_intraday=True, intraday_ttl_hours=3,
-                     live=False):
+                     live=False, as_of=None):
     """{tf: ohlcv_df} for the available timeframes, plus a list of notes about anything omitted.
     `live=True` (lens --live) tops the 1h frame up to the current session via Tradier timesales,
-    so the 1h/4h rows stay current even when the yfinance intraday download is stale or refused."""
+    so the 1h/4h rows stay current even when the yfinance intraday download is stale or refused.
+    `as_of` (S57 — historical/backtest mode): truncate the SOURCE frames to that date BEFORE
+    resampling, so the forming week/month as of that date is exactly what a viewer saw then —
+    truncating the resampled frames by label would instead drop the forming period (a W-FRI
+    label is the period-END Friday, which sits past a mid-week as-of)."""
     daily = _load_daily(ticker, data_dir)
+    if as_of is not None:
+        cutoff = pd.Timestamp(as_of).normalize()
+        daily = daily.loc[:cutoff]
+        if len(daily) == 0:
+            raise FileNotFoundError(f"no {ticker} data on/before {cutoff.date()}")
     frames = {
         "1D": daily,
         "1W": _resample(daily, "W-FRI"),
@@ -143,6 +152,11 @@ def build_timeframes(ticker, data_dir=DATA_DIR, include_intraday=True, intraday_
             h1 = _load_intraday(ticker, intraday_ttl_hours, notes=notes)
             if live:
                 h1 = _topup_intraday(h1, ticker, notes)
+            if as_of is not None:
+                # intraday timestamps run through the session — keep the whole as-of day
+                h1 = h1[h1.index < pd.Timestamp(as_of).normalize() + pd.Timedelta(days=1)]
+                if len(h1) == 0:
+                    raise RuntimeError("intraday history does not reach the as-of date")
             frames["1h"] = h1
             frames["4h"] = _resample(h1, "4h")
         except Exception as e:

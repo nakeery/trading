@@ -266,6 +266,16 @@ def sec_risk(p):
         return
     _sec("RALLY vs DRAWDOWN RISK  (current conditions, not a forecast)")
     _net("NET", risk.get("net", "n/a"))
+    reg = risk.get("regime")
+    if reg:
+        # S57 trend-regime context — the tallies below stay two-sided; this line says which
+        # lens to read them through (stretch inside an intact trend = pullback timing)
+        col = GREEN if reg.get("state") == "up" else RED
+        st.markdown(f'{_pill(reg.get("label", ""), col)}&nbsp; <span style="color:{INK};">'
+                    f'{html.escape(" · ".join(reg.get("why") or []))}</span>',
+                    unsafe_allow_html=True)
+        if reg.get("note"):
+            st.caption(f"↳ {reg['note']}")
     c1, c2 = st.columns(2)
     with c1:
         if risk.get("drawdown"):

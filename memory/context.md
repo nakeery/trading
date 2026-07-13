@@ -15,7 +15,8 @@ LONG CALLS at 6–12mo tenors (sizing.py MIN_DTE=180) — hence the S46/S47 addi
 
 Run:
 - CLI: `python -X utf8 lens.py --ticker QQQ` (+ flags: --vol --call --pc-oi --squeeze --insider
-  --geo --live --thesis/--level --candle box|braille|sixel|none --no-refresh/--refresh).
+  --geo --live --thesis/--level --candle box|braille|sixel|none --no-refresh/--refresh
+  --as-of YYYY-MM-DD).
 - Web: `.\trade\Scripts\python.exe -m streamlit run lens_web.py` → localhost:8501.
 - Both share `lens.render_ticker(ticker, args, use_color, interactive, backdrop_base)` +
   `build_backdrop(data_dir)` (S48 extraction, byte-identical to the old CLI). `interactive`
@@ -37,7 +38,9 @@ What the lens prints (all CONTEXT): header+candles (two-axis hollow convention: 
 close, FILL = vs open) · MARKET BACKDROP (SPY trend, equal-weight breadth RSP−SPY/QQQE−QQQ, CNN
 F&G, VIX regime) · MULTI-TIMEFRAME 1M/1W/1D/4h/1h table (partial bars marked *, calendar-aware
 S43) · divergences · volume profile (POC/value area/HVN/LVN) · two-sided RALLY vs DRAWDOWN
-scorecard · SETUP CHECK ✓/✗/– checklist (HTF alignment, momentum, volume, RS vs benchmark,
+scorecard (+S57 TREND REGIME line: ESTABLISHED UPTREND/DOWNTREND off 1D+1W alignment + a ≥5-
+session MA20-side close streak — stretch factors mid-rally read as PULLBACK timing, not a top
+call; tallies untouched per S43) · SETUP CHECK ✓/✗/– checklist (HTF alignment, momentum, volume, RS vs benchmark,
 market beta vs SPY, location, vol regime, catalyst timing + ex-div) · OPTIONS & VOL CONTEXT
 gauges with trailing percentiles + cached liquidity line · KNOWN CATALYSTS (catalysts.csv) ·
 macro ≤10d · optional blocks per flag (below).
@@ -114,6 +117,24 @@ lens_web.py specifics (S48, +S49 native visuals):
   rows); polish — `?ticker=QQQ&gex=1` deep links (read once pre-widgets, written back after
   each generate), st.status stage log (compute preamble visible), `.streamlit/config.toml`
   dark theme, sidebar quick-nav (anchor slugs stamped by `lens_web_sections._slug`).
+- **S57 as-of / date-range backtest mode** (user request: backtest their OWN charting theory):
+  `lens.py --as-of YYYY-MM-DD` + web "🕰 date range / as-of backtest" expander +
+  `?asof=…&from=…` deep links. Engine: `build_timeframes(as_of=)` truncates the SOURCE frames
+  before resampling (forming W/M periods survive — truncating resampled labels would drop
+  them; NB inside gather_report the mode var is `asof_ts`, NOT `as_of` — that name is already
+  the report's last-bar date and shadowing it broke the payload), `analyze` passes the
+  historical session to `last_bar_partial(now_session=)` (a Thursday forming week clears the
+  count heuristic — only the calendar check vs the HISTORICAL session marks it), and
+  `gather_context(as_of=)` truncates the indicators frame so every gauge/percentile/spark/
+  stale-flag reads as of then (VIX refetched for the window = fully historical; SKEW/VVIX
+  ≤2y then silently absent). Historically valid: SPY-tide backdrop, macro proximity (5y econ
+  cache), catalysts (`today=as_of`), as-of next-earnings (yfinance list, trusted ≤120d),
+  RS/beta (auto-degrade beyond the 6mo benchmark fetch), --vol scorecard/EM. Disabled with
+  ONE note: live-chain quotes (pc-oi/gex/vol quote/call), squeeze, insider, geo,
+  breadth/F&G/COT, ex-div, liquidity, live. Web: banner + chart/IV-history/earnings-reactions
+  truncated (`chart_frame(ticker, as_of, start)`); `from` widens the chart window only
+  (NOT in flags_key — never regenerates); snapshots/diff/ledger suppressed in as-of mode
+  (no history pollution / realized-outcome leakage). Payload key `as_of_mode` (iso|None).
 - **S55 cleanup pass**: one cached full-history loader `load_daily_full` (chart tail +
   seasonality previously each ran `_load_daily` = two full yfinance downloads for CSV-less
   tickers); the daily/1y profile fallback + its dead transition caption removed (payload
@@ -130,8 +151,10 @@ Modules the lens/web stack uses
 - `timeframes.py` — per-TF OHLCV (CSV else yfinance; 1h cached + Tradier timesales top-up in
   --live), `last_bar_partial` (calendar-aware S43), `fetch_live_bar`/`append_live_bar`.
 - `structure.py` — transparent per-TF reads (trend/RSI/Stoch/MACD — None states print "—" on
-  thin frames), `read_volume` (partial-bar aware), divergences, confluence summary,
-  `rally_drawdown_risk` two-sided scorecard, `read_squeeze` (BB-inside-KC).
+  thin frames; +S57 `ma20_run` signed MA20-side close streak), `read_volume` (partial-bar
+  aware), divergences, confluence summary, `rally_drawdown_risk` two-sided scorecard
+  (+S57 `regime` key via `trend_regime` — the overbought-stays-overbought fix, AMD Mar–Apr
+  2026 motivating case; regime flips surface in the web Δ-diff), `read_squeeze` (BB-inside-KC).
 - `volume_profile.py` — POC/value-area/HVN/LVN (+`with_hist=True` for the web histogram);
   `near_hvn_*` proximity-bounded ±`HVN_NEAR_PCT`=5% (S43 — "approaching" must mean near).
 - `sentiment.py` — `gather_context()` gauges: IV/HV, ATM IV (30d) **real harvested IV**,
@@ -202,7 +225,7 @@ Operational notes
 - Venv explicitly: `.\trade\Scripts\python.exe -X utf8 …` (+ `-X utf8` required on Windows).
   Piped runs: PowerShell tool, `cmd /c "(echo TICKER) | python -X utf8 script.py"`; prefer
   `--ticker` to skip prompts. Env vars ($PROFILE): MASSIVE_API_KEY, FRED_API_KEY, TRADIER_TOKEN.
-- Smoke: `.\trade\Scripts\python.exe -m pytest tests/ -q` (45 tests, offline, ~3-9s).
+- Smoke: `.\trade\Scripts\python.exe -m pytest tests/ -q` (47 tests, offline, ~3-9s).
 - Percentile gauges need ≥63 harvested rows per ticker — thin history prints the value with an
   explanatory note instead (GOOG case: 2 rows → no percentile until backfill or ~3 months).
 

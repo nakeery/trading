@@ -59,6 +59,10 @@ try:
 except Exception:
     next_ex_dividend = None
 try:
+    from modules.features import earnings_dates          # S57 as-of mode: historical "next earnings"
+except Exception:
+    earnings_dates = None
+try:
     from modules.callquote import call_quote, cached_liquidity
 except Exception:
     call_quote = cached_liquidity = None
@@ -454,9 +458,14 @@ def sixel_candles(bars, color=True, cell_w=14, gap=8, height_px=128):
     return _to_sixel(grid, palette)
 
 
-def analyze(ticker, include_intraday=True, data_dir="data", live=False):
+def analyze(ticker, include_intraday=True, data_dir="data", live=False, as_of=None):
+    """`as_of` (S57 — historical/backtest mode): every frame is truncated to that date before the
+    reads run, so trend/RSI/volume/profile/divergences are exactly what the lens would have said
+    then. Live mode is meaningless historically and is forced off."""
+    if as_of is not None:
+        live = False
     frames, notes = build_timeframes(ticker, data_dir=data_dir, include_intraday=include_intraday,
-                                     intraday_ttl_hours=0 if live else 3, live=live)
+                                     intraday_ttl_hours=0 if live else 3, live=live, as_of=as_of)
     live_bar = None
     if live:
         live_bar = fetch_live_bar(ticker)
@@ -468,12 +477,17 @@ def analyze(ticker, include_intraday=True, data_dir="data", live=False):
             live_bar["applied"] = apply_live_bar(frames, live_bar)
     live_partial = bool(live_bar and live_bar.get("applied") and live_bar.get("in_progress"))
     now_naive = pd.Timestamp.now(tz="America/New_York").tz_localize(None)
+    # as-of mode: the "most recent completed session" is the truncated frame's last bar, not the
+    # wall clock — otherwise a historical forming week/month would never earn its partial mark
+    asof_sess = (frames["1D"].index[-1].normalize()
+                 if (as_of is not None and "1D" in frames and len(frames["1D"])) else None)
     reads, divs = {}, {}
     for tf, df in frames.items():
         r = read_timeframe(df)
         if not r.get("ok"):
             continue
-        partial = last_bar_partial(frames.get("1D"), tf) or (live_partial and tf == "1D")
+        partial = (last_bar_partial(frames.get("1D"), tf, now_session=asof_sess)
+                   or (live_partial and tf == "1D"))
         if live and tf in ("1h", "4h") and len(df):
             # in live mode the last intraday bar can be the forming hour — treat it as partial so
             # RVOL/ΔVol% use the last completed bar (same convention as the W/M/1D partial bars).
@@ -654,6 +668,12 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         risk = rally_drawdown_risk(reads, profile=profile, ctx=ctx, divergences=divs)
     _section("RALLY vs DRAWDOWN RISK  (current conditions, not a forecast)", color)
     print(f"    NET: {risk['net']}")
+    reg = risk.get("regime")
+    if reg:
+        # S57 — inside an established trend the stretch/washout factors below fire continuously;
+        # the regime line says which lens to read them through (pullback timing vs a top call)
+        print(f"    regime: {reg['label']} — {' · '.join(reg['why'])}")
+        print(f"      ↳ {reg['note']}")
     if risk["drawdown"]:
         print(f"    drawdown-risk factors:")
         for f in risk["drawdown"]:
@@ -1021,10 +1041,12 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
     print(f"{'═'*w}\n")
 
 
-def market_backdrop(data_dir="data"):
-    """SPY D/W/M trend + (via gather_context) VIX regime — the macro tide."""
+def market_backdrop(data_dir="data", as_of=None):
+    """SPY D/W/M trend + (via gather_context) VIX regime — the macro tide. `as_of` (S57)
+    truncates the SPY frames so the tide reads historically."""
     try:
-        frames, _ = build_timeframes("SPY", data_dir=data_dir, include_intraday=False)
+        frames, _ = build_timeframes("SPY", data_dir=data_dir, include_intraday=False,
+                                     as_of=as_of)
         parts = []
         for tf in ("1M", "1W", "1D"):
             if tf in frames:
@@ -1132,6 +1154,15 @@ def gather_report(ticker, args, interactive, backdrop_base):
     reads print_report used to compute itself (rally/drawdown risk, macro events) are lifted
     here so a non-print renderer gets them without re-running module I/O. Returns None when
     data can't load (the error line is printed, matching the old inline behavior)."""
+    # AS-OF mode (S57 — backtest the user's own charting theory): every data frame is truncated
+    # to this date, so the report is what the lens would have said THEN. Live-chain / current-
+    # only blocks (Tradier quotes, GEX, short interest, insider, geo, breadth/F&G/COT) have no
+    # historical source and are disabled with a note.
+    # `asof_ts`, NOT `as_of` — gather_report already has a local `as_of` (the report's last-bar
+    # date string, assigned below); shadowing it broke the payload and the macro as-of read
+    asof_ts = getattr(args, "as_of", None)
+    asof_ts = pd.Timestamp(asof_ts).normalize() if asof_ts else None
+
     if not args.no_refresh:
         csv_missing = not os.path.exists(
             os.path.join(args.data_dir, f"{ticker.lower()}_indicators.csv"))
@@ -1141,15 +1172,25 @@ def gather_report(ticker, args, interactive, backdrop_base):
     try:
         frames, reads, divs, summary, profile, notes, live_bar = analyze(
             ticker, include_intraday=not args.no_intraday, data_dir=args.data_dir,
-            live=args.live)
+            live=args.live, as_of=asof_ts)
     except FileNotFoundError as e:
         print(f"  Could not load data for {ticker}: {e}")
         return
 
+    if asof_ts is not None:
+        on_flags = [name for name, on in (
+            ("pc-oi", args.pc_oi is not None), ("gex", getattr(args, "gex", False)),
+            ("vol quote/history", args.vol), ("call", args.call), ("squeeze", args.squeeze),
+            ("insider", args.insider), ("geo", args.geo), ("live", args.live)) if on]
+        notes.insert(0, f"AS-OF {asof_ts.date()}: historical mode — report reflects data through "
+                        f"that session; current-only blocks disabled"
+                        + (f" ({', '.join(on_flags)})" if on_flags else "")
+                        + "; ex-div, options liquidity, and breadth/F&G/COT omitted.")
+
     ctx = None
     if not args.no_vix and gather_context is not None:
         try:
-            ctx = gather_context(ticker, data_dir=args.data_dir, with_vix=True)
+            ctx = gather_context(ticker, data_dir=args.data_dir, with_vix=True, as_of=asof_ts)
         except Exception as e:
             notes.append(f"options/vol context unavailable ({type(e).__name__}).")
         else:
@@ -1161,7 +1202,7 @@ def gather_report(ticker, args, interactive, backdrop_base):
     # --live: real-time ATM IV from Tradier (smv), shown beside the harvested gauge so
     # "IV now" and "IV's place in its history" are both visible intraday.
     live_iv = None
-    if args.live and get_atm_iv is not None:
+    if args.live and asof_ts is None and get_atm_iv is not None:
         try:
             spot_now = float(frames["1D"]["Close"].iloc[-1]) if "1D" in frames else None
             live_iv = get_atm_iv(ticker, current_price=spot_now)
@@ -1175,18 +1216,21 @@ def gather_report(ticker, args, interactive, backdrop_base):
                             "pct": None})
 
     backdrop = backdrop_base
+    if asof_ts is not None:
+        # historical SPY tide (fully as-of); breadth/F&G/COT segments are current-only caches
+        backdrop = market_backdrop(args.data_dir, as_of=asof_ts)
     if ctx and ctx.get("regime") and ctx["regime"] != "n/a" and backdrop:
-        backdrop = f"{backdrop_base}  |  VIX regime: {ctx['regime']}"
+        backdrop = f"{backdrop}  |  VIX regime: {ctx['regime']}"
 
     geo = None
-    if args.geo and gather_geo_context is not None:
+    if args.geo and asof_ts is None and gather_geo_context is not None:
         try:
             geo = gather_geo_context(data_dir=args.data_dir)
         except Exception as e:
             notes.append(f"geopolitical backdrop unavailable ({type(e).__name__}).")
 
     pc = None
-    if args.pc_oi is not None and gather_pc_oi is not None:   # [] (bare = all) is falsy → test is-not-None
+    if args.pc_oi is not None and asof_ts is None and gather_pc_oi is not None:   # [] (bare = all) is falsy → test is-not-None
         toks = set(args.pc_oi)
         monthly = "monthly" in toks
         tenor = "near" if "near" in toks else "leaps" if "leaps" in toks else "all"
@@ -1204,7 +1248,7 @@ def gather_report(ticker, args, interactive, backdrop_base):
 
     # GAMMA EXPOSURE (--gex; S56) — dealer positioning off the live chain, cached like pc-oi.
     gex = None
-    if getattr(args, "gex", False) and gather_gex is not None:
+    if getattr(args, "gex", False) and asof_ts is None and gather_gex is not None:
         try:
             gex = gather_gex(ticker, interactive=interactive, data_dir=args.data_dir,
                              force=args.live)
@@ -1218,15 +1262,30 @@ def gather_report(ticker, args, interactive, backdrop_base):
 
     # earnings date — shared by the --vol block and the SETUP CHECK (S41)
     earn = None
-    if next_earnings is not None:
+    if asof_ts is not None:
+        # as-of "next earnings" from the yfinance dates LIST (it carries past dates too). Only
+        # trusted when the resolved date sits within a quarter-ish of the as-of — beyond that
+        # the list probably doesn't cover the as-of era and the earliest KNOWN date would
+        # masquerade as "next" (the S31 lesson, display edition).
+        if earnings_dates is not None:
+            try:
+                eds = sorted(pd.Timestamp(e).normalize() for e in (earnings_dates(ticker) or []))
+                fut = [e for e in eds if e >= asof_ts]
+                if fut and (fut[0] - asof_ts).days <= 120:
+                    earn = {"date": fut[0].date().isoformat(),
+                            "days": int((fut[0] - asof_ts).days), "hist_move": None}
+            except Exception:
+                earn = None
+    elif next_earnings is not None:
         try:
             earn = next_earnings(ticker, daily=frames.get("1D"))
         except Exception:
             earn = None
 
-    # next ex-dividend (S46) — shared by the SETUP CHECK catalyst row and the --call block
+    # next ex-dividend (S46) — shared by the SETUP CHECK catalyst row and the --call block.
+    # Current-only (yfinance calendar) → omitted in as-of mode.
     exd = None
-    if next_ex_dividend is not None:
+    if asof_ts is None and next_ex_dividend is not None:
         try:
             exd = next_ex_dividend(ticker)
         except Exception:
@@ -1235,7 +1294,8 @@ def gather_report(ticker, args, interactive, backdrop_base):
     # earnings-window capture guard (S44): inside the pre-earnings window, a missed daily IV
     # harvest is UNRECOVERABLE for the vol study (Massive history is trades-only — thin names
     # can't be backfilled). Surface a missing harvest the same day instead of post-print.
-    if earn and earn.get("days") is not None and 0 <= earn["days"] <= 10:
+    # (Current-data check — meaningless against a historical as-of.)
+    if asof_ts is None and earn and earn.get("days") is not None and 0 <= earn["days"] <= 10:
         try:
             _csv = os.path.join(args.data_dir, f"{ticker.lower()}_indicators.csv")
             _iv = pd.read_csv(_csv, index_col=0, parse_dates=True)["atm_iv_30d"].dropna()
@@ -1260,21 +1320,25 @@ def gather_report(ticker, args, interactive, backdrop_base):
             em_dte = (live_iv.get("dte") or 30) if live_ok else 30
             em = expected_move(spot, em_iv, dte=em_dte,
                                hv=gauge_val(ctx, "HV-20 (annualized)"))
+            # as-of mode: squeeze/expected-move/scorecard compute historically off the truncated
+            # frames + gauges; the live straddle quote and the vol study (full-history CSV read
+            # — would see post-as-of sessions) are current-only and skipped.
             vol = {"squeeze": squeeze, "em": em, "earnings": earn,
                    "setup": vol_setup(reads, squeeze, ctx, earnings=earn, em=em),
                    "quote": (straddle_quote(ticker, earnings_date=(earn or {}).get("date"),
                                             interactive=interactive,
                                             data_dir=args.data_dir,
-                                            force=args.live) if straddle_quote else None),
+                                            force=args.live)
+                             if straddle_quote and asof_ts is None else None),
                    "history": (pre_earnings_vol_study(ticker, interactive=interactive,
                                                       data_dir=args.data_dir)
-                               if pre_earnings_vol_study else None)}
+                               if pre_earnings_vol_study and asof_ts is None else None)}
         except Exception as e:
             notes.append(f"vol setup unavailable ({type(e).__name__}).")
 
     # LONG CALL VIABILITY (--call; S46) — the directional instrument's carry math, cached.
     callq = None
-    if args.call and call_quote is not None:
+    if args.call and asof_ts is None and call_quote is not None:
         try:
             callq = call_quote(ticker, earnings_date=(earn or {}).get("date"),
                                ex_div_date=(exd or {}).get("date"),
@@ -1289,14 +1353,17 @@ def gather_report(ticker, args, interactive, backdrop_base):
                 notes.append(f"call quote cached {callq['age_str']} and stale — run in a terminal to refresh.")
 
     # chain liquidity grade (S46) — default-on, ZERO network: reads the freshest --call cache.
-    liq = cached_liquidity(ticker, data_dir=args.data_dir) if cached_liquidity is not None else None
+    # The cache is a TODAY snapshot → omitted in as-of mode.
+    liq = (cached_liquidity(ticker, data_dir=args.data_dir)
+           if cached_liquidity is not None and asof_ts is None else None)
 
     # known binary catalysts (S46) — surfaces catalysts.csv (PDUFA/trial dates) in the lens.
-    cats = upcoming_catalysts(ticker) if upcoming_catalysts is not None else []
+    # catalysts.csv is static history, so `today=asof_ts` reads it historically (None = today).
+    cats = upcoming_catalysts(ticker, today=asof_ts) if upcoming_catalysts is not None else []
 
     # SHORT POSITIONING / SQUEEZE (--squeeze; S41) — reuses the lens' own profile + pc flow.
     sqz = None
-    if args.squeeze and gather_squeeze is not None:
+    if args.squeeze and asof_ts is None and gather_squeeze is not None:
         rvol_1d = ((reads.get("1D") or {}).get("_vol") or {}).get("rvol")
         sqz = gather_squeeze(ticker, daily=frames.get("1D"), rvol=rvol_1d, pc=pc,
                              profile=profile, data_dir=args.data_dir)
@@ -1312,7 +1379,7 @@ def gather_report(ticker, args, interactive, backdrop_base):
 
     # INSIDER ACTIVITY (--insider; S42) — SEC EDGAR Form 4 open-market flow, cached.
     ins = None
-    if args.insider and gather_insider is not None:
+    if args.insider and asof_ts is None and gather_insider is not None:
         ins = gather_insider(ticker, data_dir=args.data_dir)
         if ins is None:
             notes.append("insider activity unavailable (EDGAR fetch failed / unknown ticker).")
@@ -1323,7 +1390,7 @@ def gather_report(ticker, args, interactive, backdrop_base):
         try:
             macro_t1 = None
             if next_event_per_series is not None:
-                ev = next_event_per_series(data_dir=args.data_dir)
+                ev = next_event_per_series(as_of=asof_ts, data_dir=args.data_dir)
                 t1 = [days for name, (d, days) in ev.items()
                       if name in TIER1_MACRO and days is not None]
                 macro_t1 = min(t1) if t1 else None
@@ -1359,7 +1426,8 @@ def gather_report(ticker, args, interactive, backdrop_base):
     macro_events = None
     if next_event_per_series is not None:
         try:
-            macro_events = next_event_per_series(data_dir="data")
+            # the econ cache holds ~5y of history, so as-of macro proximity works historically
+            macro_events = next_event_per_series(as_of=asof_ts, data_dir="data")
         except Exception:
             macro_events = None
 
@@ -1370,6 +1438,9 @@ def gather_report(ticker, args, interactive, backdrop_base):
             "insider": ins, "callq": callq, "liq": liq, "cats": cats, "risk": risk,
             "macro_events": macro_events, "thesis": args.thesis, "level": args.level,
             "live_iv": live_iv,
+            # S57: iso date when the report was computed AS OF a historical date (backtest mode);
+            # None on a normal current run. The web keys chart truncation + snapshot skips on it.
+            "as_of_mode": (asof_ts.date().isoformat() if asof_ts is not None else None),
             # S50: earnings/ex-div scalars for the web chart's event markers — already computed
             # above for the setup check; ISO-date/int/bool dicts, so the payload stays picklable
             "earn": earn, "exd": exd}
@@ -1411,6 +1482,10 @@ if __name__ == "__main__":
     ap.add_argument("--candle-px", type=int, default=128, help="Sixel candle pixel height — the resolution knob (default 128; taller = finer).")
     ap.add_argument("--prev", type=int, default=10, help="Previous candles to show beside today's (default 10).")
     ap.add_argument("--data-dir", default="data")
+    ap.add_argument("--as-of", dest="as_of", metavar="YYYY-MM-DD",
+                    help="Historical/backtest mode (S57): compute the report as of this past date "
+                         "— every frame truncated (no lookahead). Live-chain/current-only blocks "
+                         "(pc-oi, gex, vol quote, call, squeeze, insider, geo, live) are disabled.")
     ap.add_argument("--no-refresh", action="store_true",
                     help="Skip the auto-refresh of stale indicators CSVs (render whatever is on disk).")
     ap.add_argument("--refresh", action="store_true",

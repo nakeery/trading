@@ -58,14 +58,17 @@ def known_tickers(data_dir=DATA_DIR):
 
 
 def make_args(flags):
-    """argparse-shaped namespace for lens.render_ticker — candle 'none' (Plotly replaces it)."""
+    """argparse-shaped namespace for lens.render_ticker — candle 'none' (Plotly replaces it).
+    `as_of` (S57 backtest mode) rides through to gather_report; live is forced off with it —
+    a real-time quote on a historical report is a contradiction."""
     return SimpleNamespace(
         ticker=None, thesis=flags.get("thesis"), level=flags.get("level"),
         no_intraday=False, no_vix=False, geo=flags["geo"], no_color=False,
         candle="none", candle_px=128, prev=10, data_dir=DATA_DIR,
-        no_refresh=False, refresh=False,
+        no_refresh=False, refresh=False, as_of=flags.get("as_of"),
         pc_oi=([] if flags["pc_oi"] == "all" else [flags["pc_oi"]]) if flags["pc_oi"] != "off" else None,
-        insider=flags["insider"], squeeze=flags["squeeze"], live=flags["live"],
+        insider=flags["insider"], squeeze=flags["squeeze"],
+        live=flags["live"] and not flags.get("as_of"),
         vol=flags["vol"], call=flags["call"], gex=flags["gex"],
     )
 
@@ -108,14 +111,29 @@ def load_daily_tail(ticker, bars=CHART_BARS, warmup=CHART_WARMUP):
     return load_daily_full(ticker).tail(max(bars + warmup, 260))
 
 
+def chart_frame(ticker, as_of=None, start=None):
+    """(df, n_view) for the chart window (S57 date range): the daily frame truncated to `as_of`
+    (backtest mode — the chart must not show bars the as-of report couldn't see), display bars
+    counted from `start` when given (else the usual CHART_BARS), warm-up-extended like
+    load_daily_tail (same 260-row floor for range52)."""
+    full = load_daily_full(ticker)
+    if as_of:
+        full = full.loc[:pd.Timestamp(as_of)]
+    n_view = CHART_BARS
+    if start:
+        n_view = max(int((full.index >= pd.Timestamp(start)).sum()), 20)
+    return full.tail(max(n_view + CHART_WARMUP, 260)), n_view
+
+
 VP_ASPECTS = ["value area", "POC", "HVN", "LVN", "histogram"]
 
 
 @st.cache_data(ttl=600, show_spinner=False)
-def load_iv_history(ticker, bars=252):
+def load_iv_history(ticker, bars=252, asof=None):
     """Trailing IV/HV history for the chart under the candles (S50) — ZERO network: indicators
     CSV only (None for yfinance-fallback tickers / CSVs without the harvested IV columns).
-    HV_20 is computed on load exactly as the gauges do (compute_hv_features)."""
+    HV_20 is computed on load exactly as the gauges do (compute_hv_features). `asof` (S57)
+    truncates the trailing year to the backtest date."""
     path = os.path.join(DATA_DIR, f"{ticker.lower()}_indicators.csv")
     if not os.path.exists(path):
         return None
@@ -123,7 +141,10 @@ def load_iv_history(ticker, bars=252):
         df = pd.read_csv(path, index_col=0, parse_dates=True)
         if "atm_iv_30d" not in df.columns or "Close" not in df.columns:
             return None
-        t = compute_hv_features(df).tail(bars)
+        t = compute_hv_features(df)
+        if asof:
+            t = t.loc[:pd.Timestamp(asof)]
+        t = t.tail(bars)
 
         def col(name):
             if name not in t.columns:
@@ -155,14 +176,6 @@ def _iv_fig(hist):
         fig = make_subplots(rows=2 if has_skew else 1, cols=1, shared_xaxes=True,
                             vertical_spacing=0.06,
                             row_heights=[0.68, 0.32] if has_skew else None)
-        start = None
-        for i, v in enumerate(ev + [None]):                # sentinel closes a trailing run
-            if v is not None and start is None:
-                start = i
-            elif v is None and start is not None:
-                fig.add_vrect(x0=d[start], x1=d[i - 1],
-                              fillcolor="rgba(224,166,58,0.08)", line_width=0)
-                start = None
         fig.add_trace(go.Scatter(x=d, y=hv, name="HV-20 (realized)", mode="lines",
                                  line=dict(color="#4ea3d8", width=1.2)), row=1, col=1)
         fig.add_trace(go.Scatter(x=d, y=iv, name="ATM IV (30d)", mode="lines",
@@ -175,6 +188,19 @@ def _iv_fig(hist):
                                      line=dict(color="#b070d0", width=1.2)), row=2, col=1)
             fig.add_hline(y=0, line_width=0.8, line_color="#4a5160", row=2, col=1)
             fig.update_yaxes(tickformat="+.0%", row=2, col=1)
+        # pre-earnings shading AFTER the traces: on a make_subplots figure with no traces yet,
+        # add_vrect silently adds NOTHING (plotly 6.x) — the loop originally ran first and the
+        # shading never rendered. row/col pins it to the IV pane (bare add_vrect would also
+        # shade the skew subpane); the ±12h pad keeps a single-session run visible.
+        start = None
+        for i, v in enumerate(ev + [None]):                # sentinel closes a trailing run
+            if v is not None and start is None:
+                start = i
+            elif v is None and start is not None:
+                fig.add_vrect(x0=pd.Timestamp(d[start]) - pd.Timedelta(hours=12),
+                              x1=pd.Timestamp(d[i - 1]) + pd.Timedelta(hours=12),
+                              fillcolor="rgba(224,166,58,0.08)", line_width=0, row=1, col=1)
+                start = None
         fig.update_layout(height=310 if has_skew else 230,
                           margin=dict(l=10, r=10, t=10, b=10),
                           template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
@@ -219,7 +245,8 @@ def snap_from_payload(p):
     lb = p.get("last_bar") or {}
     return {"as_of": p.get("as_of"), "close": lb.get("close"), "setup": setup,
             "dd": [str(x) for x in risk.get("drawdown") or []],
-            "rally": [str(x) for x in risk.get("rally") or []], "gauges": gauges}
+            "rally": [str(x) for x in risk.get("rally") or []], "gauges": gauges,
+            "regime": (risk.get("regime") or {}).get("label")}   # S57 trend regime (None = no regime)
 
 
 def save_snapshot(ticker, payload):
@@ -261,6 +288,11 @@ def diff_snapshots(prev, cur):
     flips = [(k, prev["setup"][k], v) for k, v in (cur.get("setup") or {}).items()
              if k in (prev.get("setup") or {}) and prev["setup"][k] != v]
     out = {"flips": flips}
+    # trend-regime flip (S57) — only when the prior snapshot carries the key (pre-S57 snapshots
+    # don't; a missing→labeled transition would otherwise read as a flip on day one)
+    out["regime_flip"] = ((prev.get("regime"), cur.get("regime"))
+                          if "regime" in prev and prev.get("regime") != cur.get("regime")
+                          else None)
     for side in ("dd", "rally"):
         p, c = set(prev.get(side) or []), set(cur.get(side) or [])
         out[f"{side}_added"] = sorted(c - p)
@@ -294,6 +326,9 @@ def render_diff(ticker, payload):
         if cur.get("close") and prev.get("close"):
             st.caption(f"close {prev['close']:,.2f} → {cur['close']:,.2f} "
                        f"({cur['close'] / prev['close'] - 1:+.2%})")
+        if d.get("regime_flip"):
+            a, b = d["regime_flip"]
+            st.markdown(f"**trend regime:** {a or 'no regime'} → {b or 'no regime'}")
         if d["flips"]:
             st.markdown("**setup-check flips:** "
                         + " · ".join(f"{k}: {a} → {b}" for k, a, b in d["flips"]))
@@ -387,7 +422,8 @@ def render_watchlist(known):
                     arrows += f" · MA50 {'▲' if tile['ma50_up'] else '▼'}"
                 setup_chip = ""
                 try:
-                    snaps = sorted(os.listdir(os.path.join(HISTORY_DIR, t.lower())))
+                    snaps = sorted(f for f in os.listdir(os.path.join(HISTORY_DIR, t.lower()))
+                                   if f.endswith(".json"))
                     if snaps:
                         with open(os.path.join(HISTORY_DIR, t.lower(), snaps[-1]),
                                   encoding="utf-8") as f:
@@ -427,10 +463,12 @@ def load_seasonality(ticker):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_earnings_reactions(ticker, n=10):
+def load_earnings_reactions(ticker, n=10, asof=None):
     """Realized post-print reactions (S53): gap/1d/5d + pre-print IV per past earnings —
     indicators CSV + the same yfinance earnings-dates call the lens run already makes
-    (cached here ~1h). None for ETFs / no CSV / no usable prints."""
+    (cached here ~1h). None for ETFs / no CSV / no usable prints. `asof` (S57) truncates the
+    frame so post-as-of prints can't leak into a backtest view (earnings_reactions only uses
+    dates ≤ the frame's last bar)."""
     path = os.path.join(DATA_DIR, f"{ticker.lower()}_indicators.csv")
     if not os.path.exists(path):
         return None
@@ -438,6 +476,8 @@ def load_earnings_reactions(ticker, n=10):
         from modules.features import earnings_dates
         from modules.vol_history import earnings_reactions
         df = pd.read_csv(path, index_col=0, parse_dates=True).sort_index()
+        if asof:
+            df = df.loc[:pd.Timestamp(asof)]
         out = earnings_reactions(df, earnings_dates(ticker), n=n)
         return out if out.get("status") == "ok" else None
     except Exception:
@@ -657,7 +697,7 @@ def _event_markers(p, horizon_days=EVENT_HORIZON_D):
 
 
 def _candle_fig(df, overlays=(), show_volume=False, price_line=None, vprofile=None,
-                events=(), glevels=(), rsi=None, macd=None):
+                events=(), glevels=(), rsi=None, macd=None, prev_close=None):
     """Plotly candlestick from a daily OHLCV frame + optional indicator overlays
     [(name, series, color, dash), …], a volume sub-pane, a dotted last/live price line,
     volume-profile aspects (`vprofile` = profile dict + an "aspects" set: value area band, POC
@@ -665,7 +705,9 @@ def _candle_fig(df, overlays=(), show_volume=False, price_line=None, vprofile=No
     (`events` = [(date_iso, label, color), …] — dashed vlines, S50), dealer-positioning
     levels (`glevels` = [(label, y, color, dash), …] — GEX walls/zero-gamma/max pain, tagged
     inside-right, S56), and momentum subpanes (S56): `rsi` = RSI(14) series, `macd` =
-    (macd, signal, hist) series triple. Returns None when it can't build."""
+    (macd, signal, hist) series triple. `prev_close` = prior-close series computed on the
+    caller's warm-up frame (true color for the first visible bar). Returns None when it
+    can't build."""
     try:
         import plotly.graph_objects as go
         from plotly.subplots import make_subplots
@@ -690,7 +732,10 @@ def _candle_fig(df, overlays=(), show_volume=False, price_line=None, vprofile=No
         # open, so the bars are split into four style groups — within each group the close-vs-
         # open state is uniform, so setting both increasing/decreasing styles is safe.
         GREEN, RED, HOLLOW = "#5ec45e", "#d83c34", "rgba(0,0,0,0)"
-        pc = df["Close"].shift(1).fillna(df["Open"])
+        # prev_close (from the caller's warm-up frame) gives the FIRST visible bar its true
+        # prior close; the shift-within-view fallback would color it by close-vs-open instead
+        pc = prev_close if prev_close is not None else df["Close"].shift(1)
+        pc = pc.fillna(df["Open"])
         up = df["Close"] >= pc
         hollow = df["Close"] >= df["Open"]
         for mask, color, fill in ((up & hollow, GREEN, HOLLOW), (up & ~hollow, GREEN, GREEN),
@@ -833,9 +878,9 @@ def _candle_fig(df, overlays=(), show_volume=False, price_line=None, vprofile=No
         # collapse non-trading gaps (S54): hide weekends + any missing weekdays inside the bar
         # span (holidays), so candles on either side of a market close sit adjacent. Only dates
         # WITHIN the data span count as holidays — future weekdays (the event-marker extension)
-        # must survive, or upcoming markers would collapse onto the last candle. Applied to the
-        # date axes only (x, and x2 when the volume pane exists) — x3 is the numeric
-        # volume-profile overlay and rangebreaks are a date-axis feature.
+        # must survive, or upcoming markers would collapse onto the last candle. Applied to
+        # every subplot row's date axis (x..x4 with volume/RSI/MACD panes on) — x9, the numeric
+        # volume-profile overlay, is excluded: rangebreaks are a date-axis feature.
         rb = [dict(bounds=["sat", "mon"])]
         holidays = pd.bdate_range(df.index[0], df.index[-1]).difference(df.index.normalize())
         if len(holidays):
@@ -863,15 +908,19 @@ def _candle_fig(df, overlays=(), show_volume=False, price_line=None, vprofile=No
         return None
 
 
-def draw_chart(ticker, live=False, payload=None):
+def draw_chart(ticker, live=False, payload=None, as_of=None, start=None):
     """Chart section. In live mode the latest Tradier quote becomes a provisional today-bar
     (same fetch_live_bar/append_live_bar machinery as the CLI --live; display-only) with a
     LIVE price/timestamp caption — this function runs inside a st.fragment on a timer, and the
     live price line AND the header metric tiles beneath the chart ride each tick (render_all
     skips sec_header in live mode; `payload` is the fallback when the quote is unavailable).
     Indicator checkboxes are DISPLAY-ONLY: they rerun just this section (fragment scope), never
-    the report or its debounce."""
-    df = load_daily_tail(ticker).copy()
+    the report or its debounce. `as_of`/`start` (S57 date range): candles truncated to the
+    backtest as-of date, window pulled back to `start`; live is forced off under as_of."""
+    if as_of:
+        live = False
+    df, n_view = chart_frame(ticker, as_of, start)
+    df = df.copy()
     live_last = None
     bar = None
     prev = None
@@ -960,7 +1009,9 @@ def draw_chart(ticker, live=False, payload=None):
     if ema9:
         ov.append(("EMA9", close.ewm(span=9, adjust=False).mean(), "#cfcfcf", "dot"))
     if bb:
-        m, s = close.rolling(20).mean(), close.rolling(20).std()
+        # ddof=0 (population std) — the ta library's Bollinger convention, so these bands match
+        # the report's Bollinger–Keltner squeeze (structure.read_squeeze)
+        m, s = close.rolling(20).mean(), close.rolling(20).std(ddof=0)
         ov.append(("BB upper", m + 2 * s, "#7f8ea3", "dash"))
         ov.append(("BB lower", m - 2 * s, "#7f8ea3", "dash"))
 
@@ -971,18 +1022,19 @@ def draw_chart(ticker, live=False, payload=None):
         delta = close.diff()
         gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
         loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
-        rsi_s = (100 - 100 / (1 + gain / loss)).tail(CHART_BARS)
+        rsi_s = (100 - 100 / (1 + gain / loss)).tail(n_view)
     if macd_on:
         m = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
         sig = m.ewm(span=9, adjust=False).mean()
-        macd_t = (m.tail(CHART_BARS), sig.tail(CHART_BARS), (m - sig).tail(CHART_BARS))
+        macd_t = (m.tail(n_view), sig.tail(n_view), (m - sig).tail(n_view))
 
-    view = df.tail(CHART_BARS)
+    view = df.tail(n_view)
     price = live_last if live_last is not None else float(view["Close"].iloc[-1])
-    fig = _candle_fig(view, overlays=[(n, s.tail(CHART_BARS), c, d) for n, s, c, d in ov],
+    fig = _candle_fig(view, overlays=[(n, s.tail(n_view), c, d) for n, s, c, d in ov],
                       show_volume=vol_pane, price_line=price if pline else None,
                       vprofile=vprofile, events=_event_markers(payload), glevels=glevels,
-                      rsi=rsi_s, macd=macd_t)
+                      rsi=rsi_s, macd=macd_t,
+                      prev_close=df["Close"].shift(1).tail(n_view))
     if fig is not None:
         st.plotly_chart(fig, width="stretch", key=f"chart_{ticker}")
 
@@ -1034,6 +1086,13 @@ if "qp_done" not in st.session_state:
         qp_pc = st.query_params.get("pc_oi")
         if qp_pc in ("all", "near", "leaps", "monthly"):
             st.session_state["flag_pc_oi"] = qp_pc
+        qp_asof = st.query_params.get("asof")            # S57 date range deep links
+        if qp_asof:
+            st.session_state["asof_on"] = True
+            st.session_state["asof_date"] = pd.Timestamp(qp_asof).date()
+        qp_from = st.query_params.get("from")
+        if qp_from:
+            st.session_state["chart_from"] = pd.Timestamp(qp_from).date()
     except Exception:
         pass
 
@@ -1060,6 +1119,33 @@ with st.expander("thesis overlay (optional)"):
     thesis = t1.selectbox("bias", ["none", "bullish", "bearish"], index=0)
     level = t2.number_input("key level", value=0.0, step=1.0)
 
+# ── date range / as-of backtest (S57) ────────────────────────────────────────
+# `as-of` rewinds the WHOLE report (frames truncated engine-side — no lookahead) so the user
+# can backtest their own charting reads; `chart from` only widens the chart window (display-
+# only — changing it never regenerates the report). Session keys are pre-seeded instead of
+# passing value= so the deep-link block above can prefill them without the Streamlit
+# default-vs-session-state warning.
+st.session_state.setdefault("asof_date", pd.Timestamp.today().date())
+st.session_state.setdefault("chart_from", None)
+with st.expander("🕰 date range / as-of backtest (optional)"):
+    d1, d2, d3 = st.columns([1, 1.2, 1.4])
+    asof_on = d1.checkbox("as-of mode", key="asof_on",
+                          help="Rewind the whole report to a past date — every frame is "
+                               "truncated engine-side, so nothing after that date leaks in.")
+    asof_date = d2.date_input("report as of", key="asof_date",
+                              max_value=pd.Timestamp.today().date())
+    chart_from = d3.date_input("chart from (window start, optional)", key="chart_from")
+    if asof_on:
+        st.caption("historical mode — the report and chart end at the as-of date; live-chain / "
+                   "current-only blocks (pc-oi, gex, vol quote, call, squeeze, insider, geo, "
+                   "live) are disabled: there is no historical source for them")
+
+asof_iso = asof_date.isoformat() if (asof_on and asof_date) else None
+if chart_from and asof_iso and chart_from.isoformat() > asof_iso:
+    st.warning("chart-from is after the as-of date — ignoring the window start")
+    chart_from = None
+from_iso = chart_from.isoformat() if chart_from else None
+
 if known:
     st.pills("recent data", known, selection_mode="single", default=None,
              key="ticker_pills", on_change=_pick_ticker)
@@ -1073,9 +1159,11 @@ run_clicked = st.button("Run", type="primary")
 # menu Rerun blank the page. Regenerate only when the (ticker, flags) key changes or Run is
 # clicked; otherwise redisplay the stored result (generate_payload's 2-min cache absorbs repeats).
 flags = {"vol": vol, "call": call, "gex": gex, "squeeze": squeeze, "insider": insider,
-         "geo": geo, "live": live, "pc_oi": pc_oi,
+         "geo": geo, "live": live and not asof_iso, "pc_oi": pc_oi,
          "thesis": None if thesis == "none" else thesis,
-         "level": level or None}
+         "level": level or None, "as_of": asof_iso}
+# NB: `chart_from` is deliberately NOT in flags — it only moves the chart window, so changing
+# it must not re-key the cache / trigger a regenerate
 flags_key = tuple(sorted(flags.items()))
 key = (ticker, flags_key)
 # consumed every run: a pill pick is explicit intent like Run — it skips the debounce below
@@ -1117,7 +1205,7 @@ if should_generate:
     # st.status (S56) — the spinner upgraded to a stage log: the compute preamble (refresh/
     # progress notices the CLI would print) lands inside it instead of vanishing
     with st.status(f"running the lens on {ticker}…", expanded=False) as gen_status:
-        if live or run_clicked:
+        if flags["live"] or run_clicked:
             # explicit Run / live mode = fetch fresh — clear THIS entry only, not every ticker's
             generate_payload.clear(ticker, flags_key)
         try:
@@ -1136,7 +1224,10 @@ if should_generate:
         st.session_state["last_ansi"] = preamble + ansi
         st.session_state.pop("failed_key", None)
         st.session_state["live_misses"] = 0            # fresh generate resumes live polling
-        save_snapshot(ticker, payload)                 # day-over-day diff history (S56)
+        # day-over-day diff history (S56) — skipped for as-of runs (S57): a backtest rerun
+        # must not overwrite that date's REAL end-of-day snapshot with a partial-blocks one
+        if payload.get("as_of_mode") is None:
+            save_snapshot(ticker, payload)
         try:                                           # shareable URL reflects the current view
             st.query_params["ticker"] = ticker
             for f in FLAG_NAMES:
@@ -1148,6 +1239,11 @@ if should_generate:
                 st.query_params["pc_oi"] = flags["pc_oi"]
             elif "pc_oi" in st.query_params:
                 del st.query_params["pc_oi"]
+            for k, v in (("asof", flags["as_of"]), ("from", from_iso)):   # S57 date range
+                if v:
+                    st.query_params[k] = v
+                elif k in st.query_params:
+                    del st.query_params[k]
         except Exception:
             pass
         # the generate may have auto-refreshed the indicators CSV (new close stamped) — drop the
@@ -1170,26 +1266,36 @@ if should_generate:
 if st.session_state.get("last_payload"):
     shown_ticker = st.session_state["last_key"][0]
     shown_live = bool(dict(st.session_state["last_key"][1]).get("live"))
+    # as-of date the SHOWN report was computed for (S57) — None on a normal run; live and
+    # as-of are mutually exclusive (flags force live off), so the fragment path is never as-of
+    shown_asof = st.session_state["last_payload"].get("as_of_mode")
+    if shown_asof:
+        st.warning(f"🕰 AS-OF {shown_asof} — historical backtest view: report, chart, and "
+                   f"gauges reflect data through that session only (no lookahead); "
+                   f"live-chain/current-only blocks are disabled")
     if shown_live:
         # continuous live chart + header tiles: st.fragment reruns ONLY this section every N
         # seconds — one Tradier quote per tick; the report below stays as rendered (its own
         # sec_header is skipped — the fragment renders the live tiles beneath the chart).
         st.fragment(run_every=LIVE_CHART_EVERY_S)(draw_chart)(
-            shown_ticker, True, st.session_state["last_payload"])
+            shown_ticker, True, st.session_state["last_payload"], None, from_iso)
     else:
-        draw_chart(shown_ticker, False, st.session_state["last_payload"])
+        draw_chart(shown_ticker, False, st.session_state["last_payload"], shown_asof, from_iso)
         # header tiles drawn here rather than via render_all (mirrors live mode, where the
         # fragment draws them) so the calendar below slots in right under the header's
         # 'state characterization' caption in BOTH modes
-        _header_tiles(st.session_state["last_payload"], load_daily_tail(shown_ticker))
-    render_diff(shown_ticker, st.session_state["last_payload"])   # day-over-day state diff (S56)
+        _header_tiles(st.session_state["last_payload"],
+                      chart_frame(shown_ticker, shown_asof, from_iso)[0])
+    if not shown_asof:
+        render_diff(shown_ticker, st.session_state["last_payload"])   # day-over-day diff (S56)
     render_econ_calendar()
     # IV vs realized-vol history (S50) — zero network (indicators CSV); skipped silently for
-    # tickers without harvested IV columns
-    hist = load_iv_history(shown_ticker)
+    # tickers without harvested IV columns. Truncated to the as-of date in backtest mode.
+    hist = load_iv_history(shown_ticker, asof=shown_asof)
     fig_iv = _iv_fig(hist) if hist else None
     if fig_iv is not None:
-        lens_web_sections._sec("IV vs REALIZED VOL — trailing year")
+        lens_web_sections._sec("IV vs REALIZED VOL — trailing year"
+                               + (f" to {shown_asof}" if shown_asof else ""))
         st.plotly_chart(fig_iv, width="stretch", key=f"ivhist_{shown_ticker}")
         cap = ("ATM IV (30d, harvested) vs HV-20 (realized) · shaded spans = pre-earnings "
                "event-IV stamp windows (S44) · gaps = sessions with no harvest")
@@ -1197,8 +1303,9 @@ if st.session_state.get("last_payload"):
             cap += (" · lower pane: 25Δ skew, put IV − call IV (rising = downside protection "
                     "getting bid)")
         st.caption(cap)
-    # earnings reaction history (S53) — realized prints; skipped silently for ETFs/no data
-    rx = load_earnings_reactions(shown_ticker)
+    # earnings reaction history (S53) — realized prints; skipped silently for ETFs/no data.
+    # As-of mode truncates so post-as-of prints can't leak into the backtest view.
+    rx = load_earnings_reactions(shown_ticker, asof=shown_asof)
     if rx:
         with st.expander(f"📊 earnings reactions — last {len(rx['rows'])} prints"):
             tbl = pd.DataFrame([{
@@ -1297,7 +1404,9 @@ if st.session_state.get("last_payload"):
     # native section renderers (S49) — same payload the ANSI report below is printed from;
     # the header is always drawn above (fragment in live mode, direct call otherwise)
     lens_web_sections.render_all(st.session_state["last_payload"], skip_header=True)
-    ledger = load_ledger(shown_ticker)
+    # signal ledger hidden in as-of mode (S57): its rows/scores span dates after the backtest
+    # as-of — showing realized outcomes would defeat the no-lookahead point
+    ledger = load_ledger(shown_ticker) if not shown_asof else None
     if ledger is not None:
         sc = load_ledger_score(shown_ticker)
         with st.expander(f"signal ledger — entry.py forward ledger, last {len(ledger)} rows"
@@ -1307,14 +1416,16 @@ if st.session_state.get("last_payload"):
                 by_date = {r["date"]: r for r in sc["rows"]}
 
                 def _cell(d, k, wk):
-                    r = by_date.get(str(d))
+                    r = by_date.get(str(d)[:10])   # score dates are ISO; tolerate a timestamped cell
                     if not r or r[k] is None:
                         return "pending"
                     mark = "" if r[wk] is None else (" ✓" if r[wk] else " ✗")
                     return f"{r[k]:+.1%}{mark}"
 
-                led.insert(3, "fwd 15d", [_cell(d, "fwd15", "win15") for d in led["date"]])
-                led.insert(4, "fwd 63d", [_cell(d, "fwd63", "win63") for d in led["date"]])
+                # after the `signal` column — the CSV reads as date, ticker, signal_pre_gate,
+                # signal, … (entry.py writes `date` as the index, then the row dict)
+                led.insert(4, "fwd 15d", [_cell(d, "fwd15", "win15") for d in led["date"]])
+                led.insert(5, "fwd 63d", [_cell(d, "fwd63", "win63") for d in led["date"]])
             st.dataframe(led, hide_index=True, width="stretch")
             if sc:
                 segs = []
