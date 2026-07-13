@@ -79,6 +79,19 @@ def bs_delta(S, K, r, T, sigma, q=0.0, contract_type="call"):
     return -math.exp(-q * T) * _norm_cdf(-d1)
 
 
+def bs_gamma(S, K, r, T, sigma, q=0.0):
+    """
+    Black-Scholes gamma (d²C/dS²) — identical for calls and puts. Used by modules/gex.py
+    to re-price per-contract gamma at hypothetical spot levels for the zero-gamma flip.
+
+    Returns gamma (per $1 of underlying move, per share); 0 when T/sigma/S are degenerate.
+    """
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return 0.0
+    d1 = (math.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+    return math.exp(-q * T) * _norm_pdf(d1) / (S * sigma * math.sqrt(T))
+
+
 def implied_vol(C, S, K, r, T, q=0.0, tol=1e-6, max_iter=100):
     """
     Call implied volatility via Newton-Raphson with bisection fallback.

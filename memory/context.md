@@ -69,6 +69,59 @@ lens_web.py specifics (S48, +S49 native visuals):
   chart lives in `st.fragment(run_every=10s)` — one Tradier quote per tick becomes a provisional
   today-bar (fetch_live_bar/append_live_bar), price line rides it; the report is never
   re-fetched by the timer. Chart caches cleared after each generate (data-vintage match).
+- **S50–S54 web-only additions** (all display-only per the S31 rule; zero default-on network):
+  chart EVENT MARKERS (earnings / ex-div~ / Tier-1 macro / catalysts.csv ≤`EVENT_HORIZON_D`=30d
+  — dashed vlines off payload scalars, weekend dates snapped to next trading day); IV-vs-HV
+  history figure (harvested `atm_iv_30d` vs HV-20, event-tenor markers, pre-earnings windows
+  shaded via contiguous `atm_iv_event` runs — CSV only); econ-calendar expander (S51/S52:
+  two-month Mon–Fri FRED grid, tier-colored chips linking to the headline series' FRED graph,
+  headline prints shown once out; network ONLY on its refresh button — `refresh_if_stale(-1)` +
+  `fetch_release_results`); seasonality + earnings-reaction expanders (S53 — monthly base rates
+  over full history / realized post-print gap/1d/5d + pre-print IV); signal-ledger expander
+  (tail of entry.py's forward ledger); 52-week-range tile injected into `sec_header`;
+  non-trading-gap rangebreaks + chart/report volume-profile unification (S54 — the chart
+  renders the PAYLOAD's profile, never a local recompute).
+- **S56 flesh-out (4 phases, all display-only per the durable rules)**:
+  · **A — options positioning**: `modules/gex.py` + lens `--gex` (+ web checkbox) — dealer GEX
+  by strike off the Tradier chain (greeks already ride every chain fetch; expiries ≤60d via
+  `select_gex_expiries`, cached session-stale like pc-oi): net GEX regime (long/short gamma),
+  call/put walls, zero-gamma flip (`bs_gamma` added to bs_invert.py — BS repricing across
+  hypothetical spots), max pain (nearest monthly), unusual volume-vs-OI strikes; naive
+  dealer-convention caveats always printed. Web: `sec_gex` diverging per-strike bars +
+  "GEX levels" chart toggle (walls/zero-γ/max-pain hlines, inside-right tags); the IV-history
+  figure gained a 25Δ-skew subpane (`load_iv_history` reads `iv_skew_25d`).
+  · **D — ledger scorer (the S30 TODO, LANDED)**: `score_ledger.py` — joins each signal-ledger
+  row to realized 15d/63d returns off the indicators CSV closes, WIN-tagged vs the row's OWN
+  stamped thresholds (recalibration never rewrites history); rows younger than a horizon =
+  pending; `score()` reusable, web ledger expander shows scored columns. NB win = the up-move
+  bar for EVERY tier — on a STAY OUT row ✗ means staying out was right.
+  · **B — new sources**: SKEW+VVIX gauges in `sentiment.gather_context` (yfinance ^SKEW/^VVIX,
+  bands 130/150 + 85/110, own try — display-only); `modules/cot.py` CFTC TFF Socrata (no key;
+  dataset gpe5-46if; contracts "E-MINI S&P 500"/"NASDAQ MINI"/"VIX FUTURES"; lev-funds
+  net/OI + inline weekly percentile ≥26w — sentiment.percentile_of's 63-obs floor is a DAILY
+  convention) on the MARKET BACKDROP line + market_context gauges; `modules/buzz.py` ApeWisdom
+  reddit mentions (keyless, 4 pages cached ~6h, one feed serves all tickers) riding the
+  --squeeze block; **FINRA consolidated short interest needs NO auth** (probed live — POST
+  compareFilters to api.finra.org works unauthenticated; GTE settlementDate filter REQUIRED
+  or oldest-first + limit truncates before the newest rows) → NYSE names now resolve in
+  --squeeze (shortint `parse_finra_si` fallback after the NASDAQ API).
+  · **C — web UX**: watchlist landing grid (CSV-only tiles: sparkline, Δ%, MA20/50 arrows,
+  latest snapshot's setup-score chip; tile click = pill semantics); day-over-day diff
+  (`snap_from_payload`/`diff_snapshots` — compact per-date snapshots under
+  data/payload_history/{ticker}/, pruned to 90; "Δ what changed" expander: setup flips,
+  risk factors added/cleared, gauge percentile moves ≥10pt); RSI/MACD chart subpanes
+  (warm-up-computed, display-only; vp-histogram overlay axis moved x3→x9 to clear subplot
+  rows); polish — `?ticker=QQQ&gex=1` deep links (read once pre-widgets, written back after
+  each generate), st.status stage log (compute preamble visible), `.streamlit/config.toml`
+  dark theme, sidebar quick-nav (anchor slugs stamped by `lens_web_sections._slug`).
+- **S55 cleanup pass**: one cached full-history loader `load_daily_full` (chart tail +
+  seasonality previously each ran `_load_daily` = two full yfinance downloads for CSV-less
+  tickers); the daily/1y profile fallback + its dead transition caption removed (payload
+  profile only — the fallback contradicted the S54 rationale); `_header_tiles` helper dedupes
+  the live/non-live tile try/except; pill picks bypass the 2s debounce (explicit intent, no
+  cache bust — Run remains the only force-refresh); live polling backs off after
+  `LIVE_MISS_LIMIT`=3 consecutive empty Tradier quotes (fragment keeps ticking, a fresh
+  generate/Run resets); deprecated `use_container_width` → `width="stretch"` (Streamlit 1.59).
 - Deps: streamlit/ansi2html/plotly. `.claude/launch.json`: lens-web (8501, the user's) +
   lens-web-dev (8502, verification — never collide with the user's instance).
 
@@ -149,7 +202,7 @@ Operational notes
 - Venv explicitly: `.\trade\Scripts\python.exe -X utf8 …` (+ `-X utf8` required on Windows).
   Piped runs: PowerShell tool, `cmd /c "(echo TICKER) | python -X utf8 script.py"`; prefer
   `--ticker` to skip prompts. Env vars ($PROFILE): MASSIVE_API_KEY, FRED_API_KEY, TRADIER_TOKEN.
-- Smoke: `.\trade\Scripts\python.exe -m pytest tests/ -q` (33 tests, offline, ~2-7s).
+- Smoke: `.\trade\Scripts\python.exe -m pytest tests/ -q` (45 tests, offline, ~3-9s).
 - Percentile gauges need ≥63 harvested rows per ticker — thin history prints the value with an
   explanatory note instead (GOOG case: 2 rows → no percentile until backfill or ~3 months).
 
@@ -159,6 +212,7 @@ Outstanding / backlog
   reference ticker); then SOFI/LYFT re-backfill + AAPL build. Safe post-S44 (per-cell writes).
 - **CRSP watch**: PDUFA 2026-08-01 + earnings 2026-08-10 — keep the daily harvest running
   through the window (missed pre-earnings sessions cannot be backfilled; the lens warns ≤10d).
-- Signal-ledger scorer (matures ~1–2 months of rows); NYSE short-interest coverage for
-  --squeeze (FINRA Query API); optional --geo percentile-window normalization; Textual +
-  textual-image TUI recorded as the deferred terminal-window alternative to lens_web.
+- ~~Signal-ledger scorer~~ LANDED S56 (`score_ledger.py`; verdicts mature as rows age past
+  15/63 sessions). ~~NYSE short interest~~ LANDED S56 (FINRA consolidated, no auth).
+- Optional --geo percentile-window normalization; Textual + textual-image TUI recorded as
+  the deferred terminal-window alternative to lens_web.

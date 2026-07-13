@@ -1,0 +1,10 @@
+# LENS web theme (S56) — matches the report panels' palette (#0e1117 bg, amber accent).
+[theme]
+base = "dark"
+primaryColor = "#e0a63a"
+backgroundColor = "#0e1117"
+secondaryBackgroundColor = "#161a23"
+textColor = "#d8dee9"
+
+[browser]
+gatherUsageStats = false

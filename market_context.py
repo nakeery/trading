@@ -177,6 +177,26 @@ if __name__ == "__main__":
     except Exception:
         pass
 
+    # CFTC COT (S56) — leveraged-funds futures positioning (ES/NQ/VIX), weekly, cached ~24h;
+    # best-effort. Context only — Tuesday data published Friday (3-day lag baked in).
+    try:
+        from modules.cot import fetch_cot, label_cot
+        cot = fetch_cot(data_dir=args.data_dir)
+        for sym in ("ES", "NQ", "VIX"):
+            d = (cot or {}).get(sym)
+            if not d:
+                continue
+            ctx["gauges"].append({"group": "MARKET", "name": f"COT lev-funds {sym}",
+                                  "value": d["net_pct_oi"], "fmt": "{:+.1%}",
+                                  "label": label_cot(d, invert=(sym == "VIX")),
+                                  "pct": d.get("pct")})
+        if cot:
+            ctx["notes"].append(f"COT = net leveraged-funds position / open interest "
+                                f"(as of {max(d['date'] for d in cot.values())}, Tue data "
+                                f"published Fri); VIX net-short = the vol-selling carry crowd.")
+    except Exception:
+        pass
+
     print_console(ctx)
 
     if args.graphical:

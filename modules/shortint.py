@@ -6,10 +6,13 @@ fuel-vs-counter scorecard in the style of structure.rally_drawdown_risk / volset
 Squeeze FUEL (crowded shorts, forced-covering mechanics) is a necessary but not sufficient
 condition — it still needs a spark, and crowded shorts are sometimes right.
 
-Sources (both free; probed live 2026-07-02):
+Sources (all free; NASDAQ/RegSHO probed live 2026-07-02, FINRA consolidated 2026-07-12):
   - NASDAQ short-interest API (unofficial, browser-UA-gated): the bi-monthly FINRA-settled short
     interest, avg daily share volume, and days-to-cover. Settles twice a month with a ~2-week
-    dissemination lag — the caveat is printed with the settle date.
+    dissemination lag — the caveat is printed with the settle date. NASDAQ-listed names only.
+  - FINRA consolidated short interest Query API (official api.finra.org, NO auth needed —
+    probed: POST filters work unauthenticated; S56): the same bi-monthly settlements across
+    ALL exchanges — the NYSE fallback when the NASDAQ API returns nothing.
   - FINRA Reg SHO daily short-volume files (official CDN, no auth): per-symbol daily short volume /
     total volume — the DAILY pulse between settlements. NB short VOLUME includes market-making
     shorting (~50% of volume is a normal baseline), so the trailing percentile is the read,
@@ -34,6 +37,7 @@ from modules.sentiment import percentile_of, ordinal_percentile
 CACHE_SUBDIR = "shortint_cache"
 NASDAQ_URL = "https://api.nasdaq.com/api/quote/{sym}/short-interest?assetClass=stocks"
 FINRA_URL = "https://cdn.finra.org/equity/regsho/daily/CNMSshvol{d}.txt"
+FINRA_SI_URL = "https://api.finra.org/data/group/otcMarket/name/consolidatedShortInterest"
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
                          "(KHTML, like Gecko) Chrome/126.0 Safari/537.36",
            "Accept": "application/json, text/plain, */*"}
@@ -92,6 +96,22 @@ def parse_si_payload(payload):
     return out
 
 
+def parse_finra_si(records):
+    """FINRA consolidatedShortInterest records → [{settle_date, interest, adv, dtc}, …]
+    newest-first (the API returns oldest-first and forbids server-side sort without the
+    partition key). Same shape as parse_si_payload so the scorecard is source-agnostic."""
+    out = []
+    for r in records or []:
+        try:
+            out.append({"settle_date": str(r["settlementDate"])[:10],
+                        "interest": float(r["currentShortPositionQuantity"]),
+                        "adv": float(r["averageDailyVolumeQuantity"]),
+                        "dtc": float(r["daysToCoverQuantity"])})
+        except Exception:
+            continue
+    return sorted(out, key=lambda x: x["settle_date"], reverse=True)
+
+
 def parse_finra_text(text, ticker):
     """One FINRA Reg SHO daily file → (short_volume, total_volume) for `ticker`, or None.
     Format: Date|Symbol|ShortVolume|ShortExemptVolume|TotalVolume|Market"""
@@ -112,8 +132,10 @@ def parse_finra_text(text, ticker):
 # Fetchers (network, cached, best-effort)
 # ─────────────────────────────────────────────────────────────────────────────
 def fetch_short_interest(ticker, data_dir="data"):
-    """Bi-monthly short-interest rows (newest-first) from the NASDAQ API, cached session-stale.
-    On any failure serves the cached rows regardless of age; None only when nothing is available."""
+    """Bi-monthly short-interest rows (newest-first), cached session-stale. NASDAQ API first
+    (NASDAQ-listed names), then the official FINRA consolidated Query API (S56 — covers ALL
+    exchanges, unauthenticated) for the names NASDAQ can't see (NYSE etc.). On any failure
+    serves the cached rows regardless of age; None only when nothing is available."""
     path = _cache_path(ticker, "si", data_dir)
     cache = _load_json(path)
     if cache and not cache_stale(cache):
@@ -122,6 +144,24 @@ def fetch_short_interest(ticker, data_dir="data"):
         r = requests.get(NASDAQ_URL.format(sym=ticker.upper()), headers=HEADERS, timeout=15)
         r.raise_for_status()
         rows = parse_si_payload(r.json())
+        if rows:
+            _save_json(path, {"as_of": time.time(), "rows": rows})
+            return rows
+    except Exception:
+        pass
+    try:
+        # GTE date filter is REQUIRED for freshness: the API returns oldest-first and caps at
+        # `limit` — without it a long-listed name truncates before the newest settlements
+        since = (datetime.date.today() - datetime.timedelta(days=400)).isoformat()
+        r = requests.post(FINRA_SI_URL, timeout=20,
+                          headers={"Accept": "application/json"},
+                          json={"limit": 50, "compareFilters": [
+                              {"compareType": "EQUAL", "fieldName": "symbolCode",
+                               "fieldValue": ticker.upper()},
+                              {"compareType": "GTE", "fieldName": "settlementDate",
+                               "fieldValue": since}]})
+        r.raise_for_status()
+        rows = parse_finra_si(r.json())[:8]
         if rows:
             _save_json(path, {"as_of": time.time(), "rows": rows})
             return rows

@@ -63,11 +63,21 @@ def _rsi_hex(rsi):
     return _ramp_hex(0.5 - 0.5 * d / max(RSI_FULL - RSI_DEAD, 1e-9))
 
 
+def _slug(title):
+    """Stable anchor id from a section title: the part before any '—'/'(' qualifier (those
+    carry run-specific text like regimes and as-of stamps), lowercased, non-alnum → '-'.
+    lens_web.py's sidebar quick-nav links against these (S56)."""
+    import re
+    base = re.split(r"—|\(", title)[0]
+    return re.sub(r"[^a-z0-9]+", "-", base.lower()).strip("-")
+
+
 def _sec(title):
     st.markdown(
-        f'<div style="margin:1.1em 0 0.35em;color:#8b95a7;font-size:0.82em;'
-        f'letter-spacing:0.06em;text-transform:uppercase;border-bottom:1px solid #2a2f3a;'
-        f'padding-bottom:3px;">{html.escape(title)}</div>', unsafe_allow_html=True)
+        f'<div id="{_slug(title)}" style="margin:1.1em 0 0.35em;color:#8b95a7;'
+        f'font-size:0.82em;letter-spacing:0.06em;text-transform:uppercase;'
+        f'border-bottom:1px solid #2a2f3a;padding-bottom:3px;">{html.escape(title)}</div>',
+        unsafe_allow_html=True)
 
 
 def _net_color(text):
@@ -339,12 +349,19 @@ def sec_squeeze(p):
             adv = f"avg daily vol {si['adv'] / 1e6:,.1f}M" if si.get("adv") else None
             c[1].metric("Days-to-cover", f"{si['dtc']:.1f}", adv, delta_color="off")
     else:
-        c[0].caption("short interest n/a — source covers NASDAQ-listed names only")
+        c[0].caption("short interest n/a — no data from the NASDAQ API or FINRA's consolidated feed")
     if sv.get("now") is not None:
         cap = f"{ordinal_percentile(sv['pct'])} of {sv['n']} sessions" if sv.get("pct") is not None else None
         c[2].metric("Short-volume (latest)", f"{sv['now']:.0%}", cap, delta_color="off")
         if sv.get("avg5") is not None and sv.get("avg20") is not None:
             st.caption(f"short-volume 5d avg {sv['avg5']:.0%} · 20d avg {sv['avg20']:.0%}")
+    bz = sq.get("buzz")
+    if bz:
+        was = f" (was #{bz['rank_prev']})" if bz.get("rank_prev") else ""
+        chg = f", {bz['chg']:+.0%} vs prior 24h" if bz.get("chg") is not None else ""
+        st.markdown(f'<div style="color:{INK};">retail buzz: <b>#{bz["rank"]}</b> on reddit '
+                    f'stock boards{html.escape(was)} — {bz["mentions"]} mentions'
+                    f'{html.escape(chg)} (ApeWisdom)</div>', unsafe_allow_html=True)
     _net("NET", read.get("net", "n/a"))
     c1, c2 = st.columns(2)
     with c1:
@@ -359,6 +376,8 @@ def sec_squeeze(p):
             _bullets(read["counter"])
     for cav in read.get("caveats", []):
         st.caption(f"· {cav}")
+    if bz:
+        st.caption("· buzz = attention, not direction — crowded names gap on headlines both ways")
 
 
 def sec_insider(p):
@@ -502,6 +521,91 @@ def sec_pcoi(p):
     _df(pd.DataFrame(tbl))
     st.caption("P/C OI = put OI / call OI (positioning) · P/C Vol = latest-session flow "
                "(lower pane) · * = LEAPS tenor")
+
+
+def _gexfmt(v, sign=True):
+    """Compact dollar-gamma formatter (mirrors print_report's local _gexfmt)."""
+    s = "+" if (sign and v >= 0) else ("-" if v < 0 else "")
+    a = abs(v)
+    if a >= 1e9:
+        return f"{s}${a / 1e9:.2f}bn"
+    if a >= 1e6:
+        return f"{s}${a / 1e6:.0f}m"
+    return f"{s}${a / 1e3:.0f}k"
+
+
+def sec_gex(p):
+    g = p.get("gex")
+    if not g or not g.get("by_strike"):
+        return
+    hdr = (f"GAMMA EXPOSURE — dealer positioning, Tradier chain  "
+           f"(≤{max(e['dte'] for e in g['expiries'])}d, {len(g['expiries'])} expiries)")
+    if g.get("as_of_str"):
+        hdr += f" · as of {g['as_of_str']}" + ("  (stale)" if g.get("stale") else "")
+    _sec(hdr)
+    regime = ("dealers long gamma — stabilizing (sell rallies, buy dips)" if g["net_gex"] > 0
+              else "dealers short gamma — amplifying (buy rallies, sell dips)")
+    _net(f"net GEX {_gexfmt(g['net_gex'])}/1%", regime)
+
+    chips = []
+    if g.get("call_wall") is not None:
+        chips.append((f"call wall {g['call_wall']:g}  ({_gexfmt(g['call_wall_gex'], sign=False)})",
+                      GREEN))
+    if g.get("put_wall") is not None:
+        chips.append((f"put wall {g['put_wall']:g}  ({_gexfmt(abs(g['put_wall_gex']), sign=False)})",
+                      RED))
+    if g.get("zero_gamma") is not None:
+        side = "below" if g["zero_gamma"] < g.get("spot", 0) else "above"
+        chips.append((f"zero-gamma ~{g['zero_gamma']:.2f} ({side} spot)", GOLD))
+    mp = g.get("max_pain")
+    if mp:
+        chips.append((f"max pain {mp['strike']:g} ({mp['expiry']}, {mp['dte']}d)", GRAY))
+    if chips:
+        st.markdown('<div style="line-height:2.3;margin:4px 0;">'
+                    + " ".join(_pill(t, c) for t, c in chips) + "</div>",
+                    unsafe_allow_html=True)
+
+    # diverging per-strike bars: calls up (green), puts down (red) — the wall geometry
+    try:
+        import plotly.graph_objects as go
+        rows = g["by_strike"]
+        if rows:
+            x = [r["strike"] for r in rows]
+            fig = go.Figure()
+            fig.add_trace(go.Bar(x=x, y=[r["call"] for r in rows], name="call GEX",
+                                 marker_color=GREEN, marker_line_width=0))
+            fig.add_trace(go.Bar(x=x, y=[r["put"] for r in rows], name="put GEX (dealer-short)",
+                                 marker_color=RED, marker_line_width=0))
+            if g.get("spot"):
+                fig.add_vline(x=g["spot"], line_dash="dot", line_width=1, line_color="#e8c547",
+                              annotation=dict(text="spot", font=dict(color="#e8c547", size=10)))
+            if g.get("zero_gamma") is not None:
+                fig.add_vline(x=g["zero_gamma"], line_dash="dash", line_width=1,
+                              line_color=GOLD,
+                              annotation=dict(text="zero-γ", font=dict(color=GOLD, size=10),
+                                              yanchor="bottom", y=0))
+            fig.add_hline(y=0, line_width=0.8, line_color="#4a5160")
+            fig.update_layout(barmode="relative", height=280,
+                              margin=dict(l=10, r=10, t=10, b=10), template="plotly_dark",
+                              paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(14,17,23,1)",
+                              yaxis=dict(title="dealer $Γ / 1% move", title_font_size=11),
+                              legend=dict(orientation="h", y=1.08, x=0, font=dict(size=11)))
+            st.plotly_chart(fig, width="stretch")
+    except Exception:
+        pass
+
+    if g.get("unusual"):
+        tbl = [{"Strike": f"{u['strike']:g}{u['type'][0]}", "Expiry": u["expiry"],
+                "DTE": u["dte"], "Volume": f"{u['volume']:,}",
+                "OI": f"{u['oi']:,}" if u["oi"] else "0",
+                "Vol/OI": f"×{u['ratio']:.1f}" if u["ratio"] is not None else "NEW"}
+               for u in g["unusual"]]
+        st.markdown(f'<div style="color:{INK};margin-top:2px;">unusual activity today '
+                    f'(volume running a multiple of OI):</div>', unsafe_allow_html=True)
+        _df(pd.DataFrame(tbl))
+    st.caption("assumes dealers long calls / short puts (standard convention) — real inventory "
+               "unknown · OI settles once daily (start-of-day); intraday flow shifts walls "
+               "first · levels also drawable on the price chart (“GEX levels” toggle)")
 
 
 def _quote_caveats(cb):
@@ -743,7 +847,7 @@ def sec_notes(p):
 
 
 _SECTIONS = [sec_header, sec_backdrop, sec_multi_tf, sec_divergences, sec_volume_profile,
-             sec_risk, sec_setup, sec_options, sec_squeeze, sec_insider, sec_pcoi,
+             sec_risk, sec_setup, sec_options, sec_squeeze, sec_insider, sec_pcoi, sec_gex,
              sec_vol, sec_call, sec_geo, sec_catalysts, sec_macro, sec_thesis, sec_notes]
 
 

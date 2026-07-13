@@ -16,6 +16,7 @@ widget interactions don't refetch — the module-level JSON caches still dedupe 
 
 import contextlib
 import io
+import json
 import os
 import re
 import time
@@ -29,7 +30,6 @@ import lens
 import lens_web_sections
 from modules.features import compute_hv_features
 from modules.timeframes import _load_daily, fetch_live_bar, append_live_bar
-from modules.volume_profile import volume_profile
 
 try:
     from modules.setupcheck import TIER1_MACRO
@@ -43,6 +43,8 @@ DEBOUNCE_S = 2.0    # settle time after a checkbox/argument change before regene
                     # clicks batch into ONE run instead of one fetch per click (Run bypasses it)
 LIVE_CHART_EVERY_S = 10   # live-mode chart refresh cadence (one Tradier quote per tick; the
                           # chart redraws in a st.fragment — the report below is NOT re-fetched)
+LIVE_MISS_LIMIT = 3       # consecutive empty live quotes before polling pauses (S55 — the
+                          # fragment otherwise hits Tradier every 10s all night; Run resumes)
 
 st.set_page_config(page_title="LENS", page_icon="🔭", layout="wide")
 
@@ -64,7 +66,7 @@ def make_args(flags):
         no_refresh=False, refresh=False,
         pc_oi=([] if flags["pc_oi"] == "all" else [flags["pc_oi"]]) if flags["pc_oi"] != "off" else None,
         insider=flags["insider"], squeeze=flags["squeeze"], live=flags["live"],
-        vol=flags["vol"], call=flags["call"],
+        vol=flags["vol"], call=flags["call"], gex=flags["gex"],
     )
 
 
@@ -92,23 +94,21 @@ def generate_payload(ticker, flags_key):
 
 
 @st.cache_data(ttl=600, show_spinner=False)
+def load_daily_full(ticker):
+    """Cached full daily history — the ONE loader behind the chart tail and seasonality (S55;
+    they previously each made their own _load_daily call, i.e. two identical full yfinance
+    downloads for CSV-less tickers) — keeps the fallback path from re-downloading on every
+    live tick."""
+    return _load_daily(ticker, DATA_DIR)
+
+
 def load_daily_tail(ticker, bars=CHART_BARS, warmup=CHART_WARMUP):
-    """Cached daily-bar tail for the chart (display window + indicator warm-up) — keeps the
-    yfinance-fallback path (no CSV) from re-downloading full history on every live tick."""
-    return _load_daily(ticker, DATA_DIR).tail(bars + warmup)
+    """Daily-bar tail for the chart (display window + indicator warm-up), floored at 260 rows
+    so range52's 252-bar window stays a real 52 weeks if CHART_WARMUP ever shrinks."""
+    return load_daily_full(ticker).tail(max(bars + warmup, 260))
 
 
 VP_ASPECTS = ["value area", "POC", "HVN", "LVN", "histogram"]
-
-
-@st.cache_data(ttl=600, show_spinner=False)
-def load_profile(ticker):
-    """Volume profile over the last ~1y of DAILY bars (the lens' daily-fallback convention;
-    the report's own profile may use finer 1h bars over ~6mo, so levels can differ slightly)."""
-    try:
-        return volume_profile(load_daily_tail(ticker), lookback=252, with_hist=True)
-    except Exception:
-        return None
 
 
 @st.cache_data(ttl=600, show_spinner=False)
@@ -132,7 +132,7 @@ def load_iv_history(ticker, bars=252):
 
         out = {"dates": [d.date().isoformat() for d in t.index],
                "iv30": col("atm_iv_30d"), "iv_event": col("atm_iv_event"),
-               "hv20": col("HV_20")}
+               "hv20": col("HV_20"), "skew": col("iv_skew_25d")}
         return out if any(v is not None for v in out["iv30"]) else None
     except Exception:
         return None
@@ -140,14 +140,21 @@ def load_iv_history(ticker, bars=252):
 
 def _iv_fig(hist):
     """IV-vs-HV history figure: harvested ATM IV (30d) vs realized HV-20, the event-tenor IV
-    where stamped, and shaded pre-earnings windows (contiguous runs of the S44 atm_iv_event
-    stamp — earnings markers with no network call). Returns None when it can't build."""
+    where stamped, shaded pre-earnings windows (contiguous runs of the S44 atm_iv_event
+    stamp — earnings markers with no network call), and (S56) a 25Δ-skew subpane when the
+    harvest carries it — a rising skew = downside protection getting bid. Returns None when
+    it can't build."""
     try:
         import plotly.graph_objects as go
+        from plotly.subplots import make_subplots
         d, iv, hv, ev = hist["dates"], hist["iv30"], hist["hv20"], hist["iv_event"]
+        sk = hist.get("skew") or []
+        has_skew = any(v is not None for v in sk)
         if len(d) < 2:
             return None
-        fig = go.Figure()
+        fig = make_subplots(rows=2 if has_skew else 1, cols=1, shared_xaxes=True,
+                            vertical_spacing=0.06,
+                            row_heights=[0.68, 0.32] if has_skew else None)
         start = None
         for i, v in enumerate(ev + [None]):                # sentinel closes a trailing run
             if v is not None and start is None:
@@ -157,13 +164,19 @@ def _iv_fig(hist):
                               fillcolor="rgba(224,166,58,0.08)", line_width=0)
                 start = None
         fig.add_trace(go.Scatter(x=d, y=hv, name="HV-20 (realized)", mode="lines",
-                                 line=dict(color="#4ea3d8", width=1.2)))
+                                 line=dict(color="#4ea3d8", width=1.2)), row=1, col=1)
         fig.add_trace(go.Scatter(x=d, y=iv, name="ATM IV (30d)", mode="lines",
-                                 line=dict(color="#e0a63a", width=1.4)))
+                                 line=dict(color="#e0a63a", width=1.4)), row=1, col=1)
         if any(v is not None for v in ev):
             fig.add_trace(go.Scatter(x=d, y=ev, name="event-expiry IV", mode="markers",
-                                     marker=dict(color="#d6ba2e", size=3)))
-        fig.update_layout(height=230, margin=dict(l=10, r=10, t=10, b=10),
+                                     marker=dict(color="#d6ba2e", size=3)), row=1, col=1)
+        if has_skew:
+            fig.add_trace(go.Scatter(x=d, y=sk, name="25Δ skew (put−call IV)", mode="lines",
+                                     line=dict(color="#b070d0", width=1.2)), row=2, col=1)
+            fig.add_hline(y=0, line_width=0.8, line_color="#4a5160", row=2, col=1)
+            fig.update_yaxes(tickformat="+.0%", row=2, col=1)
+        fig.update_layout(height=310 if has_skew else 230,
+                          margin=dict(l=10, r=10, t=10, b=10),
                           template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
                           plot_bgcolor="rgba(14,17,23,1)", yaxis=dict(tickformat=".0%"),
                           legend=dict(orientation="h", y=1.12, x=0, font=dict(size=11)))
@@ -188,14 +201,227 @@ def range52(df, window=252):
         return None
 
 
+# ── day-over-day snapshots + diff (S56) ──────────────────────────────────────
+HISTORY_DIR = os.path.join(DATA_DIR, "payload_history")
+SNAP_KEEP = 90            # snapshots kept per ticker
+GAUGE_MOVE_PP = 0.10      # gauge percentile move worth surfacing (10 points)
+
+
+def snap_from_payload(p):
+    """Compact, diffable slice of a payload (pure): setup marks, risk factor strings, gauge
+    value/percentile pairs, close. NOT the full payload — snapshots stay tiny on disk."""
+    setup = {str(r[0]): str(r[1]) for r in (p.get("setup") or {}).get("rows", [])
+             if isinstance(r, (list, tuple)) and len(r) >= 2}
+    risk = p.get("risk") or {}
+    gauges = {g["name"]: [g.get("value"), g.get("pct")]
+              for g in (p.get("ctx") or {}).get("gauges", [])
+              if g.get("value") is not None}
+    lb = p.get("last_bar") or {}
+    return {"as_of": p.get("as_of"), "close": lb.get("close"), "setup": setup,
+            "dd": [str(x) for x in risk.get("drawdown") or []],
+            "rally": [str(x) for x in risk.get("rally") or []], "gauges": gauges}
+
+
+def save_snapshot(ticker, payload):
+    """Persist today's snapshot (one file per as-of date — a same-day re-run overwrites),
+    pruned to SNAP_KEEP. Best-effort: never raises."""
+    try:
+        snap = snap_from_payload(payload)
+        if not snap["as_of"]:
+            return
+        d = os.path.join(HISTORY_DIR, ticker.lower())
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, f"{snap['as_of']}.json"), "w", encoding="utf-8") as f:
+            json.dump(snap, f)
+        files = sorted(f for f in os.listdir(d) if f.endswith(".json"))
+        for old in files[:-SNAP_KEEP]:
+            os.remove(os.path.join(d, old))
+    except Exception:
+        pass
+
+
+def load_prev_snapshot(ticker, before_iso):
+    """Most recent snapshot STRICTLY BEFORE `before_iso` (so a same-day re-run diffs against
+    the prior session, not itself). None when there is no history yet."""
+    try:
+        d = os.path.join(HISTORY_DIR, ticker.lower())
+        prior = sorted(f for f in os.listdir(d)
+                       if f.endswith(".json") and f[:-5] < before_iso)
+        if not prior:
+            return None
+        with open(os.path.join(d, prior[-1]), encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def diff_snapshots(prev, cur):
+    """What changed between two snapshots (pure): setup-mark flips, risk factors added/
+    removed, gauge percentile moves ≥ GAUGE_MOVE_PP. Returns None when nothing notable."""
+    flips = [(k, prev["setup"][k], v) for k, v in (cur.get("setup") or {}).items()
+             if k in (prev.get("setup") or {}) and prev["setup"][k] != v]
+    out = {"flips": flips}
+    for side in ("dd", "rally"):
+        p, c = set(prev.get(side) or []), set(cur.get(side) or [])
+        out[f"{side}_added"] = sorted(c - p)
+        out[f"{side}_removed"] = sorted(p - c)
+    moves = []
+    for name, (val, pct) in (cur.get("gauges") or {}).items():
+        pv = (prev.get("gauges") or {}).get(name)
+        if pv and pct is not None and pv[1] is not None and abs(pct - pv[1]) >= GAUGE_MOVE_PP:
+            moves.append((name, pv[1], pct))
+    out["gauge_moves"] = sorted(moves, key=lambda m: -abs(m[2] - m[1]))
+    return out if any(out[k] for k in out) else None
+
+
+def render_diff(ticker, payload):
+    """'What changed' expander (S56) — latest report vs the prior stored session's snapshot.
+    Silent when there's no history or nothing notable moved."""
+    cur = snap_from_payload(payload)
+    if not cur["as_of"]:
+        return
+    prev = load_prev_snapshot(ticker, cur["as_of"])
+    if not prev:
+        return
+    d = diff_snapshots(prev, cur)
+    if d is None:
+        chg = ((cur["close"] / prev["close"] - 1)
+               if cur.get("close") and prev.get("close") else None)
+        st.caption(f"Δ vs {prev['as_of']}: no notable state changes"
+                   + (f" · close {chg:+.2%}" if chg is not None else ""))
+        return
+    with st.expander(f"Δ what changed since {prev['as_of']}", expanded=False):
+        if cur.get("close") and prev.get("close"):
+            st.caption(f"close {prev['close']:,.2f} → {cur['close']:,.2f} "
+                       f"({cur['close'] / prev['close'] - 1:+.2%})")
+        if d["flips"]:
+            st.markdown("**setup-check flips:** "
+                        + " · ".join(f"{k}: {a} → {b}" for k, a, b in d["flips"]))
+        for label, key in (("new drawdown-risk factors", "dd_added"),
+                           ("cleared drawdown-risk factors", "dd_removed"),
+                           ("new rally factors", "rally_added"),
+                           ("cleared rally factors", "rally_removed")):
+            if d[key]:
+                st.markdown(f"**{label}:**")
+                for x in d[key]:
+                    st.markdown(f"- {x}")
+        if d["gauge_moves"]:
+            from modules.sentiment import ordinal_percentile
+            st.markdown("**gauge percentile moves (≥10 points):** "
+                        + " · ".join(f"{n} {ordinal_percentile(a)} → {ordinal_percentile(b)}"
+                                     for n, a, b in d["gauge_moves"][:6]))
+        st.caption("state diff vs the prior stored session — snapshots accumulate per run "
+                   "under data/payload_history/")
+
+
+# ── watchlist landing grid (S56) ─────────────────────────────────────────────
+@st.cache_data(ttl=600, show_spinner=False)
+def load_tile(ticker):
+    """Watchlist-tile data off the indicators CSV — zero network (known_tickers() only lists
+    tickers WITH a CSV). None when the file is unreadable/too thin."""
+    path = os.path.join(DATA_DIR, f"{ticker.lower()}_indicators.csv")
+    try:
+        c = pd.read_csv(path, index_col=0, parse_dates=True)["Close"].dropna()
+        if len(c) < 21:
+            return None
+        last, prev = float(c.iloc[-1]), float(c.iloc[-2])
+        ma20 = float(c.rolling(20).mean().iloc[-1])
+        ma50 = float(c.rolling(50).mean().iloc[-1]) if len(c) >= 50 else None
+        return {"closes": [float(v) for v in c.tail(60)], "last": last,
+                "chg": last / prev - 1 if prev else 0.0,
+                "ma20_up": last >= ma20,
+                "ma50_up": (last >= ma50) if ma50 is not None else None,
+                "as_of": c.index[-1].date().isoformat()}
+    except Exception:
+        return None
+
+
+def _spark_fig(closes):
+    """Tiny axis-less sparkline; green/red by the 60-bar trend."""
+    try:
+        import plotly.graph_objects as go
+        color = "#5ec45e" if closes[-1] >= closes[0] else "#d83c34"
+        fig = go.Figure(go.Scatter(y=closes, mode="lines",
+                                   line=dict(color=color, width=1.4)))
+        fig.update_layout(height=54, margin=dict(l=0, r=0, t=2, b=2), showlegend=False,
+                          xaxis=dict(visible=False), yaxis=dict(visible=False),
+                          paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                          hovermode=False)
+        return fig
+    except Exception:
+        return None
+
+
+def _pick_from_tile(t):
+    """Tile/pill pick → search box + one-shot explicit-intent flag (skips the debounce)."""
+    st.session_state["ticker_input"] = t
+    st.session_state["pill_clicked"] = True
+
+
+def render_watchlist(known):
+    """Empty-state landing grid: one compact tile per known ticker (CSV only, zero network) —
+    sparkline, last close + Δ, MA20/50 arrows, latest snapshot's setup score when one exists."""
+    st.caption("watchlist — every ticker with indicators data on disk; click one to run the lens")
+    per_row = 4
+    for i in range(0, len(known), per_row):
+        cols = st.columns(per_row)
+        for col, t in zip(cols, known[i:i + per_row]):
+            tile = load_tile(t)
+            with col.container(border=True):
+                b1, b2 = st.columns([1, 1.4])
+                b1.button(t, key=f"tile_{t}", on_click=_pick_from_tile, args=(t,))
+                if not tile:
+                    b2.caption("no data")
+                    continue
+                cc = "#5ec45e" if tile["chg"] >= 0 else "#d83c34"
+                b2.markdown(f'<div style="text-align:right;line-height:1.25;">'
+                            f'<span style="font-weight:600;">{tile["last"]:,.2f}</span><br>'
+                            f'<span style="color:{cc};font-size:0.85em;">{tile["chg"]:+.2%}'
+                            f'</span></div>', unsafe_allow_html=True)
+                fig = _spark_fig(tile["closes"])
+                if fig is not None:
+                    st.plotly_chart(fig, width="stretch", key=f"spark_{t}",
+                                    config={"displayModeBar": False, "staticPlot": True})
+                arrows = f"MA20 {'▲' if tile['ma20_up'] else '▼'}"
+                if tile["ma50_up"] is not None:
+                    arrows += f" · MA50 {'▲' if tile['ma50_up'] else '▼'}"
+                setup_chip = ""
+                try:
+                    snaps = sorted(os.listdir(os.path.join(HISTORY_DIR, t.lower())))
+                    if snaps:
+                        with open(os.path.join(HISTORY_DIR, t.lower(), snaps[-1]),
+                                  encoding="utf-8") as f:
+                            marks = list((json.load(f).get("setup") or {}).values())
+                        if marks:
+                            ok = sum(1 for m in marks if m == "✓")
+                            setup_chip = f" · setup {ok}/{len(marks)}"
+                except Exception:
+                    pass
+                st.caption(f"{arrows}{setup_chip} · {tile['as_of']}")
+
+
+def _header_tiles(p, df):
+    """Header metric tiles from a payload-shaped dict, with the 52-week-range tile injected
+    from the chart's daily frame (S55 — the same block previously lived in both the live and
+    non-live paths). Never raises: a failure degrades to a caption, the ANSI expander below
+    is the lossless fallback."""
+    try:
+        hdr = dict(p)                                   # shallow copy — never mutate the cache
+        hdr["range52"] = range52(df)
+        lens_web_sections.sec_header(hdr)
+    except Exception as e:
+        st.caption(f"header tiles unavailable ({type(e).__name__}: {e}) — "
+                   f"see the full text report below")
+
+
 @st.cache_data(ttl=3600, show_spinner=False)
 def load_seasonality(ticker):
     """Monthly seasonality base rates (S53) — zero network when the indicators CSV exists
-    (yfinance-fallback tickers reuse _load_daily's own fallback, cached here ~1h). Needs the
-    FULL history — decades, not the chart's 320-bar tail."""
+    (yfinance-fallback tickers ride load_daily_full's cache — S55: no second download). Needs
+    the FULL history — decades, not the chart's 320-bar tail."""
     try:
         from modules.seasonality import monthly_seasonality
-        return monthly_seasonality(_load_daily(ticker, DATA_DIR)["Close"])
+        return monthly_seasonality(load_daily_full(ticker)["Close"])
     except Exception:
         return None
 
@@ -228,6 +454,19 @@ def load_ledger(ticker, rows=30):
     try:
         df = pd.read_csv(path)
         return df.tail(rows) if len(df) else None
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def load_ledger_score(ticker):
+    """Realized-return scoring of the signal ledger (S56 — the S30 standing TODO landed):
+    score_ledger.score() joins each ledger row to its 15d/63d forward return off the
+    indicators CSV, WIN-tagged against the row's OWN stamped thresholds. Zero network."""
+    try:
+        from score_ledger import score
+        res = score(ticker, DATA_DIR)
+        return res if res.get("status") == "ok" else None
     except Exception:
         return None
 
@@ -418,21 +657,33 @@ def _event_markers(p, horizon_days=EVENT_HORIZON_D):
 
 
 def _candle_fig(df, overlays=(), show_volume=False, price_line=None, vprofile=None,
-                events=()):
+                events=(), glevels=(), rsi=None, macd=None):
     """Plotly candlestick from a daily OHLCV frame + optional indicator overlays
     [(name, series, color, dash), …], a volume sub-pane, a dotted last/live price line,
     volume-profile aspects (`vprofile` = profile dict + an "aspects" set: value area band, POC
-    line, HVN/LVN levels, right-edge volume-at-price histogram), and upcoming-event markers
-    (`events` = [(date_iso, label, color), …] — dashed vlines, S50). Returns None when it
-    can't build."""
+    line, HVN/LVN levels, right-edge volume-at-price histogram), upcoming-event markers
+    (`events` = [(date_iso, label, color), …] — dashed vlines, S50), dealer-positioning
+    levels (`glevels` = [(label, y, color, dash), …] — GEX walls/zero-gamma/max pain, tagged
+    inside-right, S56), and momentum subpanes (S56): `rsi` = RSI(14) series, `macd` =
+    (macd, signal, hist) series triple. Returns None when it can't build."""
     try:
         import plotly.graph_objects as go
         from plotly.subplots import make_subplots
         if df is None or len(df) < 2:
             return None
-        rows = 2 if show_volume else 1
+        # pane layout: price + optional volume/RSI/MACD rows (row numbers assigned in order)
+        panes = [("price", 0.62)]
+        if show_volume:
+            panes.append(("volume", 0.14))
+        if rsi is not None:
+            panes.append(("rsi", 0.12))
+        if macd is not None:
+            panes.append(("macd", 0.12))
+        w = sum(h for _, h in panes)
+        rowno = {name: i + 1 for i, (name, _) in enumerate(panes)}
+        rows = len(panes)
         fig = make_subplots(rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.03,
-                            row_heights=[0.76, 0.24] if show_volume else None)
+                            row_heights=[h / w for _, h in panes] if rows > 1 else None)
         # TradingView hollow-candle convention (matches the lens' terminal candles): COLOR =
         # close vs PRIOR close (green up / red down), FILL = close vs THIS bar's open (hollow
         # when close ≥ open, solid otherwise). Plotly's single trace can only key on close-vs-
@@ -461,13 +712,38 @@ def _candle_fig(df, overlays=(), show_volume=False, price_line=None, vprofile=No
             # its open) — `up` from the candle masks above already encodes it
             colors = ["rgba(94,196,94,0.55)" if u else "rgba(216,60,52,0.55)" for u in up]
             fig.add_trace(go.Bar(x=df.index, y=df["Volume"], marker_color=colors,
-                                 showlegend=False, name="volume"), row=2, col=1)
-        if vprofile:
-            a = vprofile.get("aspects") or set()
-            # The profile spans ~1y of prices — levels and histogram bins can sit far outside
-            # the 120-bar window, and autorange would stretch the y-axis to include them,
-            # squishing the candles. Pin the price pane to the VISIBLE window's range (bars +
-            # overlays + price line, padded) and clip every profile aspect to it.
+                                 showlegend=False, name="volume"),
+                          row=rowno["volume"], col=1)
+        if rsi is not None:
+            r_row = rowno["rsi"]
+            fig.add_trace(go.Scatter(x=rsi.index, y=rsi, name="RSI(14)", mode="lines",
+                                     line=dict(color="#d6ba2e", width=1.2), showlegend=False),
+                          row=r_row, col=1)
+            for lvl, col_ in ((70, "#d83c34"), (30, "#5ec45e")):
+                fig.add_hline(y=lvl, line_dash="dot", line_width=0.8, line_color=col_,
+                              row=r_row, col=1)
+            fig.update_yaxes(range=[0, 100], tickvals=[30, 50, 70], title_text="RSI",
+                             title_font_size=10, row=r_row, col=1)
+        if macd is not None:
+            m_row = rowno["macd"]
+            m_line, m_sig, m_hist = macd
+            hcol = ["rgba(94,196,94,0.55)" if (v is not None and v >= 0)
+                    else "rgba(216,60,52,0.55)" for v in m_hist]
+            fig.add_trace(go.Bar(x=m_hist.index, y=m_hist, marker_color=hcol,
+                                 showlegend=False, name="MACD hist"), row=m_row, col=1)
+            fig.add_trace(go.Scatter(x=m_line.index, y=m_line, name="MACD", mode="lines",
+                                     line=dict(color="#4ea3d8", width=1.1), showlegend=False),
+                          row=m_row, col=1)
+            fig.add_trace(go.Scatter(x=m_sig.index, y=m_sig, name="signal", mode="lines",
+                                     line=dict(color="#e0a63a", width=1.0), showlegend=False),
+                          row=m_row, col=1)
+            fig.update_yaxes(title_text="MACD", title_font_size=10, row=m_row, col=1)
+        ylo = yhi = None
+        if vprofile or glevels:
+            # Profile levels span ~1y of prices and GEX levels can sit outside the window —
+            # autorange would stretch the y-axis to include them, squishing the candles. Pin
+            # the price pane to the VISIBLE window's range (bars + overlays + price line,
+            # padded) and clip every level to it.
             ylo = float(df["Low"].min())
             yhi = float(df["High"].max())
             for _n, s, _c, _d in overlays:
@@ -479,7 +755,8 @@ def _candle_fig(df, overlays=(), show_volume=False, price_line=None, vprofile=No
             pad = (yhi - ylo) * 0.03 or 1.0
             ylo, yhi = ylo - pad, yhi + pad
             fig.update_yaxes(range=[ylo, yhi], row=1, col=1)
-
+        if vprofile:
+            a = vprofile.get("aspects") or set()
             ann = dict(x=0.0, xanchor="left", showarrow=False)     # inside-left level tags
             if "value area" in a and vprofile["va_low"] < yhi and vprofile["va_high"] > ylo:
                 fig.add_hrect(y0=max(vprofile["va_low"], ylo), y1=min(vprofile["va_high"], yhi),
@@ -512,14 +789,26 @@ def _candle_fig(df, overlays=(), show_volume=False, price_line=None, vprofile=No
                 if pairs:
                     centers, vols = [p[0] for p in pairs], [p[1] for p in pairs]
                     # right-edge volume-at-price bars on an overlaying, reversed x-axis: value 0
-                    # sits at the RIGHT edge and bars extend left, ~28% of the plot width
+                    # sits at the RIGHT edge and bars extend left, ~28% of the plot width.
+                    # Axis id x9 is deliberately clear of the subplot rows' x2/x3/x4 (S56 —
+                    # the RSI/MACD panes claimed x3 and collided with the old id)
                     fig.add_trace(go.Bar(x=vols, y=centers, orientation="h",
                                          marker_color="rgba(150,170,200,0.20)",
                                          marker_line_width=0, showlegend=False,
-                                         hoverinfo="skip", xaxis="x3", yaxis="y"))
-                    fig.update_layout(xaxis3=dict(overlaying="x", range=[max(vols) * 3.5, 0],
+                                         hoverinfo="skip", xaxis="x9", yaxis="y"))
+                    fig.update_layout(xaxis9=dict(overlaying="x", range=[max(vols) * 3.5, 0],
                                                   showgrid=False, showticklabels=False,
                                                   visible=False))
+        for label, y, gcolor, gdash in glevels or ():
+            # dealer-positioning levels (S56) — tagged inside-RIGHT so they never collide
+            # with the profile's inside-left POC/HVN/LVN tags
+            if ylo is not None and not ylo <= y <= yhi:
+                continue
+            fig.add_hline(y=y, line_dash=gdash, line_width=1.1, line_color=gcolor,
+                          row=1, col=1,
+                          annotation=dict(text=f"{label} {y:,.2f}", x=0.99, xanchor="right",
+                                          showarrow=False,
+                                          font=dict(color=gcolor, size=9)))
         if events:
             # upcoming events (earnings/ex-div/Tier-1 macro/catalysts) as dashed vlines; an
             # invisible marker at the furthest date pulls the x-range forward so future events
@@ -551,10 +840,10 @@ def _candle_fig(df, overlays=(), show_volume=False, price_line=None, vprofile=No
         holidays = pd.bdate_range(df.index[0], df.index[-1]).difference(df.index.normalize())
         if len(holidays):
             rb.append(dict(values=[d.strftime("%Y-%m-%d") for d in holidays]))
-        ax_rb = {"xaxis": dict(rangebreaks=rb)}
-        if show_volume:
-            ax_rb["xaxis2"] = dict(rangebreaks=rb)
-        fig.update_layout(**ax_rb)
+        # every subplot row has its own date x-axis (xaxis, xaxis2, …) — x9 (the numeric
+        # volume-profile overlay) is excluded: rangebreaks are a date-axis feature
+        fig.update_layout(**{f"xaxis{i + 1 if i else ''}": dict(rangebreaks=rb)
+                             for i in range(rows)})
         if price_line is not None:
             # price-tag style: label anchored LEFT at the plot's right edge, extending into the
             # widened right margin — never clipped by the plot area
@@ -564,7 +853,7 @@ def _candle_fig(df, overlays=(), show_volume=False, price_line=None, vprofile=No
                           row=1, col=1,
                           annotation=dict(text=f"{price_line:,.2f}", x=1.0, xanchor="left",
                                           font=dict(color="#e8c547", size=12), showarrow=False))
-        fig.update_layout(height=440 if show_volume else 360,
+        fig.update_layout(height=360 + 85 * (rows - 1),
                           margin=dict(l=10, r=64, t=26, b=10),
                           xaxis_rangeslider_visible=False, template="plotly_dark",
                           paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(14,17,23,1)",
@@ -587,11 +876,17 @@ def draw_chart(ticker, live=False, payload=None):
     bar = None
     prev = None
     if live:
-        try:
-            bar = fetch_live_bar(ticker)
-        except Exception:
-            pass
+        # backoff (S55): after LIVE_MISS_LIMIT consecutive empty quotes stop calling Tradier —
+        # the fragment keeps ticking, but a closed market / missing token isn't polled all
+        # night. Any successful bar or a new generate (Run) resets the counter.
+        misses = st.session_state.get("live_misses", 0)
+        if misses < LIVE_MISS_LIMIT:
+            try:
+                bar = fetch_live_bar(ticker)
+            except Exception:
+                pass
         if bar:
+            st.session_state["live_misses"] = 0
             df, _ = append_live_bar(df, bar)
             live_last = float(bar["Close"])
             prev = float(df["Close"].iloc[-2]) if len(df) > 1 else live_last
@@ -600,43 +895,57 @@ def draw_chart(ticker, live=False, payload=None):
             state = "session in progress" if bar.get("in_progress") else "session closed"
             st.caption(f"🔴 LIVE {now_et} ET — {ticker} ${live_last:,.2f} ({chg:+.2%} vs prior "
                        f"close) · {state} · chart updates every {LIVE_CHART_EVERY_S}s")
+        elif misses >= LIVE_MISS_LIMIT:
+            st.caption(f"live: polling paused after {LIVE_MISS_LIMIT} empty Tradier responses "
+                       f"(market closed / no token?) — showing last close; Run resumes")
         else:
+            st.session_state["live_misses"] = misses + 1
             st.caption("live: no Tradier session data right now (market closed / no token?) — "
                        "showing last close")
 
-    oc = st.columns(8)
+    has_gex = bool((payload or {}).get("gex"))
+    oc = st.columns(11)
     ma20 = oc[0].checkbox("MA20", value=True, key="ov_ma20")
     ma50 = oc[1].checkbox("MA50", value=True, key="ov_ma50")
     ma200 = oc[2].checkbox("MA200", key="ov_ma200")
     ema9 = oc[3].checkbox("EMA9", key="ov_ema9")
     bb = oc[4].checkbox("BB(20,2σ)", key="ov_bb")
     vol_pane = oc[5].checkbox("volume", value=True, key="ov_volume")
-    pline = oc[6].checkbox("price line", value=True, key="ov_pline")
-    vp_on = oc[7].checkbox("vol profile", key="ov_vp")
+    rsi_on = oc[6].checkbox("RSI", key="ov_rsi")
+    macd_on = oc[7].checkbox("MACD", key="ov_macd")
+    pline = oc[8].checkbox("price line", value=True, key="ov_pline")
+    vp_on = oc[9].checkbox("vol profile", key="ov_vp")
+    gex_on = oc[10].checkbox("GEX levels", value=True, key="ov_gex") if has_gex else False
+
+    glevels = []
+    if gex_on:
+        g = payload["gex"]
+        if g.get("call_wall") is not None:
+            glevels.append(("call wall", float(g["call_wall"]), "#5ec45e", "dash"))
+        if g.get("put_wall") is not None:
+            glevels.append(("put wall", float(g["put_wall"]), "#d83c34", "dash"))
+        if g.get("zero_gamma") is not None:
+            glevels.append(("zero-γ", float(g["zero_gamma"]), "#e0a63a", "dot"))
+        if g.get("max_pain") and g["max_pain"].get("strike") is not None:
+            glevels.append(("max pain", float(g["max_pain"]["strike"]), "#9aa4b2", "dot"))
 
     vprofile = None
     if vp_on:
         aspects = st.pills("profile aspects", VP_ASPECTS, selection_mode="multi",
                            default=VP_ASPECTS, key="ov_vp_aspects")
-        # the REPORT's own profile (payload) — chart levels must match the Volume Profile
-        # section exactly (S54; recomputing here on daily/1y disagreed wildly on names like
-        # SOFI where the 1y value area spans an old high-price shelf). load_profile is only
-        # the fallback for payloads without one (thin data).
-        prof = (payload or {}).get("profile") or load_profile(ticker)
+        # the REPORT's own profile — chart levels must match the Volume Profile section
+        # exactly (S54; recomputing here on daily/1y disagreed wildly on names like SOFI
+        # where the 1y value area spans an old high-price shelf), so there is deliberately
+        # NO local fallback when the report carried none (S55)
+        prof = (payload or {}).get("profile")
         if prof:
             vprofile = dict(prof)
             vprofile["aspects"] = set(aspects or [])
-            from_payload = bool((payload or {}).get("profile"))
-            src = ("report profile — matches the Volume Profile section (1h bars ~6mo when "
-                   "available, else daily ~1y)" if from_payload
-                   else "daily bars ~1y (fallback — report carried no profile)")
-            st.caption(f"profile: {src} · POC {prof['poc']:,.2f} · value area "
+            st.caption(f"profile: report levels (1h bars ~6mo when available, else daily ~1y)"
+                       f" · POC {prof['poc']:,.2f} · value area "
                        f"{prof['va_low']:,.2f}–{prof['va_high']:,.2f}")
-            if "histogram" in (aspects or []) and not prof.get("hist_volumes"):
-                st.caption("histogram appears after the next Run (this report predates the "
-                           "chart/report profile unification)")
         else:
-            st.caption("volume profile unavailable for this ticker")
+            st.caption("volume profile unavailable — the report carried none for this ticker")
 
     # overlays computed on the warm-up-extended frame, then sliced to the display window so
     # MA200/BB are fully formed at the left edge (matches the CSV's indicator conventions)
@@ -655,33 +964,41 @@ def draw_chart(ticker, live=False, payload=None):
         ov.append(("BB upper", m + 2 * s, "#7f8ea3", "dash"))
         ov.append(("BB lower", m - 2 * s, "#7f8ea3", "dash"))
 
+    # momentum subpanes (S56) — computed on the warm-up-extended frame like the MAs, so
+    # RSI/MACD are fully formed at the window's left edge; display-only
+    rsi_s = macd_t = None
+    if rsi_on:
+        delta = close.diff()
+        gain = delta.clip(lower=0).ewm(alpha=1 / 14, adjust=False).mean()
+        loss = (-delta.clip(upper=0)).ewm(alpha=1 / 14, adjust=False).mean()
+        rsi_s = (100 - 100 / (1 + gain / loss)).tail(CHART_BARS)
+    if macd_on:
+        m = close.ewm(span=12, adjust=False).mean() - close.ewm(span=26, adjust=False).mean()
+        sig = m.ewm(span=9, adjust=False).mean()
+        macd_t = (m.tail(CHART_BARS), sig.tail(CHART_BARS), (m - sig).tail(CHART_BARS))
+
     view = df.tail(CHART_BARS)
     price = live_last if live_last is not None else float(view["Close"].iloc[-1])
     fig = _candle_fig(view, overlays=[(n, s.tail(CHART_BARS), c, d) for n, s, c, d in ov],
                       show_volume=vol_pane, price_line=price if pline else None,
-                      vprofile=vprofile, events=_event_markers(payload))
+                      vprofile=vprofile, events=_event_markers(payload), glevels=glevels,
+                      rsi=rsi_s, macd=macd_t)
     if fig is not None:
-        st.plotly_chart(fig, use_container_width=True, key=f"chart_{ticker}")
+        st.plotly_chart(fig, width="stretch", key=f"chart_{ticker}")
 
     if live:
         # header metric tiles ride the same quote as the chart (render_all skips sec_header in
         # live mode); payload-shaped dict so sec_header's LIVE/close labeling is reused as-is
-        try:
-            if bar:
-                lens_web_sections.sec_header({
-                    "ticker": ticker, "as_of": str(df.index[-1].date()),
-                    "last_bar": {"close": live_last, "prev_close": prev, "open": bar["Open"],
-                                 "high": bar["High"], "low": bar["Low"]},
-                    "live": {"applied": True, "in_progress": bar.get("in_progress"),
-                             "hhmm": bar.get("hhmm")},
-                    "range52": range52(df)})            # df includes the live bar → tile ticks
-            elif payload:
-                hdr = dict(payload)                     # shallow copy — never mutate the cache
-                hdr["range52"] = range52(df)
-                lens_web_sections.sec_header(hdr)       # no quote — tiles hold the last close
-        except Exception as e:
-            st.caption(f"header tiles unavailable ({type(e).__name__}: {e}) — "
-                       f"see the full text report below")
+        if bar:
+            _header_tiles({
+                "ticker": ticker, "as_of": str(df.index[-1].date()),
+                "last_bar": {"close": live_last, "prev_close": prev, "open": bar["Open"],
+                             "high": bar["High"], "low": bar["Low"]},
+                "live": {"applied": True, "in_progress": bar.get("in_progress"),
+                         "hhmm": bar.get("hhmm")}},
+                df)                                     # df includes the live bar → tile ticks
+        elif payload:
+            _header_tiles(payload, df)                  # no quote — tiles hold the last close
 
 
 # ── controls ─────────────────────────────────────────────────────────────────
@@ -693,10 +1010,33 @@ def _pick_ticker():
     if pick:
         st.session_state["ticker_input"] = pick
         st.session_state["ticker_pills"] = None
+        st.session_state["pill_clicked"] = True   # explicit intent (S55) — skips the debounce
 
 
 st.markdown("### 🔭 LENS — multi-timeframe market-structure & risk")
 known = known_tickers()
+
+# deep links (S56): ?ticker=QQQ&vol=1&pc_oi=near prefills the controls and auto-runs once
+# (explicit intent → debounce bypassed). Consumed on the FIRST run only, before the widgets
+# instantiate; the URL is written back after each successful generate, so the current view
+# is always shareable/bookmarkable.
+FLAG_NAMES = ("vol", "call", "gex", "squeeze", "insider", "geo", "live")
+if "qp_done" not in st.session_state:
+    st.session_state["qp_done"] = True
+    try:
+        qp_t = (st.query_params.get("ticker") or "").strip().upper()
+        if qp_t and not st.session_state.get("ticker_input"):
+            st.session_state["ticker_input"] = qp_t
+            st.session_state["pill_clicked"] = True
+        for f in FLAG_NAMES:
+            if st.query_params.get(f) == "1":
+                st.session_state[f"flag_{f}"] = True
+        qp_pc = st.query_params.get("pc_oi")
+        if qp_pc in ("all", "near", "leaps", "monthly"):
+            st.session_state["flag_pc_oi"] = qp_pc
+    except Exception:
+        pass
+
 c1, c2 = st.columns([2, 5])
 with c1:
     # key = the single source of truth for the ticker; the pill callback writes into it
@@ -704,15 +1044,16 @@ with c1:
                            max_chars=8).strip().upper()
 with c2:
     st.caption("blocks")
-    f1, f2, f3, f4, f5, f6, f7 = st.columns(7)
-    vol = f1.checkbox("vol")
-    call = f2.checkbox("call")
-    squeeze = f3.checkbox("squeeze")
-    insider = f4.checkbox("insider")
-    geo = f5.checkbox("geo")
-    live = f6.checkbox("live")
-    pc_oi = f7.selectbox("pc-oi", ["off", "all", "near", "leaps", "monthly"], index=0,
-                         label_visibility="collapsed")
+    f1, f2, f3, f4, f5, f6, f7, f8 = st.columns(8)
+    vol = f1.checkbox("vol", key="flag_vol")
+    call = f2.checkbox("call", key="flag_call")
+    gex = f3.checkbox("gex", key="flag_gex")
+    squeeze = f4.checkbox("squeeze", key="flag_squeeze")
+    insider = f5.checkbox("insider", key="flag_insider")
+    geo = f6.checkbox("geo", key="flag_geo")
+    live = f7.checkbox("live", key="flag_live")
+    pc_oi = f8.selectbox("pc-oi", ["off", "all", "near", "leaps", "monthly"],
+                         key="flag_pc_oi", label_visibility="collapsed")
 
 with st.expander("thesis overlay (optional)"):
     t1, t2 = st.columns(2)
@@ -723,7 +1064,7 @@ if known:
     st.pills("recent data", known, selection_mode="single", default=None,
              key="ticker_pills", on_change=_pick_ticker)
 
-run_clicked = st.button("Run", type="primary", use_container_width=False)
+run_clicked = st.button("Run", type="primary")
 
 # ── generate ─────────────────────────────────────────────────────────────────
 # Streamlit reruns the WHOLE script on any interaction (and on the menu's Rerun / the R hotkey),
@@ -731,12 +1072,15 @@ run_clicked = st.button("Run", type="primary", use_container_width=False)
 # live in session_state and be redrawn on EVERY rerun — gating the display on the click made the
 # menu Rerun blank the page. Regenerate only when the (ticker, flags) key changes or Run is
 # clicked; otherwise redisplay the stored result (generate_payload's 2-min cache absorbs repeats).
-flags = {"vol": vol, "call": call, "squeeze": squeeze, "insider": insider,
+flags = {"vol": vol, "call": call, "gex": gex, "squeeze": squeeze, "insider": insider,
          "geo": geo, "live": live, "pc_oi": pc_oi,
          "thesis": None if thesis == "none" else thesis,
          "level": level or None}
 flags_key = tuple(sorted(flags.items()))
 key = (ticker, flags_key)
+# consumed every run: a pill pick is explicit intent like Run — it skips the debounce below
+# (but NOT the 2-min cache: only Run force-refreshes)
+pill_clicked = st.session_state.pop("pill_clicked", False)
 
 # 2s debounce on argument changes: a changed key starts (or continues) a settle timer; the script
 # sleeps out the remainder and reruns itself, and only regenerates once the key has been stable
@@ -752,21 +1096,27 @@ elif ticker and key != st.session_state.get("last_key") \
         and key != st.session_state.get("failed_key"):
     # failed_key: a key whose generate failed doesn't auto-retry on every rerun (each overlay
     # toggle would otherwise eat the 2s debounce + re-error); Run retries it explicitly
-    now = time.time()
-    if st.session_state.get("pending_key") != key:
-        st.session_state["pending_key"] = key
-        st.session_state["pending_at"] = now
-    remaining = DEBOUNCE_S - (now - st.session_state["pending_at"])
-    if remaining > 0.05:
-        st.caption(f"⏳ applying in {remaining:.1f}s — keep clicking to batch changes")
-        time.sleep(remaining)
-        st.rerun()
-    else:
+    if pill_clicked:
         should_generate = True
         st.session_state.pop("pending_key", None)
+    else:
+        now = time.time()
+        if st.session_state.get("pending_key") != key:
+            st.session_state["pending_key"] = key
+            st.session_state["pending_at"] = now
+        remaining = DEBOUNCE_S - (now - st.session_state["pending_at"])
+        if remaining > 0.05:
+            st.caption(f"⏳ applying in {remaining:.1f}s — keep clicking to batch changes")
+            time.sleep(remaining)
+            st.rerun()
+        else:
+            should_generate = True
+            st.session_state.pop("pending_key", None)
 
 if should_generate:
-    with st.spinner(f"running the lens on {ticker}…"):
+    # st.status (S56) — the spinner upgraded to a stage log: the compute preamble (refresh/
+    # progress notices the CLI would print) lands inside it instead of vanishing
+    with st.status(f"running the lens on {ticker}…", expanded=False) as gen_status:
         if live or run_clicked:
             # explicit Run / live mode = fetch fresh — clear THIS entry only, not every ticker's
             generate_payload.clear(ticker, flags_key)
@@ -775,19 +1125,40 @@ if should_generate:
         except Exception as e:
             st.error(f"lens failed for {ticker}: {type(e).__name__}: {e}")
             payload, preamble, ansi = None, "", ""
+        for ln in re.sub(r"\x1b\[[0-9;]*m", "", preamble).strip().splitlines():
+            st.write(ln)
+        gen_status.update(label=(f"lens complete — {ticker}" if payload is not None
+                                 else f"lens failed — {ticker}"),
+                          state="complete" if payload is not None else "error")
     if payload is not None:
         st.session_state["last_key"] = key
         st.session_state["last_payload"] = payload
         st.session_state["last_ansi"] = preamble + ansi
         st.session_state.pop("failed_key", None)
+        st.session_state["live_misses"] = 0            # fresh generate resumes live polling
+        save_snapshot(ticker, payload)                 # day-over-day diff history (S56)
+        try:                                           # shareable URL reflects the current view
+            st.query_params["ticker"] = ticker
+            for f in FLAG_NAMES:
+                if flags[f]:
+                    st.query_params[f] = "1"
+                elif f in st.query_params:
+                    del st.query_params[f]
+            if flags["pc_oi"] != "off":
+                st.query_params["pc_oi"] = flags["pc_oi"]
+            elif "pc_oi" in st.query_params:
+                del st.query_params["pc_oi"]
+        except Exception:
+            pass
         # the generate may have auto-refreshed the indicators CSV (new close stamped) — drop the
         # chart caches so the candles/profile/IV-history always match the report's data vintage
-        load_daily_tail.clear()
-        load_profile.clear()
+        load_daily_full.clear()
         load_iv_history.clear()
         load_ledger.clear()
+        load_ledger_score.clear()
         load_seasonality.clear()
         load_earnings_reactions.clear()
+        load_tile.clear()
     else:
         st.session_state["failed_key"] = key
         if preamble:
@@ -810,13 +1181,8 @@ if st.session_state.get("last_payload"):
         # header tiles drawn here rather than via render_all (mirrors live mode, where the
         # fragment draws them) so the calendar below slots in right under the header's
         # 'state characterization' caption in BOTH modes
-        try:
-            hdr = dict(st.session_state["last_payload"])   # shallow copy — payload is cached
-            hdr["range52"] = range52(load_daily_tail(shown_ticker))
-            lens_web_sections.sec_header(hdr)
-        except Exception as e:
-            st.caption(f"header tiles unavailable ({type(e).__name__}: {e}) — "
-                       f"see the full text report below")
+        _header_tiles(st.session_state["last_payload"], load_daily_tail(shown_ticker))
+    render_diff(shown_ticker, st.session_state["last_payload"])   # day-over-day state diff (S56)
     render_econ_calendar()
     # IV vs realized-vol history (S50) — zero network (indicators CSV); skipped silently for
     # tickers without harvested IV columns
@@ -824,9 +1190,13 @@ if st.session_state.get("last_payload"):
     fig_iv = _iv_fig(hist) if hist else None
     if fig_iv is not None:
         lens_web_sections._sec("IV vs REALIZED VOL — trailing year")
-        st.plotly_chart(fig_iv, use_container_width=True, key=f"ivhist_{shown_ticker}")
-        st.caption("ATM IV (30d, harvested) vs HV-20 (realized) · shaded spans = pre-earnings "
-                   "event-IV stamp windows (S44) · gaps = sessions with no harvest")
+        st.plotly_chart(fig_iv, width="stretch", key=f"ivhist_{shown_ticker}")
+        cap = ("ATM IV (30d, harvested) vs HV-20 (realized) · shaded spans = pre-earnings "
+               "event-IV stamp windows (S44) · gaps = sessions with no harvest")
+        if any(v is not None for v in (hist.get("skew") or [])):
+            cap += (" · lower pane: 25Δ skew, put IV − call IV (rising = downside protection "
+                    "getting bid)")
+        st.caption(cap)
     # earnings reaction history (S53) — realized prints; skipped silently for ETFs/no data
     rx = load_earnings_reactions(shown_ticker)
     if rx:
@@ -903,16 +1273,63 @@ if st.session_state.get("last_payload"):
                        f"{medtxt(cs)} (full) · {wintxt(cr)} up, median {medtxt(cr)} (last "
                        f"10y — a month strong in both windows is a real prior; one that "
                        f"flips is noise) · base rates, NOT edge; stays display-only (S31)")
+    # sidebar quick-nav (S56) — anchor links to the section headers below (lens_web_sections
+    # stamps a stable slug id on each header div); entries appear only when the payload
+    # carries that section
+    _p = st.session_state["last_payload"]
+    _nav = [("Market backdrop", "market-backdrop", _p.get("backdrop")),
+            ("Multi-timeframe", "multi-timeframe", _p.get("reads")),
+            ("Volume profile", "volume-profile", _p.get("profile")),
+            ("Rally vs drawdown", "rally-vs-drawdown-risk", _p.get("risk")),
+            ("Setup check", "setup-check", _p.get("setup")),
+            ("Options & vol", "options-vol-context", _p.get("ctx")),
+            ("Short/squeeze", "short-positioning-squeeze", _p.get("squeeze")),
+            ("Insider activity", "insider-activity", _p.get("insider")),
+            ("Put/call OI", "put-call-oi", _p.get("pcoi")),
+            ("Gamma exposure", "gamma-exposure", _p.get("gex")),
+            ("Volatility setup", "volatility-setup", _p.get("vol")),
+            ("Long call viability", "long-call-viability", _p.get("callq")),
+            ("Geo backdrop", "geopolitical-cross-asset-backdrop", _p.get("geo"))]
+    with st.sidebar:
+        st.markdown(f"**{shown_ticker}** — sections")
+        st.markdown("\n".join(f"- [{label}](#{slug})" for label, slug, present in _nav
+                              if present))
     # native section renderers (S49) — same payload the ANSI report below is printed from;
     # the header is always drawn above (fragment in live mode, direct call otherwise)
     lens_web_sections.render_all(st.session_state["last_payload"], skip_header=True)
     ledger = load_ledger(shown_ticker)
     if ledger is not None:
-        with st.expander(f"signal ledger — entry.py forward ledger, last {len(ledger)} rows "
-                         f"(unscored)"):
-            st.dataframe(ledger, hide_index=True, width="stretch")
-            st.caption("one row per as-of run date (S30); not yet joined to realized returns — "
-                       "the standing scorer TODO")
+        sc = load_ledger_score(shown_ticker)
+        with st.expander(f"signal ledger — entry.py forward ledger, last {len(ledger)} rows"
+                         f"{' (scored vs realized returns)' if sc else ' (unscored)'}"):
+            led = ledger.copy()
+            if sc:
+                by_date = {r["date"]: r for r in sc["rows"]}
+
+                def _cell(d, k, wk):
+                    r = by_date.get(str(d))
+                    if not r or r[k] is None:
+                        return "pending"
+                    mark = "" if r[wk] is None else (" ✓" if r[wk] else " ✗")
+                    return f"{r[k]:+.1%}{mark}"
+
+                led.insert(3, "fwd 15d", [_cell(d, "fwd15", "win15") for d in led["date"]])
+                led.insert(4, "fwd 63d", [_cell(d, "fwd63", "win63") for d in led["date"]])
+            st.dataframe(led, hide_index=True, width="stretch")
+            if sc:
+                segs = []
+                for sig, a in sc["summary"].items():
+                    if a["avg15"] is not None:
+                        segs.append(f"{sig}: {a['scored15']} scored, avg 15d {a['avg15']:+.1%}")
+                st.caption(("one row per as-of run date (S30) · "
+                            + (" · ".join(segs) + " · " if segs else "")
+                            + f"{sc['pending15']} pending 15d / {sc['pending63']} pending 63d "
+                            f"· ✓/✗ = fwd return vs the row's OWN vol-adjusted threshold "
+                            f"(every tier — on a STAY OUT row a ✗ means staying out was "
+                            f"right) · also: python score_ledger.py"))
+            else:
+                st.caption("one row per as-of run date (S30); scoring needs the indicators "
+                           "CSV — run score_ledger.py for detail")
     with st.expander("full text report (CLI-identical)", expanded=False):
         html = Ansi2HTMLConverter(inline=True, dark_bg=True).convert(
             st.session_state.get("last_ansi", ""), full=False)
@@ -924,7 +1341,9 @@ if st.session_state.get("last_payload"):
             f'<pre style="font-family:Cascadia Mono,Consolas,monospace;font-size:13px;'
             f'line-height:1.35;color:#d8dee9;margin:0;">{html}</pre></div>')
 else:
-    st.info("Type a ticker (or pick one above) to run the lens. "
+    st.info("Type a ticker (or pick one from the watchlist below) to run the lens. "
             "Checkbox blocks mirror the CLI flags; quotes are cached per session like the CLI.")
     render_econ_calendar()      # still reachable before the first report
+    if known:
+        render_watchlist(known)     # landing grid (S56) — CSV-only tiles, zero network
 

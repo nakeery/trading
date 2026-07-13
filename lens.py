@@ -103,6 +103,18 @@ try:
     from modules.econ_calendar import next_event_per_series, ALL_SERIES
 except Exception:
     next_event_per_series, ALL_SERIES = None, []
+try:
+    from modules.gex import gather_gex
+except Exception:
+    gather_gex = None
+try:
+    from modules.cot import fetch_cot
+except Exception:
+    fetch_cot = None
+try:
+    from modules.buzz import fetch_buzz
+except Exception:
+    fetch_buzz = None
 
 _ARROW = {"up": "↑ up", "down": "↓ dn", "mixed": "~ mix"}
 _OB = {"overbought": "OB", "oversold": "OS", "neutral": "neut"}
@@ -503,9 +515,9 @@ def _section(title, color=True, w=78):
 
 def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as_of=None,
                  ctx=None, backdrop=None, thesis=None, level=None, color=True, candle_style="box",
-                 panel_bars=None, candle_px=128, geo=None, pcoi=None, vol=None, live=None,
-                 setup=None, squeeze=None, insider=None, callq=None, liq=None, cats=None,
-                 risk=None, macro_events=_UNSET):
+                 panel_bars=None, candle_px=128, geo=None, pcoi=None, gex=None, vol=None,
+                 live=None, setup=None, squeeze=None, insider=None, callq=None, liq=None,
+                 cats=None, risk=None, macro_events=_UNSET):
     w = 78
     print(f"\n{'═'*w}")
     hdr = f"  LENS — {ticker}"
@@ -686,8 +698,8 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
                 adv = f"  (avg daily vol {si['adv']/1e6:,.1f}M)" if si.get("adv") else ""
                 print(f"    days-to-cover    {si['dtc']:.1f}{adv}")
         else:
-            print(f"    short interest   n/a — source covers NASDAQ-listed names only "
-                  f"(NYSE tickers return no data)")
+            print(f"    short interest   n/a — neither the NASDAQ API nor FINRA's consolidated "
+                  f"feed returned data for this symbol")
         sv = squeeze.get("svr") or {}
         if sv.get("now") is not None:
             pct = f"  [{ordinal_percentile(sv['pct'])} of {sv['n']} sessions]" if sv.get("pct") is not None else ""
@@ -695,6 +707,12 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
             if sv.get("avg5") is not None and sv.get("avg20") is not None:
                 avgs = f" · 5d avg {sv['avg5']:.0%} · 20d avg {sv['avg20']:.0%}"
             print(f"    short-volume     {sv['now']:.0%} of volume (latest){avgs}{pct}")
+        bz = squeeze.get("buzz")
+        if bz:
+            was = f" (was #{bz['rank_prev']})" if bz.get("rank_prev") else ""
+            chg = f", {bz['chg']:+.0%} vs prior 24h" if bz.get("chg") is not None else ""
+            print(f"    retail buzz      #{bz['rank']} on reddit stock boards{was} — "
+                  f"{bz['mentions']} mentions{chg} (ApeWisdom)")
         read = squeeze.get("read") or {}
         print(f"    NET: {read.get('net', 'n/a')}")
         if read.get("fuel"):
@@ -707,6 +725,8 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
                 print(f"      • {f}")
         for c in read.get("caveats", []):
             print(f"    · {c}")
+        if bz:
+            print(f"    · buzz = attention, not direction — crowded names gap on headlines both ways")
 
     # 6b. INSIDER ACTIVITY (--insider; S42 — SEC Form 4 open-market flow, cluster-buy detection)
     if insider:
@@ -750,6 +770,46 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
             tpcv = f"{t['pc_vol']:.2f}" if t["pc_vol"] is not None else "n/a"
             print(f"    {'TOTAL':>10}  {'':>4}  {tpc:>6}  {tpcv:>7}   {pc_label(t['pc'])}  ({pcoi['scope']})")
         print(f"    P/C OI = put OI / call OI (positioning) · P/C Vol = latest-session flow · * = LEAPS tenor")
+
+    # GAMMA EXPOSURE — dealer positioning off the live Tradier chain (--gex; S56).
+    if gex and gex.get("by_strike"):
+        def _gexfmt(v, sign=True):
+            s = "+" if (sign and v >= 0) else ("-" if v < 0 else "")
+            a = abs(v)
+            if a >= 1e9:
+                return f"{s}${a / 1e9:.2f}bn"
+            if a >= 1e6:
+                return f"{s}${a / 1e6:.0f}m"
+            return f"{s}${a / 1e3:.0f}k"
+
+        _hdr = f"(≤{max(e['dte'] for e in gex['expiries'])}d, {len(gex['expiries'])} expiries)"
+        if gex.get("as_of_str"):
+            _hdr += f" · as of {gex['as_of_str']}" + ("  (stale)" if gex.get("stale") else "")
+        _section(f"GAMMA EXPOSURE — dealer positioning, Tradier chain  {_hdr}", color)
+        regime = ("dealers long gamma — stabilizing (sell rallies, buy dips)" if gex["net_gex"] > 0
+                  else "dealers short gamma — amplifying (buy rallies, sell dips)")
+        print(f"    net GEX: {_gexfmt(gex['net_gex'])} per 1% move — {regime}")
+        segs = []
+        if gex.get("call_wall") is not None:
+            segs.append(f"call wall {gex['call_wall']:g} ({_gexfmt(gex['call_wall_gex'], sign=False)})")
+        if gex.get("put_wall") is not None:
+            segs.append(f"put wall {gex['put_wall']:g} ({_gexfmt(abs(gex['put_wall_gex']), sign=False)})")
+        if gex.get("zero_gamma") is not None:
+            side = "below" if gex["zero_gamma"] < gex["spot"] else "above"
+            segs.append(f"zero-gamma ~{gex['zero_gamma']:.2f} ({side} spot)")
+        if segs:
+            print(f"    {'  ·  '.join(segs)}")
+        mp = gex.get("max_pain")
+        if mp:
+            print(f"    max pain ({mp['expiry']}, {mp['dte']}d): {mp['strike']:g}")
+        if gex.get("unusual"):
+            ua = " · ".join(f"{u['strike']:g}{u['type'][0]} "
+                            + (f"×{u['ratio']:.1f} OI" if u["ratio"] is not None else "NEW")
+                            + f" (vol {u['volume']:,})" for u in gex["unusual"])
+            print(f"    unusual activity today: {ua}")
+        print(f"    · assumes dealers long calls / short puts (standard convention) — real "
+              f"inventory unknown")
+        print(f"    · OI settles once daily (start-of-day) — intraday flow shifts walls first")
 
     # VOLATILITY SETUP — long-vol (straddle/strangle) context (--vol; descriptive, not a prediction).
     if vol and vol.get("setup"):
@@ -1049,6 +1109,18 @@ def build_backdrop(data_dir="data"):
             pct = f" [{ordinal_percentile(fng['pct'])}]" if fng.get("pct") is not None else ""
             seg = f"F&G {fng['score']:.0f} {fng['rating']}{pct}"
             backdrop_base = f"{backdrop_base}  |  {seg}" if backdrop_base else seg
+    if fetch_cot is not None:                        # CFTC COT lev-funds positioning (S56) — weekly, cached ~24h
+        cot = fetch_cot(data_dir=data_dir)
+        segs = []
+        for sym in ("ES", "NQ", "VIX"):
+            d = (cot or {}).get(sym)
+            if not d:
+                continue
+            pct = f" [{ordinal_percentile(d['pct'])}]" if d.get("pct") is not None else ""
+            segs.append(f"{sym} {d['net_pct_oi']:+.0%}{pct}")
+        if segs:
+            seg = "COT lev-funds " + " · ".join(segs)
+            backdrop_base = f"{backdrop_base}  |  {seg}" if backdrop_base else seg
     return backdrop_base
 
 
@@ -1129,6 +1201,20 @@ def gather_report(ticker, args, interactive, backdrop_base):
                 notes.append("put/call OI unavailable (no Tradier token or no chain data).")
             elif pc.get("cached") and pc.get("stale"):
                 notes.append(f"put/call OI cached {pc['age_str']} and stale — run in a terminal to refresh.")
+
+    # GAMMA EXPOSURE (--gex; S56) — dealer positioning off the live chain, cached like pc-oi.
+    gex = None
+    if getattr(args, "gex", False) and gather_gex is not None:
+        try:
+            gex = gather_gex(ticker, interactive=interactive, data_dir=args.data_dir,
+                             force=args.live)
+        except Exception as e:
+            notes.append(f"gamma exposure unavailable ({type(e).__name__}).")
+        else:
+            if gex is None:
+                notes.append("gamma exposure unavailable (no Tradier token or no chain data).")
+            elif gex.get("cached") and gex.get("stale"):
+                notes.append(f"gamma exposure cached {gex['age_str']} and stale — run in a terminal to refresh.")
 
     # earnings date — shared by the --vol block and the SETUP CHECK (S41)
     earn = None
@@ -1216,6 +1302,13 @@ def gather_report(ticker, args, interactive, backdrop_base):
                              profile=profile, data_dir=args.data_dir)
         if sqz is None:
             notes.append("short-positioning data unavailable (NASDAQ/FINRA fetch failed).")
+        # retail buzz (S56) — attention context riding the squeeze block; cached ~6h, one
+        # feed fetch serves every ticker. Unranked / feed down → silently absent.
+        if fetch_buzz is not None:
+            bz = fetch_buzz(ticker, data_dir=args.data_dir)
+            if bz:
+                sqz = dict(sqz) if sqz else {}
+                sqz["buzz"] = bz
 
     # INSIDER ACTIVITY (--insider; S42) — SEC EDGAR Form 4 open-market flow, cached.
     ins = None
@@ -1273,7 +1366,7 @@ def gather_report(ticker, args, interactive, backdrop_base):
     return {"ticker": ticker, "reads": reads, "divs": divs, "summary": summary,
             "profile": profile, "notes": notes, "last_bar": last_bar, "as_of": as_of,
             "panel_bars": panel_bars, "ctx": ctx, "backdrop": backdrop, "geo": geo,
-            "pcoi": pc, "vol": vol, "live": live_bar, "setup": setup, "squeeze": sqz,
+            "pcoi": pc, "gex": gex, "vol": vol, "live": live_bar, "setup": setup, "squeeze": sqz,
             "insider": ins, "callq": callq, "liq": liq, "cats": cats, "risk": risk,
             "macro_events": macro_events, "thesis": args.thesis, "level": args.level,
             "live_iv": live_iv,
@@ -1288,9 +1381,9 @@ def render_payload(p, use_color=True, candle_style="box", candle_px=128):
                  last_bar=p["last_bar"], as_of=p["as_of"], ctx=p["ctx"], backdrop=p["backdrop"],
                  thesis=p["thesis"], level=p["level"], color=use_color,
                  candle_style=candle_style, panel_bars=p["panel_bars"], candle_px=candle_px,
-                 geo=p["geo"], pcoi=p["pcoi"], vol=p["vol"], live=p["live"], setup=p["setup"],
-                 squeeze=p["squeeze"], insider=p["insider"], callq=p["callq"], liq=p["liq"],
-                 cats=p["cats"], risk=p["risk"], macro_events=p["macro_events"])
+                 geo=p["geo"], pcoi=p["pcoi"], gex=p.get("gex"), vol=p["vol"], live=p["live"],
+                 setup=p["setup"], squeeze=p["squeeze"], insider=p["insider"], callq=p["callq"],
+                 liq=p["liq"], cats=p["cats"], risk=p["risk"], macro_events=p["macro_events"])
 
 
 def render_ticker(ticker, args, use_color, interactive, backdrop_base):
@@ -1347,6 +1440,11 @@ if __name__ == "__main__":
                          "~0.35-0.40 delta) with breakeven move, theta/day as %% of premium, an "
                          "ATM-IV-by-expiry curve, and a chain liquidity grade. Network; needs "
                          "TRADIER_TOKEN; cached like --vol.")
+    ap.add_argument("--gex", action="store_true",
+                    help="Add a GAMMA EXPOSURE block — dealer GEX by strike off the live Tradier "
+                         "chain (expiries ≤60d): net GEX regime, call/put walls, zero-gamma flip, "
+                         "max pain, and unusual volume-vs-OI strikes. Network; needs TRADIER_TOKEN; "
+                         "cached like --pc-oi.")
     args = ap.parse_args()
 
     _enable_windows_ansi()

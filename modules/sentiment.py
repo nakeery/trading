@@ -33,6 +33,11 @@ IV_HV_RICH      = 1.40
 # harvest would otherwise present weeks-old IV/skew/term as current (S43).
 STALE_GAUGE_SESSIONS = 5
 
+# CBOE tail-risk bands (S56; display-only — never model features). SKEW ≈100 = lognormal
+# baseline, ≥150 = heavy OTM-put tail bid; VVIX long-run range roughly 80–120.
+SKEW_LOW, SKEW_HIGH = 130.0, 150.0
+VVIX_LOW, VVIX_HIGH = 85.0, 110.0
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Band labelers (single source of truth; mirror entry.py OPTIONS-MARKET CHECK)
@@ -283,6 +288,34 @@ def gather_context(ticker, data_dir="data", with_vix=True):
                                "pct": None})
         except Exception as e:
             notes.append(f"VIX complex unavailable ({type(e).__name__}) — market block skipped.")
+
+        # ── CBOE tail-risk pair (S56) — SKEW (OTM-put tail pricing) + VVIX (vol-of-vol).
+        # Display-only context, NEVER a model feature (S31 lesson); own try so a fetch miss
+        # never costs the VIX gauges above.
+        try:
+            import yfinance as yf
+            tail = yf.download(["^SKEW", "^VVIX"], period="2y", interval="1d",
+                               progress=False, auto_adjust=True)["Close"]
+            sk = tail["^SKEW"].dropna() if "^SKEW" in tail else pd.Series(dtype=float)
+            vv = tail["^VVIX"].dropna() if "^VVIX" in tail else pd.Series(dtype=float)
+            if len(sk):
+                v = float(sk.iloc[-1])
+                gauges.append({"group": "MARKET", "name": "SKEW (CBOE)", "value": v,
+                               "fmt": "{:.0f}",
+                               "label": ("tail hedging elevated (>=150)" if v >= SKEW_HIGH
+                                         else "tail premium low (<130)" if v < SKEW_LOW
+                                         else "typical"),
+                               "pct": percentile_of(sk, v), "spark": spark_of(sk)})
+            if len(vv):
+                v = float(vv.iloc[-1])
+                gauges.append({"group": "MARKET", "name": "VVIX (vol-of-vol)", "value": v,
+                               "fmt": "{:.0f}",
+                               "label": ("vol-of-vol stress (>=110)" if v >= VVIX_HIGH
+                                         else "vol-of-vol becalmed (<85)" if v < VVIX_LOW
+                                         else "typical"),
+                               "pct": percentile_of(vv, v), "spark": spark_of(vv)})
+        except Exception:
+            notes.append("SKEW/VVIX unavailable — tail-risk gauges skipped.")
 
     net = _net_read(atm_iv, hv_20, skew, term, pc_oi, regime)
     return {"ticker": ticker.upper(), "as_of": as_of, "regime": regime,

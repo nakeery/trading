@@ -1376,7 +1376,7 @@ def test_gather_payload_keys(monkeypatch):
     assert payload is not None
 
     expected = {"ticker", "reads", "divs", "summary", "profile", "notes", "last_bar", "as_of",
-                "panel_bars", "ctx", "backdrop", "geo", "pcoi", "vol", "live", "setup",
+                "panel_bars", "ctx", "backdrop", "geo", "pcoi", "gex", "vol", "live", "setup",
                 "squeeze", "insider", "callq", "liq", "cats", "risk", "macro_events",
                 "thesis", "level", "live_iv", "earn", "exd"}
     assert set(payload.keys()) == expected
@@ -1533,3 +1533,192 @@ def test_earnings_reactions():
 
     assert earnings_reactions(df, [])["status"] == "no_earnings"
     assert earnings_reactions(None, earnings)["status"] == "no_csv"
+
+
+# ─── Test 42: GEX pure math (S56, offline) ───────────────────────────────────────
+def test_gex_math():
+    """Dealer-GEX aggregation, walls, max pain, unusual activity, expiry selection and the
+    zero-gamma crossing — all on fixture rows (no network)."""
+    import datetime
+    from modules.gex import (gex_by_strike, key_levels, max_pain, unusual_activity,
+                             select_gex_expiries, zero_gamma, _unit_gex)
+    from modules.bs_invert import bs_gamma
+
+    spot = 100.0
+    rows = [
+        {"type": "call", "strike": 105.0, "oi": 100, "volume": 50, "gamma": 0.04,
+         "iv": 0.30, "dte": 20, "expiry": "2026-07-31"},
+        {"type": "call", "strike": 110.0, "oi": 300, "volume": 2000, "gamma": 0.02,
+         "iv": 0.30, "dte": 20, "expiry": "2026-07-31"},
+        {"type": "put", "strike": 95.0, "oi": 600, "volume": 900, "gamma": 0.03,
+         "iv": 0.35, "dte": 20, "expiry": "2026-07-31"},
+        {"type": "put", "strike": 90.0, "oi": 50, "volume": 600, "gamma": 0.01,
+         "iv": 0.35, "dte": 20, "expiry": "2026-07-31"},
+    ]
+
+    strikes, net = gex_by_strike(rows, spot)
+    assert [s["strike"] for s in strikes] == [90.0, 95.0, 105.0, 110.0]     # ascending
+    # calls positive, puts negative; unit formula = Γ·OI·100·S²·0.01
+    assert abs(strikes[2]["call"] - _unit_gex(0.04, 100, spot)) < 1e-9
+    assert strikes[1]["put"] < 0
+    assert abs(net - sum(s["net"] for s in strikes)) < 1e-6
+
+    lvl = key_levels(strikes)
+    assert lvl["call_wall"] == 110.0          # 0.02×300 > 0.04×100
+    assert lvl["put_wall"] == 95.0            # biggest |put| gamma-OI
+    assert key_levels([]) == {"call_wall": None, "call_wall_gex": None,
+                              "put_wall": None, "put_wall_gex": None}
+
+    # max pain: with heavy call OI above and put OI below, the minimum sits between the wings
+    mp = max_pain(rows)
+    assert 90.0 <= mp <= 110.0
+    assert max_pain([r for r in rows if r["type"] == "call"]) is None       # one-sided → None
+
+    # unusual activity: floor(vol≥500) and ratio(≥2×OI) both bind; NEW (zero-OI) ranks first
+    rows_ua = rows + [{"type": "call", "strike": 120.0, "oi": 0, "volume": 800,
+                       "gamma": 0.0, "iv": None, "dte": 20, "expiry": "2026-07-31"}]
+    ua = unusual_activity(rows_ua, min_vol=500, min_ratio=2.0)
+    assert ua[0]["oi"] == 0 and ua[0]["ratio"] is None                      # NEW first
+    assert {u["strike"] for u in ua} == {120.0, 90.0, 110.0}                # 95p: 900/600 < 2×
+    assert all(u["volume"] >= 500 for u in ua)
+
+    # expiry selection: nearest N + monthlies inside the window, deduped, dte-sorted
+    fut = [("2026-07-14", 2), ("2026-07-15", 3), ("2026-07-16", 4), ("2026-07-21", 9),
+           ("2026-08-21", 40),   # 3rd Friday → monthly, must survive beyond nearest-5
+           ("2026-09-04", 54), ("2026-10-16", 96)]
+    sel = select_gex_expiries(fut, max_dte=60, near=3, cap=8)
+    assert ("2026-08-21", 40) in sel and ("2026-10-16", 96) not in sel
+    assert [d for _, d in sel] == sorted(d for _, d in sel)
+    assert datetime.date(2026, 8, 21).weekday() == 4                        # fixture sanity
+
+    # bs_gamma: peaks near ATM, 0 on degenerate inputs
+    g_atm = bs_gamma(100, 100, 0.04, 30 / 365, 0.3)
+    assert g_atm > bs_gamma(100, 80, 0.04, 30 / 365, 0.3)
+    assert g_atm > bs_gamma(100, 120, 0.04, 30 / 365, 0.3)
+    assert bs_gamma(100, 100, 0.04, 0, 0.3) == 0.0
+
+    # zero-gamma: call-heavy above / put-heavy below → a crossing between the wings,
+    # found near spot; rows without iv/dte → None
+    zg = zero_gamma(rows, spot, band=0.15)
+    assert zg is None or 85.0 <= zg <= 115.0
+    assert zero_gamma([{**r, "iv": None} for r in rows], spot) is None
+
+
+# ─── Test 43: signal-ledger scorer (S56, offline via tmp_path) ───────────────────
+def test_score_ledger(tmp_path):
+    """score() joins ledger rows to realized 15d/63d returns and WIN-tags vs each row's OWN
+    stamped threshold; rows younger than a horizon are pending; missing files degrade to a
+    status, never an exception."""
+    import pandas as pd
+    from score_ledger import score
+
+    idx = pd.bdate_range("2026-01-05", periods=80)
+    close = pd.Series(100.0, index=idx)
+    close.iloc[20:] = 105.0          # +5% from session 5 → session 20 window
+    pd.DataFrame({"Close": close}).to_csv(tmp_path / "xyz_indicators.csv")
+
+    ledger = pd.DataFrame([
+        # session 5 → fwd15 = 105/100−1 = +5% ≥ 2% threshold → WIN; fwd63 lands in-data too
+        {"date": idx[5].date().isoformat(), "ticker": "XYZ", "signal": "STRONG ENTRY",
+         "win_threshold": 0.02, "win_threshold_63": 0.20},
+        # session 70 → 15d/63d windows both extend past the data → pending
+        {"date": idx[70].date().isoformat(), "ticker": "XYZ", "signal": "STAY OUT",
+         "win_threshold": 0.02, "win_threshold_63": 0.20},
+    ])
+    ledger.to_csv(tmp_path / "xyz_signal_ledger.csv", index=False)
+
+    res = score("XYZ", data_dir=str(tmp_path))
+    assert res["status"] == "ok" and res["n_rows"] == 2
+    newest, oldest = res["rows"]                                # newest first
+    assert newest["fwd15"] is None and newest["win15"] is None  # pending
+    assert abs(oldest["fwd15"] - 0.05) < 1e-9 and oldest["win15"] is True
+    assert oldest["win63"] is False                             # +5% < 20% bar
+    assert res["pending15"] == 1 and res["baseline"]["scored15"] == 1
+    assert res["summary"]["STRONG ENTRY"]["win15"] == 1.0
+
+    assert score("NOPE", data_dir=str(tmp_path))["status"] == "no_ledger"
+    (tmp_path / "ghost_signal_ledger.csv").write_text(
+        "date,ticker,signal,win_threshold,win_threshold_63\n", encoding="utf-8")
+    assert score("GHOST", data_dir=str(tmp_path))["status"] == "empty"
+
+
+# ─── Test 44: Phase B source parsers (S56, offline) ──────────────────────────────
+def test_cot_buzz_finra_parsers():
+    """CFTC COT parse + labels, ApeWisdom buzz_read, FINRA consolidated-SI parse — all pure,
+    on fixture payloads mirroring the live shapes probed 2026-07-12."""
+    from modules.cot import parse_cot, label_cot
+    from modules.buzz import buzz_read
+    from modules.shortint import parse_finra_si
+
+    # COT: 30 weekly rows so the percentile (≥26 floor) engages; net trends up
+    rows = [{"report_date_as_yyyy_mm_dd": f"2026-{(i % 12) + 1:02d}-{(i % 28) + 1:02d}T00:00:00.000",
+             "lev_money_positions_long": str(1000 + 40 * i),
+             "lev_money_positions_short": "1000",
+             "open_interest_all": "10000"} for i in range(30)]
+    rows[-1]["report_date_as_yyyy_mm_dd"] = "2026-12-30T00:00:00.000"   # unambiguous newest
+    read = parse_cot(rows)
+    assert read["date"] == "2026-12-30" and read["n_weeks"] == 30
+    assert abs(read["net_pct_oi"] - (40 * 29) / 10000) < 1e-9
+    assert read["pct"] is not None and read["pct"] >= 0.9               # newest = most long
+    assert "net long" in label_cot(read) and "crowded long" in label_cot(read)
+    inv = {"net_pct_oi": -0.3, "pct": 0.05, "net": -3000}
+    assert label_cot(inv, invert=True) == "net short · crowded vol-short"
+    assert parse_cot([]) is None
+    assert parse_cot([{"open_interest_all": "0"}]) is None
+
+    # buzz: found (with 24h change), zero-prior (chg None), unranked → None
+    res = [{"rank": 3, "ticker": "CRSP", "name": "CRISPR", "mentions": 120, "upvotes": 400,
+            "rank_24h_ago": 9, "mentions_24h_ago": 60},
+           {"rank": 4, "ticker": "NEWB", "name": "New", "mentions": 50, "upvotes": 10,
+            "rank_24h_ago": None, "mentions_24h_ago": 0}]
+    b = buzz_read(res, "crsp")
+    assert b["rank"] == 3 and abs(b["chg"] - 1.0) < 1e-9 and b["rank_prev"] == 9
+    assert buzz_read(res, "NEWB")["chg"] is None
+    assert buzz_read(res, "GHOST") is None and buzz_read(None, "X") is None
+
+    # FINRA consolidated SI: oldest-first input → newest-first output, same shape as NASDAQ
+    fin = [{"settlementDate": "2026-05-15", "currentShortPositionQuantity": 100e6,
+            "averageDailyVolumeQuantity": 50e6, "daysToCoverQuantity": 2.0},
+           {"settlementDate": "2026-05-29", "currentShortPositionQuantity": 120e6,
+            "averageDailyVolumeQuantity": 60e6, "daysToCoverQuantity": 2.5},
+           {"settlementDate": "bad", "currentShortPositionQuantity": None,
+            "averageDailyVolumeQuantity": 1, "daysToCoverQuantity": 1}]
+    out = parse_finra_si(fin)
+    assert [r["settle_date"] for r in out] == ["2026-05-29", "2026-05-15"]   # bad row dropped
+    assert out[0]["dtc"] == 2.5 and out[0]["interest"] == 120e6
+    assert parse_finra_si(None) == []
+
+
+# ─── Test 45: lens_web snapshot/diff + section slugs (S56, offline) ──────────────
+def test_web_snapshot_diff_and_slugs():
+    """Day-over-day snapshot extraction + diff (pure) and the stable section-anchor slugs the
+    sidebar quick-nav links against. Importing lens_web executes the page script in bare mode
+    — doubles as a does-the-module-even-run smoke."""
+    import lens_web
+    from lens_web_sections import _slug
+
+    pay = {"as_of": "2026-07-10", "last_bar": {"close": 100.0, "prev_close": 99.0},
+           "setup": {"rows": [("HTF alignment", "✓", ""), ("Momentum room", "✗", "")]},
+           "risk": {"drawdown": ["1M overbought"], "rally": ["HVN support below"]},
+           "ctx": {"gauges": [{"name": "ATM IV (30d)", "value": 0.3, "pct": 0.20},
+                              {"name": "VIX", "value": 17.0, "pct": None}]}}
+    snap = lens_web.snap_from_payload(pay)
+    assert snap["setup"] == {"HTF alignment": "✓", "Momentum room": "✗"}
+    assert snap["gauges"]["ATM IV (30d)"] == [0.3, 0.20] and snap["close"] == 100.0
+
+    pay2 = {**pay, "as_of": "2026-07-11",
+            "setup": {"rows": [("HTF alignment", "✗", ""), ("Momentum room", "✗", "")]},
+            "risk": {"drawdown": ["1M overbought", "extended above MA20"], "rally": []},
+            "ctx": {"gauges": [{"name": "ATM IV (30d)", "value": 0.4, "pct": 0.55}]}}
+    d = lens_web.diff_snapshots(snap, lens_web.snap_from_payload(pay2))
+    assert d["flips"] == [("HTF alignment", "✓", "✗")]
+    assert d["dd_added"] == ["extended above MA20"] and d["rally_removed"] == ["HVN support below"]
+    assert d["gauge_moves"][0][0] == "ATM IV (30d)"            # 20ᵗʰ → 55ᵗʰ ≥ 10-pt move
+    assert lens_web.diff_snapshots(snap, snap) is None         # no change → None
+
+    # slugs: qualifier text after —/( never leaks into the anchor
+    assert _slug("MULTI-TIMEFRAME  (longest → shortest)") == "multi-timeframe"
+    assert _slug("GAMMA EXPOSURE — dealer positioning, Tradier chain  (≤40d)") == "gamma-exposure"
+    assert _slug("OPTIONS & VOL CONTEXT  (regime: calm)") == "options-vol-context"
+    assert _slug("SHORT POSITIONING / SQUEEZE  (context, not a prediction)") \
+        == "short-positioning-squeeze"
