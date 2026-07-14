@@ -70,6 +70,7 @@ def make_args(flags):
         insider=flags["insider"], squeeze=flags["squeeze"],
         live=flags["live"] and not flags.get("as_of"),
         vol=flags["vol"], call=flags["call"], gex=flags["gex"],
+        street=flags.get("street", False),
     )
 
 
@@ -1072,7 +1073,7 @@ known = known_tickers()
 # (explicit intent → debounce bypassed). Consumed on the FIRST run only, before the widgets
 # instantiate; the URL is written back after each successful generate, so the current view
 # is always shareable/bookmarkable.
-FLAG_NAMES = ("vol", "call", "gex", "squeeze", "insider", "geo", "live")
+FLAG_NAMES = ("vol", "call", "gex", "squeeze", "insider", "street", "geo", "live")
 if "qp_done" not in st.session_state:
     st.session_state["qp_done"] = True
     try:
@@ -1103,15 +1104,16 @@ with c1:
                            max_chars=8).strip().upper()
 with c2:
     st.caption("blocks")
-    f1, f2, f3, f4, f5, f6, f7, f8 = st.columns(8)
+    f1, f2, f3, f4, f5, f6, f7, f8, f9 = st.columns(9)
     vol = f1.checkbox("vol", key="flag_vol")
     call = f2.checkbox("call", key="flag_call")
     gex = f3.checkbox("gex", key="flag_gex")
     squeeze = f4.checkbox("squeeze", key="flag_squeeze")
     insider = f5.checkbox("insider", key="flag_insider")
-    geo = f6.checkbox("geo", key="flag_geo")
-    live = f7.checkbox("live", key="flag_live")
-    pc_oi = f8.selectbox("pc-oi", ["off", "all", "near", "leaps", "monthly"],
+    street = f6.checkbox("street", key="flag_street")
+    geo = f7.checkbox("geo", key="flag_geo")
+    live = f8.checkbox("live", key="flag_live")
+    pc_oi = f9.selectbox("pc-oi", ["off", "all", "near", "leaps", "monthly"],
                          key="flag_pc_oi", label_visibility="collapsed")
 
 with st.expander("thesis overlay (optional)"):
@@ -1137,8 +1139,8 @@ with st.expander("🕰 date range / as-of backtest (optional)"):
     chart_from = d3.date_input("chart from (window start, optional)", key="chart_from")
     if asof_on:
         st.caption("historical mode — the report and chart end at the as-of date; live-chain / "
-                   "current-only blocks (pc-oi, gex, vol quote, call, squeeze, insider, geo, "
-                   "live) are disabled: there is no historical source for them")
+                   "current-only blocks (pc-oi, gex, vol quote, call, squeeze, insider, street, "
+                   "geo, live) are disabled: there is no historical source for them")
 
 asof_iso = asof_date.isoformat() if (asof_on and asof_date) else None
 if chart_from and asof_iso and chart_from.isoformat() > asof_iso:
@@ -1159,7 +1161,7 @@ run_clicked = st.button("Run", type="primary")
 # menu Rerun blank the page. Regenerate only when the (ticker, flags) key changes or Run is
 # clicked; otherwise redisplay the stored result (generate_payload's 2-min cache absorbs repeats).
 flags = {"vol": vol, "call": call, "gex": gex, "squeeze": squeeze, "insider": insider,
-         "geo": geo, "live": live and not asof_iso, "pc_oi": pc_oi,
+         "street": street, "geo": geo, "live": live and not asof_iso, "pc_oi": pc_oi,
          "thesis": None if thesis == "none" else thesis,
          "level": level or None, "as_of": asof_iso}
 # NB: `chart_from` is deliberately NOT in flags — it only moves the chart window, so changing

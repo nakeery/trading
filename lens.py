@@ -119,6 +119,18 @@ try:
     from modules.buzz import fetch_buzz
 except Exception:
     fetch_buzz = None
+try:
+    from modules.sectors import fetch_sectors, own_sector
+except Exception:
+    fetch_sectors = own_sector = None
+try:
+    from modules.street import fetch_street
+except Exception:
+    fetch_street = None
+try:
+    from modules.marketsent import fetch_marketsent
+except Exception:
+    fetch_marketsent = None
 
 _ARROW = {"up": "↑ up", "down": "↓ dn", "mixed": "~ mix"}
 _OB = {"overbought": "OB", "oversold": "OS", "neutral": "neut"}
@@ -531,7 +543,8 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
                  ctx=None, backdrop=None, thesis=None, level=None, color=True, candle_style="box",
                  panel_bars=None, candle_px=128, geo=None, pcoi=None, gex=None, vol=None,
                  live=None, setup=None, squeeze=None, insider=None, callq=None, liq=None,
-                 cats=None, risk=None, macro_events=_UNSET):
+                 cats=None, sectors=None, buzz=None, street=None, risk=None,
+                 macro_events=_UNSET):
     w = 78
     print(f"\n{'═'*w}")
     hdr = f"  LENS — {ticker}"
@@ -731,8 +744,9 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         if bz:
             was = f" (was #{bz['rank_prev']})" if bz.get("rank_prev") else ""
             chg = f", {bz['chg']:+.0%} vs prior 24h" if bz.get("chg") is not None else ""
+            pct = f"  [{ordinal_percentile(bz['pct'])}]" if bz.get("pct") is not None else ""
             print(f"    retail buzz      #{bz['rank']} on reddit stock boards{was} — "
-                  f"{bz['mentions']} mentions{chg} (ApeWisdom)")
+                  f"{bz['mentions']} mentions{chg}{pct} (ApeWisdom)")
         read = squeeze.get("read") or {}
         print(f"    NET: {read.get('net', 'n/a')}")
         if read.get("fuel"):
@@ -746,6 +760,19 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         for c in read.get("caveats", []):
             print(f"    · {c}")
         if bz:
+            print(f"    · buzz = attention, not direction — crowded names gap on headlines both ways")
+
+    # 6a2. RETAIL ATTENTION (S58; default-on) — reddit-board mention rank. When --squeeze is on
+    # the ranked read already prints inside that block, so this section only renders without it.
+    if buzz and not squeeze:
+        _section("RETAIL ATTENTION  (reddit stock boards, ApeWisdom)", color)
+        if buzz.get("unranked"):
+            print(f"    unranked — not in the top ~400 most-mentioned names (quiet is normal)")
+        else:
+            was = f" (was #{buzz['rank_prev']})" if buzz.get("rank_prev") else ""
+            chg = f", {buzz['chg']:+.0%} vs prior 24h" if buzz.get("chg") is not None else ""
+            pct = f"  [{ordinal_percentile(buzz['pct'])}]" if buzz.get("pct") is not None else ""
+            print(f"    retail buzz      #{buzz['rank']}{was} — {buzz['mentions']} mentions{chg}{pct}")
             print(f"    · buzz = attention, not direction — crowded names gap on headlines both ways")
 
     # 6b. INSIDER ACTIVITY (--insider; S42 — SEC Form 4 open-market flow, cluster-buy detection)
@@ -770,6 +797,36 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
             print(f"      ⚑ {f}")
         for c in rd.get("caveats", []):
             print(f"    · {c}")
+
+    # 6b2. STREET & NEWS (--street; S58 — analyst expectations + headlines; context, not advice)
+    if street:
+        _section("STREET & NEWS  (analyst expectations + headlines — context, not advice)", color)
+        spt = street.get("pt")
+        if spt:
+            med = f" · median ${spt['median']:,.0f}" if spt.get("median") else ""
+            rng = (f" · range ${spt['low']:,.0f}–{spt['high']:,.0f}"
+                   if spt.get("low") and spt.get("high") else "")
+            print(f"    {'price targets':<17}mean ${spt['mean']:,.0f} "
+                  f"({spt['upside_mean']:+.1%} vs spot ${spt['spot']:,.2f}){med}{rng}")
+        revs = street.get("revisions")
+        if revs:
+            seg = " · ".join(f"{r['label']} {r['chg30']:+.1%}" for r in revs)
+            print(f"    {'EPS revisions':<17}{seg}  (vs 30d ago) — {street.get('rev_net')}")
+        ud = street.get("ud")
+        if ud:
+            print(f"    {'ratings (' + str(ud['window_days']) + 'd)':<17}{ud['n_up']} upgrades / "
+                  f"{ud['n_down']} downgrades / {ud['pt_raises']} PT raises / "
+                  f"{ud['pt_lowers']} PT lowers  ({ud['n']} actions)")
+        if not spt and not revs and not ud:
+            print(f"    no analyst coverage data (ETF or uncovered name) — headlines only")
+        news = street.get("news") or []
+        if news:
+            print(f"    news:")
+            for n in news:
+                print(f"      · {n['when']}  {n['title']}  ({n['provider']})")
+        if spt:
+            print(f"    · targets follow price — a wide \"upside\" right after a selloff is "
+                  f"stale ink, not a signal")
 
     # PUT/CALL OI — live Tradier chain, by expiry (--pc-oi; positioning, not a prediction).
     # Distinct from the OPTIONS "Put/Call OI" gauge above (Massive-harvested ~30d blended snapshot).
@@ -988,6 +1045,31 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         for n in geo.get("notes", []):
             print(f"      · {n}")
 
+    # 6c. SECTOR ROTATION (S58; default-on) — the 11 SPDR sectors ranked by RS vs SPY; ► marks
+    # the ticker's own sector. Complements the SETUP CHECK's RS row (ticker vs its benchmark)
+    # with the benchmark-vs-market read.
+    if sectors and sectors.get("rows"):
+        _section("SECTOR ROTATION  (RS vs SPY, ranked by 63d)", color)
+        own = sectors.get("own")
+
+        def _rs_cell(val, width):
+            # fixed-width text first, colour wrap second — ANSI escapes must not shift columns
+            cell = f"{(f'{val:+.1%}' if val is not None else '—'):>{width}}"
+            if color and val is not None and abs(val) > 0.005:
+                return f"{_GREEN if val > 0 else _RED}{cell}{_RESET}"
+            return cell
+
+        print(f"      {'SECTOR':<21}{'20d':>7}{'63d':>8}   tag")
+        for r in sectors["rows"]:
+            mark = "►" if own and r["sym"] == own else " "
+            print(f"    {mark} {(r['sym'] + ' ' + r['name']):<21}"
+                  f"{_rs_cell(r['rel_20d'], 7)}{_rs_cell(r.get('rel_63d'), 8)}   {r['tag']}")
+        if own:
+            own_row = next((r for r in sectors["rows"] if r["sym"] == own), None)
+            if own_row:
+                print(f"    · {ticker} sector: {own} — rank {own_row['rank']}/"
+                      f"{len(sectors['rows'])}, {own_row['tag']}")
+
     # 7a. KNOWN CATALYSTS (S46) — catalysts.csv binary events (PDUFA / trial readouts) ≤45d out;
     # until now only the ML layer saw these dates.
     if cats:
@@ -1143,6 +1225,26 @@ def build_backdrop(data_dir="data"):
         if segs:
             seg = "COT lev-funds " + " · ".join(segs)
             backdrop_base = f"{backdrop_base}  |  {seg}" if backdrop_base else seg
+    if fetch_marketsent is not None:                 # market sentiment + liquidity (S58) — cached ~6h
+        ms = (fetch_marketsent(data_dir=data_dir) or {}).get("gauges") or {}
+        segs = []
+        cb = ms.get("cboe")
+        if cb and cb.get("equity") is not None:
+            pct = f" [{ordinal_percentile(cb['pct'])}]" if cb.get("pct") is not None else ""
+            segs.append(f"eq P/C {cb['equity']:.2f}{pct}")
+        aa = ms.get("aaii")
+        if aa and aa.get("spread") is not None:
+            pct = f" [{ordinal_percentile(aa['pct'])}]" if aa.get("pct") is not None else ""
+            segs.append(f"AAII {aa['spread'] * 100:+.0f}pp{pct}")
+        na = ms.get("naaim")
+        if na and na.get("value") is not None:
+            segs.append(f"NAAIM {na['value']:.0f}")
+        lq = ms.get("liq")
+        if lq and lq.get("level_bn") is not None:
+            segs.append(f"net liq ${lq['level_bn'] / 1000:.2f}tn ({lq['chg_13w_bn']:+.0f}bn/13w)")
+        if segs:
+            seg = "sent " + " · ".join(segs)
+            backdrop_base = f"{backdrop_base}  |  {seg}" if backdrop_base else seg
     return backdrop_base
 
 
@@ -1181,11 +1283,13 @@ def gather_report(ticker, args, interactive, backdrop_base):
         on_flags = [name for name, on in (
             ("pc-oi", args.pc_oi is not None), ("gex", getattr(args, "gex", False)),
             ("vol quote/history", args.vol), ("call", args.call), ("squeeze", args.squeeze),
-            ("insider", args.insider), ("geo", args.geo), ("live", args.live)) if on]
+            ("insider", args.insider), ("geo", args.geo), ("live", args.live),
+            ("street", getattr(args, "street", False))) if on]
         notes.insert(0, f"AS-OF {asof_ts.date()}: historical mode — report reflects data through "
                         f"that session; current-only blocks disabled"
                         + (f" ({', '.join(on_flags)})" if on_flags else "")
-                        + "; ex-div, options liquidity, and breadth/F&G/COT omitted.")
+                        + "; ex-div, options liquidity, sector rotation, retail buzz, and "
+                          "breadth/F&G/COT/sentiment omitted.")
 
     ctx = None
     if not args.no_vix and gather_context is not None:
@@ -1361,6 +1465,25 @@ def gather_report(ticker, args, interactive, backdrop_base):
     # catalysts.csv is static history, so `today=asof_ts` reads it historically (None = today).
     cats = upcoming_catalysts(ticker, today=asof_ts) if upcoming_catalysts is not None else []
 
+    # SECTOR ROTATION (S58; default-on, best-effort) — the 11 SPDR sectors ranked by RS vs SPY,
+    # with the ticker's own sector marked. Current-only cache → omitted in as-of mode.
+    sectors = None
+    if asof_ts is None and fetch_sectors is not None:
+        try:
+            sec = fetch_sectors(data_dir=args.data_dir)
+            if sec and sec.get("rows"):
+                sectors = {"rows": sec["rows"],
+                           "own": own_sector(ticker) if own_sector is not None else None}
+        except Exception:
+            sectors = None
+
+    # RETAIL ATTENTION (S56, default-on S58) — reddit-board mention rank; cached ~6h, one feed
+    # fetch serves every ticker. Ranked → read dict (+history/pct); unranked → explicit state;
+    # feed down → None (silent). Current-only cache → omitted in as-of mode.
+    buzz = None
+    if asof_ts is None and fetch_buzz is not None:
+        buzz = fetch_buzz(ticker, data_dir=args.data_dir)
+
     # SHORT POSITIONING / SQUEEZE (--squeeze; S41) — reuses the lens' own profile + pc flow.
     sqz = None
     if args.squeeze and asof_ts is None and gather_squeeze is not None:
@@ -1369,13 +1492,10 @@ def gather_report(ticker, args, interactive, backdrop_base):
                              profile=profile, data_dir=args.data_dir)
         if sqz is None:
             notes.append("short-positioning data unavailable (NASDAQ/FINRA fetch failed).")
-        # retail buzz (S56) — attention context riding the squeeze block; cached ~6h, one
-        # feed fetch serves every ticker. Unranked / feed down → silently absent.
-        if fetch_buzz is not None:
-            bz = fetch_buzz(ticker, data_dir=args.data_dir)
-            if bz:
-                sqz = dict(sqz) if sqz else {}
-                sqz["buzz"] = bz
+        # ranked retail buzz rides the squeeze block as before (S56) — attention beside fuel
+        if buzz and not buzz.get("unranked"):
+            sqz = dict(sqz) if sqz else {}
+            sqz["buzz"] = buzz
 
     # INSIDER ACTIVITY (--insider; S42) — SEC EDGAR Form 4 open-market flow, cached.
     ins = None
@@ -1383,6 +1503,17 @@ def gather_report(ticker, args, interactive, backdrop_base):
         ins = gather_insider(ticker, data_dir=args.data_dir)
         if ins is None:
             notes.append("insider activity unavailable (EDGAR fetch failed / unknown ticker).")
+
+    # STREET & NEWS (--street; S58) — analyst expectations + headlines via yfinance, cached ~6h.
+    street = None
+    if getattr(args, "street", False) and asof_ts is None and fetch_street is not None:
+        try:
+            street = fetch_street(ticker, data_dir=args.data_dir)
+        except Exception as e:
+            notes.append(f"street/news unavailable ({type(e).__name__}).")
+        else:
+            if street is None:
+                notes.append("street/news unavailable (yfinance fetch failed).")
 
     # SETUP CHECK (S41; default-on, best-effort) — pure synthesis + one RS benchmark fetch.
     setup = None
@@ -1435,7 +1566,8 @@ def gather_report(ticker, args, interactive, backdrop_base):
             "profile": profile, "notes": notes, "last_bar": last_bar, "as_of": as_of,
             "panel_bars": panel_bars, "ctx": ctx, "backdrop": backdrop, "geo": geo,
             "pcoi": pc, "gex": gex, "vol": vol, "live": live_bar, "setup": setup, "squeeze": sqz,
-            "insider": ins, "callq": callq, "liq": liq, "cats": cats, "risk": risk,
+            "insider": ins, "callq": callq, "liq": liq, "cats": cats, "sectors": sectors,
+            "buzz": buzz, "street": street, "risk": risk,
             "macro_events": macro_events, "thesis": args.thesis, "level": args.level,
             "live_iv": live_iv,
             # S57: iso date when the report was computed AS OF a historical date (backtest mode);
@@ -1454,7 +1586,8 @@ def render_payload(p, use_color=True, candle_style="box", candle_px=128):
                  candle_style=candle_style, panel_bars=p["panel_bars"], candle_px=candle_px,
                  geo=p["geo"], pcoi=p["pcoi"], gex=p.get("gex"), vol=p["vol"], live=p["live"],
                  setup=p["setup"], squeeze=p["squeeze"], insider=p["insider"], callq=p["callq"],
-                 liq=p["liq"], cats=p["cats"], risk=p["risk"], macro_events=p["macro_events"])
+                 liq=p["liq"], cats=p["cats"], sectors=p.get("sectors"), buzz=p.get("buzz"),
+                 street=p.get("street"), risk=p["risk"], macro_events=p["macro_events"])
 
 
 def render_ticker(ticker, args, use_color, interactive, backdrop_base):
@@ -1515,6 +1648,10 @@ if __name__ == "__main__":
                          "~0.35-0.40 delta) with breakeven move, theta/day as %% of premium, an "
                          "ATM-IV-by-expiry curve, and a chain liquidity grade. Network; needs "
                          "TRADIER_TOKEN; cached like --vol.")
+    ap.add_argument("--street", action="store_true",
+                    help="Add a STREET & NEWS block — analyst price-target range, EPS estimate "
+                         "revisions (30d momentum), upgrade/downgrade counts, and recent "
+                         "headlines via yfinance. ETFs degrade to headlines-only. Cached ~6h.")
     ap.add_argument("--gex", action="store_true",
                     help="Add a GAMMA EXPOSURE block — dealer GEX by strike off the live Tradier "
                          "chain (expiries ≤60d): net GEX regime, call/put walls, zero-gamma flip, "

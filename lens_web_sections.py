@@ -369,9 +369,11 @@ def sec_squeeze(p):
     if bz:
         was = f" (was #{bz['rank_prev']})" if bz.get("rank_prev") else ""
         chg = f", {bz['chg']:+.0%} vs prior 24h" if bz.get("chg") is not None else ""
+        pct = f"  [{ordinal_percentile(bz['pct'])}]" if bz.get("pct") is not None else ""
         st.markdown(f'<div style="color:{INK};">retail buzz: <b>#{bz["rank"]}</b> on reddit '
                     f'stock boards{html.escape(was)} — {bz["mentions"]} mentions'
-                    f'{html.escape(chg)} (ApeWisdom)</div>', unsafe_allow_html=True)
+                    f'{html.escape(chg)}{html.escape(pct)} (ApeWisdom)</div>',
+                    unsafe_allow_html=True)
     _net("NET", read.get("net", "n/a"))
     c1, c2 = st.columns(2)
     with c1:
@@ -388,6 +390,43 @@ def sec_squeeze(p):
         st.caption(f"· {cav}")
     if bz:
         st.caption("· buzz = attention, not direction — crowded names gap on headlines both ways")
+
+
+def sec_buzz(p):
+    """RETAIL ATTENTION (S58; default-on) — mirrors print_report: only renders when the
+    squeeze section is absent (a ranked read already shows inside sec_squeeze)."""
+    bz = p.get("buzz")
+    if not bz or p.get("squeeze"):
+        return
+    _sec("RETAIL ATTENTION  (reddit stock boards, ApeWisdom)")
+    if bz.get("unranked"):
+        st.caption("unranked — not in the top ~400 most-mentioned names (quiet is normal)")
+        return
+    chips = [(f"rank #{bz['rank']}" + (f" (was #{bz['rank_prev']})" if bz.get("rank_prev") else ""),
+              GOLD),
+             (f"{bz['mentions']} mentions"
+              + (f", {bz['chg']:+.0%} vs 24h" if bz.get("chg") is not None else ""), INK)]
+    if bz.get("pct") is not None:
+        chips.append((f"{ordinal_percentile(bz['pct'])} of own history", BLUE))
+    st.markdown('<div style="line-height:2.3;margin:4px 0;">'
+                + " ".join(_pill(t, c) for t, c in chips) + "</div>", unsafe_allow_html=True)
+    hist = bz.get("history")
+    if hist and len(hist) >= 5:
+        try:
+            import plotly.graph_objects as go
+            fig = go.Figure(go.Scatter(x=[h["date"] for h in hist],
+                                       y=[h["mentions"] for h in hist],
+                                       mode="lines", line=dict(color=GOLD, width=1.5),
+                                       fill="tozeroy", fillcolor="rgba(224,166,58,0.15)"))
+            fig.update_layout(height=120, margin=dict(l=10, r=10, t=6, b=6),
+                              template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
+                              plot_bgcolor="rgba(14,17,23,1)", showlegend=False,
+                              yaxis=dict(title="mentions/day", title_font_size=10),
+                              xaxis=dict(tickfont=dict(size=9)))
+            st.plotly_chart(fig, width="stretch")
+        except Exception:
+            pass
+    st.caption("· buzz = attention, not direction — crowded names gap on headlines both ways")
 
 
 def sec_insider(p):
@@ -414,6 +453,48 @@ def sec_insider(p):
     _bullets(rd.get("flags"), color=AMBER, marker="⚑")
     for cav in rd.get("caveats", []):
         st.caption(f"· {cav}")
+
+
+def sec_street(p):
+    """STREET & NEWS (S58; --street) — analyst expectations + headlines."""
+    stq = p.get("street")
+    if not stq:
+        return
+    _sec("STREET & NEWS  (analyst expectations + headlines — context, not advice)")
+    pt, revs, ud = stq.get("pt"), stq.get("revisions"), stq.get("ud")
+    if pt or revs or ud:
+        c = st.columns(3)
+        if pt:
+            c[0].metric("Mean price target", f"${pt['mean']:,.0f}",
+                        f"{pt['upside_mean']:+.1%} vs spot ${pt['spot']:,.2f}",
+                        delta_color="normal")
+            lo, hi = pt.get("low"), pt.get("high")
+            if lo and hi:
+                med = f" · median ${pt['median']:,.0f}" if pt.get("median") else ""
+                c[0].caption(f"range ${lo:,.0f}–{hi:,.0f}{med}")
+        if revs:
+            seg = " · ".join(f"{r['label']} {r['chg30']:+.1%}" for r in revs)
+            c[1].metric("EPS revisions (30d)", stq.get("rev_net", ""), seg, delta_color="off")
+        if ud:
+            c[2].metric(f"Ratings ({ud['window_days']}d)",
+                        f"{ud['n_up']}↑ / {ud['n_down']}↓",
+                        f"{ud['pt_raises']} PT raises / {ud['pt_lowers']} PT lowers",
+                        delta_color="off")
+    else:
+        st.caption("no analyst coverage data (ETF or uncovered name) — headlines only")
+    news = stq.get("news") or []
+    if news:
+        rows = "".join(
+            f'<div style="margin:2px 0;color:{INK};">· <span style="color:{GRAY};">{n["when"]}'
+            f'</span> ' + (f'<a href="{html.escape(n["url"])}" style="color:{INK};">'
+                           f'{html.escape(n["title"])}</a>' if n.get("url")
+                           else html.escape(n["title"]))
+            + f' <span style="color:{GRAY};">({html.escape(str(n["provider"]))})</span></div>'
+            for n in news)
+        st.markdown(rows, unsafe_allow_html=True)
+    if pt:
+        st.caption("· targets follow price — a wide \"upside\" right after a selloff is "
+                   "stale ink, not a signal")
 
 
 def sec_pcoi(p):
@@ -800,6 +881,43 @@ def sec_geo(p):
         st.caption(f"· {n}")
 
 
+def sec_sectors(p):
+    """SECTOR ROTATION (S58) — SPDR sectors ranked by RS vs SPY; ► + row tint marks the
+    ticker's own sector."""
+    sec = p.get("sectors")
+    if not sec or not sec.get("rows"):
+        return
+    _sec("SECTOR ROTATION  (RS vs SPY, ranked by 63d)")
+    own, rows = sec.get("own"), sec["rows"]
+    df = pd.DataFrame([{
+        "Sector": ("► " if own and r["sym"] == own else "") + f"{r['sym']} {r['name']}",
+        "20d": f"{r['rel_20d']:+.1%}",
+        "63d": f"{r['rel_63d']:+.1%}" if r.get("rel_63d") is not None else "—",
+        "Tag": r["tag"],
+    } for r in rows])
+
+    def _rs_css(v):
+        if v is None or abs(v) <= 0.005:               # mirror the CLI ±0.5% noise band
+            return ""
+        return f"color:{GREEN if v > 0 else RED};font-weight:600;"
+
+    tag_color = {"leading": GREEN, "improving": BLUE, "weakening": AMBER, "lagging": RED}
+    css = pd.DataFrame("", index=df.index, columns=df.columns)
+    css["20d"] = [_rs_css(r["rel_20d"]) for r in rows]
+    css["63d"] = [_rs_css(r.get("rel_63d")) for r in rows]
+    css["Tag"] = [f"color:{tag_color.get(r['tag'], GRAY)};" for r in rows]
+    if own:
+        for i, r in enumerate(rows):
+            if r["sym"] == own:
+                css.iloc[i] = css.iloc[i] + "background-color:rgba(78,163,216,0.12);"
+    _df(df, styler=df.style.apply(lambda _: css, axis=None))
+    if own:
+        own_row = next((r for r in rows if r["sym"] == own), None)
+        if own_row:
+            st.caption(f"· {p.get('ticker', '')} sector: {own} — rank {own_row['rank']}/"
+                       f"{len(rows)}, {own_row['tag']}")
+
+
 def sec_catalysts(p):
     cats = p.get("cats")
     if not cats:
@@ -857,8 +975,10 @@ def sec_notes(p):
 
 
 _SECTIONS = [sec_header, sec_backdrop, sec_multi_tf, sec_divergences, sec_volume_profile,
-             sec_risk, sec_setup, sec_options, sec_squeeze, sec_insider, sec_pcoi, sec_gex,
-             sec_vol, sec_call, sec_geo, sec_catalysts, sec_macro, sec_thesis, sec_notes]
+             sec_risk, sec_setup, sec_options, sec_squeeze, sec_buzz, sec_insider, sec_street,
+             sec_pcoi, sec_gex,
+             sec_vol, sec_call, sec_geo, sec_sectors, sec_catalysts, sec_macro, sec_thesis,
+             sec_notes]
 
 
 def render_all(p, skip_header=False):

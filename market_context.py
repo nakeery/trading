@@ -197,6 +197,38 @@ if __name__ == "__main__":
     except Exception:
         pass
 
+    # Market sentiment + liquidity (S58) — CBOE P/C, AAII, NAAIM, Fed net liquidity; cached
+    # ~6h; best-effort per gauge. Context only; survey crowding is a contrarian read (S21).
+    try:
+        from modules.marketsent import fetch_marketsent
+        ms = (fetch_marketsent(data_dir=args.data_dir) or {}).get("gauges") or {}
+        cb = ms.get("cboe")
+        if cb and cb.get("equity") is not None:
+            ctx["gauges"].append({"group": "MARKET", "name": "Equity P/C (CBOE)",
+                                  "value": cb["equity"], "fmt": "{:.2f}",
+                                  "label": cb.get("tag", ""), "pct": cb.get("pct")})
+        aa = ms.get("aaii")
+        if aa and aa.get("spread") is not None:
+            ctx["gauges"].append({"group": "MARKET", "name": "AAII bull-bear",
+                                  "value": aa["spread"], "fmt": "{:+.1%}",
+                                  "label": aa.get("tag", ""), "pct": aa.get("pct")})
+        na = ms.get("naaim")
+        if na and na.get("value") is not None:
+            ctx["gauges"].append({"group": "MARKET", "name": "NAAIM exposure",
+                                  "value": na["value"], "fmt": "{:.0f}",
+                                  "label": na.get("tag", ""), "pct": na.get("pct")})
+        lq = ms.get("liq")
+        if lq and lq.get("level_bn") is not None:
+            ctx["gauges"].append({"group": "MARKET", "name": "Fed net liquidity",
+                                  "value": lq["level_bn"] / 1000.0, "fmt": "${:.2f}tn",
+                                  "label": f"{lq['chg_13w_bn']:+.0f}bn 13w — {lq['tag']}",
+                                  "pct": lq.get("pct")})
+        if aa or na:
+            ctx["notes"].append("AAII/NAAIM percentiles read contrarian at the extremes — a "
+                                "crowded poll is a fade tell, not a trade signal (S21).")
+    except Exception:
+        pass
+
     print_console(ctx)
 
     if args.graphical:

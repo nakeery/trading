@@ -1365,20 +1365,23 @@ def test_gather_payload_keys(monkeypatch):
     from types import SimpleNamespace
     import lens
 
-    for name in ("next_earnings", "next_ex_dividend", "fetch_rs", "fetch_beta"):
+    for name in ("next_earnings", "next_ex_dividend", "fetch_rs", "fetch_beta",
+                 "fetch_sectors", "own_sector", "fetch_buzz", "fetch_street"):   # S58 fetchers off
         monkeypatch.setattr(lens, name, None, raising=False)
 
     args = SimpleNamespace(ticker=None, thesis=None, level=None, no_intraday=True, no_vix=True,
                            geo=False, no_color=True, candle="none", candle_px=128, prev=10,
                            data_dir="data", no_refresh=True, refresh=False, pc_oi=None,
-                           insider=False, squeeze=False, live=False, vol=False, call=False)
+                           insider=False, squeeze=False, live=False, vol=False, call=False,
+                           street=False)
     payload = lens.gather_report("QQQ", args, interactive=False, backdrop_base=None)
     assert payload is not None
 
     expected = {"ticker", "reads", "divs", "summary", "profile", "notes", "last_bar", "as_of",
                 "panel_bars", "ctx", "backdrop", "geo", "pcoi", "gex", "vol", "live", "setup",
                 "squeeze", "insider", "callq", "liq", "cats", "risk", "macro_events",
-                "thesis", "level", "live_iv", "earn", "exd", "as_of_mode"}
+                "thesis", "level", "live_iv", "earn", "exd", "as_of_mode",
+                "sectors", "buzz", "street"}                                     # S58 keys
     assert set(payload.keys()) == expected
     assert not any(isinstance(v, (pd.DataFrame, pd.Series)) for v in payload.values())
     assert payload["reads"] and payload["risk"] is not None      # frames were read + risk lifted
@@ -1801,3 +1804,123 @@ def test_trend_regime():
     risk = rally_drawdown_risk({"1D": rt, "1W": rt}, profile=None, ctx=None, divergences={})
     assert risk["regime"] and risk["regime"]["state"] == "up"
     assert rally_drawdown_risk({}, profile=None, ctx=None, divergences={})["regime"] is None
+
+
+# ─── Test 48: S58 sector rotation (offline) ─────────────────────────────────────
+def test_sector_rotation():
+    """rotation_read: RS math vs SPY, quadrant tags, 63d-descending rank; own_sector maps via
+    TICKER_BENCHMARK without network (AMD → XLK though its FIRST benchmark is ^SOX; QQQ → None
+    — ^GSPC is not a sector; a sector ETF maps to itself)."""
+    import numpy as np
+    import pandas as pd
+    from modules.sectors import rotation_read, own_sector, _quadrant, ROT_DEAD
+
+    n = 80
+    spy = pd.Series(np.linspace(100, 102, n))
+    strong = pd.Series(np.linspace(100, 112, n))          # ahead on both horizons
+    weak = pd.Series(np.linspace(100, 92, n))             # behind on both
+    rows = rotation_read({"SPY": spy, "XLK": strong, "XLE": weak})
+    assert [r["sym"] for r in rows] == ["XLK", "XLE"]     # ranked by 63d RS, descending
+    assert rows[0]["tag"] == "leading" and rows[0]["rank"] == 1
+    assert rows[1]["tag"] == "lagging" and rows[1]["rel_20d"] < 0
+    assert rotation_read({"XLK": strong}) is None          # no benchmark → no read
+    # quadrant corners + the flat band
+    assert _quadrant(0.02, 0.05) == "leading"
+    assert _quadrant(0.02, -0.05) == "improving"
+    assert _quadrant(-0.02, 0.05) == "weakening"
+    assert _quadrant(-0.02, -0.05) == "lagging"
+    assert _quadrant(ROT_DEAD / 2, ROT_DEAD / 2) == "in line"
+    assert own_sector("AMD") == "XLK" and own_sector("QQQ") is None
+    assert own_sector("XLF") == "XLF"
+
+
+# ─── Test 49: S58 buzz history / unranked sentinel (offline via canned cache) ──
+def test_buzz_history(tmp_path):
+    """fetch_buzz off a fresh canned cache (no network): ranked ticker → read + history row
+    recorded (deduped on date+ticker); absent ticker → {"unranked": True}; mentions_pct floors
+    at HIST_MIN_OBS prior days and excludes today's own row."""
+    import json
+    from modules.buzz import fetch_buzz, mentions_pct, record_history, ticker_history, HIST_MIN_OBS
+
+    d = str(tmp_path)
+    results = [{"ticker": "NVDA", "rank": 3, "mentions": 120, "upvotes": 10,
+                "rank_24h_ago": 5, "mentions_24h_ago": 60}]
+    (tmp_path / "buzz_cache.json").write_text(json.dumps(results), encoding="utf-8")
+
+    r = fetch_buzz("NVDA", data_dir=d)
+    assert r["rank"] == 3 and r["chg"] == 1.0
+    assert r["history"] and r["history"][-1]["mentions"] == 120
+    assert fetch_buzz("ZZZZZ", data_dir=d) == {"unranked": True}
+
+    record_history(results, d)                             # same day again → deduped, not doubled
+    assert len(ticker_history("NVDA", d)) == 1
+
+    hist = [{"date": f"2026-06-{i:02d}", "mentions": 10} for i in range(1, HIST_MIN_OBS + 1)]
+    assert mentions_pct(hist, 50, today="2026-07-01") == 1.0
+    assert mentions_pct(hist[: HIST_MIN_OBS - 1], 50, today="2026-07-01") is None
+    assert mentions_pct(hist + [{"date": "2026-07-01", "mentions": 999}], 50,
+                        today="2026-07-01") == 1.0        # today's own row excluded
+
+
+# ─── Test 50: S58 street_read (offline) ─────────────────────────────────────────
+def test_street_read():
+    """street_read: PT upside vs spot, 30d EPS-revision tags + net, trailing-90d rating counts;
+    empty inputs (ETF/uncovered) → {} so the section degrades to headlines-only."""
+    from modules.street import street_read, REV_DEAD
+
+    pt = {"current": 100.0, "mean": 110.0, "median": 108.0, "high": 130.0, "low": 90.0}
+    eps = {"0q": {"current": 1.05, "30daysAgo": 1.00},      # +5% → up
+           "+1y": {"current": 0.99, "30daysAgo": 1.00}}     # −1% → down
+    ud = [{"date": "2026-07-10", "firm": "A", "action": "up", "pt_action": "Raises"},
+          {"date": "2026-07-01", "firm": "B", "action": "main", "pt_action": "Raises"},
+          {"date": "2026-06-20", "firm": "C", "action": "down", "pt_action": "Lowers"},
+          {"date": "2025-01-01", "firm": "D", "action": "up", "pt_action": "Raises"}]  # stale
+    r = street_read(pt, ud, eps, now="2026-07-14")
+    assert abs(r["pt"]["upside_mean"] - 0.10) < 1e-9
+    tags = {x["period"]: x["tag"] for x in r["revisions"]}
+    assert tags == {"0q": "up", "+1y": "down"} and r["rev_net"] == "estimates flat"
+    assert r["ud"]["n"] == 3 and r["ud"]["n_up"] == 1 and r["ud"]["n_down"] == 1
+    assert r["ud"]["pt_raises"] == 2 and r["ud"]["pt_lowers"] == 1
+    assert street_read({}, [], {}, now="2026-07-14") == {}
+    assert abs(REV_DEAD - 0.005) < 1e-12
+
+
+# ─── Test 51: S58 marketsent parsers/reads (offline) ────────────────────────────
+def test_marketsent_reads():
+    """parse_cboe on the escaped Next.js blob shape; equity-P/C bands; aaii_read full-history
+    percentile + contrarian tag; naaim_read bands + accumulated-history percentile floor;
+    liq_read FRED-native units (WALCL/WTREGEN $mn, RRP $bn) + 13w tag."""
+    from modules.marketsent import (parse_cboe, label_equity_pc, aaii_read, naaim_read,
+                                    liq_read, HIST_MIN_WEEKLY)
+
+    blob = ('x{\\"name\\":\\"TOTAL PUT/CALL RATIO\\",\\"value\\":\\"0.96\\"},'
+            '{\\"name\\":\\"INDEX PUT/CALL RATIO\\",\\"value\\":\\"1.10\\"},'
+            '{\\"name\\":\\"EQUITY PUT/CALL RATIO\\",\\"value\\":\\"0.67\\"}y')
+    r = parse_cboe(blob)
+    assert r == {"total": 0.96, "index": 1.10, "equity": 0.67}
+    assert parse_cboe("<html>no ratios</html>") is None
+    assert label_equity_pc(0.40).startswith("complacent")
+    assert label_equity_pc(0.67) == "normal" and label_equity_pc(1.0).startswith("fearful")
+
+    rows = [{"date": f"2025-{m:02d}-01", "bull": 0.30, "bear": 0.40} for m in range(1, 13)]
+    rows += [{"date": f"2026-{m:02d}-01", "bull": 0.30, "bear": 0.40} for m in range(1, 13)]
+    rows += [{"date": "2026-07-03", "bull": 0.30, "bear": 0.40},
+             {"date": "2026-07-10", "bull": 0.60, "bear": 0.10}]      # most bullish ever
+    a = aaii_read(rows)
+    assert a["pct"] == 1.0 and a["tag"].startswith("crowded bullish")
+    assert abs(a["spread"] - 0.50) < 1e-9
+    assert aaii_read(rows[:5]) is None                    # under the weekly floor
+
+    hist = {f"2026-01-{i:02d}": 50.0 for i in range(1, HIST_MIN_WEEKLY + 1)}
+    n = naaim_read([("2026-07-08", 95.0), ("2026-07-01", 85.0)], hist=hist)
+    assert n["tag"] == "leveraged/max long" and n["pct"] == 1.0
+    assert naaim_read([("2026-07-08", 20.0)], hist={})["tag"] == "defensive"
+
+    import pandas as pd
+    dates = pd.date_range("2025-01-01", periods=30, freq="W-WED")
+    walcl = {d.date().isoformat(): 6_600_000 + i * 10_000 for i, d in enumerate(dates)}  # $mn, rising
+    tga = {d.date().isoformat(): 800_000 for d in dates}                                 # $mn
+    rrp = {d.date().isoformat(): 100.0 for d in dates}                                   # $bn
+    lq = liq_read(walcl, tga, rrp)
+    assert lq["tag"] == "rising" and abs(lq["chg_13w_bn"] - 130.0) < 1e-6
+    assert abs(lq["level_bn"] - (6_890.0 - 800.0 - 100.0)) < 1e-6
