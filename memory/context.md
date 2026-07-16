@@ -175,6 +175,12 @@ Modules the lens/web stack uses
   (default-on checklist + `fetch_rs` + `beta_corr`/`fetch_beta`), `fng.py` (F&G, ~6h cache),
   `breadth.py` (equal-weight breadth, drift-free short horizons), `insider.py` (--insider,
   EDGAR Form 4 cluster buys), `geocontext.py` (--geo).
+- `sectors.py` **S59 movers**: opt-in `--movers` (+ web checkbox, `?movers=1`) adds top 3 of
+  each sector's ~10 largest constituents by 63d ABSOLUTE return (20d fallback) under the
+  rotation table — `YF_SECTOR_KEYS` (all 11 GICS sectors covered/probed), pure
+  `top_performers_read`, `fetch_top_performers` (~11 yf.Sector lookups + 1 batched download,
+  cached ~6h `data/sector_top_cache.json`); current-only → as-of note lists it. Caveat printed:
+  Yahoo classification, biggest names ≠ full membership.
 - `massive.py` — daily quote-based harvest via indicators.py: `atm_iv_30d` + skew/term/P-C,
   `atm_iv_event` (nearest post-earnings expiry when earnings ≤45d, S44 — the constant-maturity
   30d gauge blunts the true ramp), `atm_iv_180d` (S47, LEAPS tenor; percentile FORWARD-ONLY, no
@@ -225,7 +231,7 @@ Operational notes
 - Venv explicitly: `.\trade\Scripts\python.exe -X utf8 …` (+ `-X utf8` required on Windows).
   Piped runs: PowerShell tool, `cmd /c "(echo TICKER) | python -X utf8 script.py"`; prefer
   `--ticker` to skip prompts. Env vars ($PROFILE): MASSIVE_API_KEY, FRED_API_KEY, TRADIER_TOKEN.
-- Smoke: `.\trade\Scripts\python.exe -m pytest tests/ -q` (47 tests, offline, ~3-9s).
+- Smoke: `.\trade\Scripts\python.exe -m pytest tests/ -q` (52 tests, offline, ~3-9s).
 - Percentile gauges need ≥63 harvested rows per ticker — thin history prints the value with an
   explanatory note instead (GOOG case: 2 rows → no percentile until backfill or ~3 months).
 

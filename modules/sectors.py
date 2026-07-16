@@ -38,6 +38,27 @@ SECTORS = {
 REL_SHORT, REL_LONG = 20, 63     # sessions — mirror breadth.py / setupcheck.RS_HORIZONS
 ROT_DEAD = 0.005                 # |RS| ≤ 0.5% reads flat (noise band, mirrors BREADTH_DEAD)
 
+# ── top performers per sector (S59, opt-in via lens --movers) ────────────────
+# yfinance Sector keys per SPDR (all 11 probed live 2026-07-16). Constituents come from
+# yf.Sector(key).top_companies — each sector's LARGEST names by market weight (Yahoo's
+# classification), not full ETF membership.
+YF_SECTOR_KEYS = {
+    "XLK":  "technology",
+    "XLC":  "communication-services",
+    "XLY":  "consumer-cyclical",
+    "XLF":  "financial-services",
+    "XLV":  "healthcare",
+    "XLI":  "industrials",
+    "XLE":  "energy",
+    "XLB":  "basic-materials",
+    "XLP":  "consumer-defensive",
+    "XLU":  "utilities",
+    "XLRE": "real-estate",
+}
+UNIVERSE_N = 10                  # largest constituents considered per sector
+TOP_N = 3                        # performers shown per sector
+TOP_CACHE_FILE = "sector_top_cache.json"
+
 
 def _quadrant(r20, r63):
     """RRG-style tag from the two RS horizons (±ROT_DEAD noise band; missing 63d treated flat)."""
@@ -79,6 +100,78 @@ def rotation_read(closes, bench=BENCH):
     for i, r in enumerate(rows):
         r["rank"] = i + 1
     return rows
+
+
+def top_performers_read(constituents, closes, top_n=TOP_N):
+    """PURE: {spdr_sym: [(ticker, name), …]} + {ticker: close series} →
+    {spdr_sym: [{sym, name, r20, r63}, …]} — each sector's constituents ranked by 63d return
+    (20d when the series is too short for 63d, mirroring rotation_read's sort convention),
+    capped at `top_n`. Names with < REL_SHORT+1 sessions are omitted; sectors with no usable
+    name are omitted. Offline-testable."""
+    out = {}
+    for spdr, names in (constituents or {}).items():
+        scored = []
+        for sym, name in names or []:
+            if sym not in (closes or {}):
+                continue
+            s = pd.Series(closes[sym], dtype=float).dropna()
+            if len(s) <= REL_SHORT:
+                continue
+            r20 = float(s.pct_change(REL_SHORT).iloc[-1])
+            r63 = float(s.pct_change(REL_LONG).iloc[-1]) if len(s) > REL_LONG else None
+            scored.append({"sym": sym, "name": name, "r20": r20, "r63": r63})
+        if not scored:
+            continue
+        scored.sort(key=lambda m: m["r63"] if m["r63"] is not None else m["r20"], reverse=True)
+        out[spdr] = scored[:top_n]
+    return out
+
+
+def fetch_top_performers(data_dir="data", ttl_hours=TTL_HOURS):
+    """Current top performers per sector, cached (S59 — lens --movers). ~11 yf.Sector
+    constituent lookups (each in its own try — one bad sector never costs the rest) + ONE
+    batched daily download for all names. Never raises; stale cache on failure, else None.
+    Returns {"sectors": {spdr_sym: [{sym, name, r20, r63}, …]}}."""
+    path = os.path.join(data_dir, TOP_CACHE_FILE)
+    try:
+        if os.path.exists(path) and (time.time() - os.path.getmtime(path)) < ttl_hours * 3600:
+            with open(path, encoding="utf-8") as f:
+                return json.load(f)
+    except Exception:
+        pass
+    try:
+        import yfinance as yf
+        constituents = {}
+        for spdr, key in YF_SECTOR_KEYS.items():
+            try:
+                tc = yf.Sector(key).top_companies
+                if tc is not None and len(tc):
+                    constituents[spdr] = [(str(sym), str(row.get("name", sym)))
+                                          for sym, row in tc.head(UNIVERSE_N).iterrows()]
+            except Exception:
+                continue
+        symbols = sorted({sym for names in constituents.values() for sym, _ in names})
+        if symbols:
+            raw = yf.download(symbols, period="6mo", interval="1d",
+                              progress=False, auto_adjust=True)
+            close = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw[["Close"]]
+            sectors = top_performers_read(
+                constituents, {s: close[s] for s in symbols if s in close.columns})
+            if sectors:
+                out = {"sectors": sectors}
+                try:
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump(out, f)
+                except Exception:
+                    pass
+                return out
+    except Exception:
+        pass
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)                    # stale fallback beats nothing
+    except Exception:
+        return None
 
 
 def own_sector(ticker):

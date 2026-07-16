@@ -889,12 +889,27 @@ def sec_sectors(p):
         return
     _sec("SECTOR ROTATION  (RS vs SPY, ranked by 63d)")
     own, rows = sec.get("own"), sec["rows"]
-    df = pd.DataFrame([{
+    top = sec.get("top") or {}
+    data = [{
         "Sector": ("► " if own and r["sym"] == own else "") + f"{r['sym']} {r['name']}",
         "20d": f"{r['rel_20d']:+.1%}",
         "63d": f"{r['rel_63d']:+.1%}" if r.get("rel_63d") is not None else "—",
         "Tag": r["tag"],
-    } for r in rows])
+    } for r in rows]
+    if top:
+        # --movers (S59): ABSOLUTE 63d return per name (20d fallback on short series) —
+        # unlike the RS-vs-SPY columns; the caption below says so
+        def _top_txt(lst):
+            if not lst:
+                return "—"
+            segs = []
+            for m in lst:
+                v = m["r63"] if m.get("r63") is not None else m.get("r20")
+                segs.append(f"{m['sym']} {v:+.1%}" if v is not None else m["sym"])
+            return " · ".join(segs)
+        for d, r in zip(data, rows):
+            d["Top performers (63d)"] = _top_txt(top.get(r["sym"]))
+    df = pd.DataFrame(data)
 
     def _rs_css(v):
         if v is None or abs(v) <= 0.005:               # mirror the CLI ±0.5% noise band
@@ -916,6 +931,9 @@ def sec_sectors(p):
         if own_row:
             st.caption(f"· {p.get('ticker', '')} sector: {own} — rank {own_row['rank']}/"
                        f"{len(rows)}, {own_row['tag']}")
+    if top:
+        st.caption("top performers = 63d ABSOLUTE return among the sector's ~10 largest "
+                   "constituents (Yahoo classification) — biggest names, not full membership")
 
 
 def sec_catalysts(p):

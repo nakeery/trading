@@ -124,6 +124,10 @@ try:
 except Exception:
     fetch_sectors = own_sector = None
 try:
+    from modules.sectors import fetch_top_performers   # S59: lens --movers
+except Exception:
+    fetch_top_performers = None
+try:
     from modules.street import fetch_street
 except Exception:
     fetch_street = None
@@ -1059,16 +1063,32 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
                 return f"{_GREEN if val > 0 else _RED}{cell}{_RESET}"
             return cell
 
+        top_map = sectors.get("top") or {}
+
+        def _top_seg(m):
+            # ABSOLUTE 63d return (falls back to 20d on a short series) — unlike the table's
+            # RS-vs-SPY columns; the caveat line below says so
+            v = m["r63"] if m.get("r63") is not None else m.get("r20")
+            pct = f"{v:+.1%}" if v is not None else "—"
+            if color and v is not None and abs(v) > 0.005:
+                pct = f"{_GREEN if v > 0 else _RED}{pct}{_RESET}"
+            return f"{m['sym']} {pct}"
+
         print(f"      {'SECTOR':<21}{'20d':>7}{'63d':>8}   tag")
         for r in sectors["rows"]:
             mark = "►" if own and r["sym"] == own else " "
             print(f"    {mark} {(r['sym'] + ' ' + r['name']):<21}"
                   f"{_rs_cell(r['rel_20d'], 7)}{_rs_cell(r.get('rel_63d'), 8)}   {r['tag']}")
+            if top_map.get(r["sym"]):
+                print(f"          top: {' · '.join(_top_seg(m) for m in top_map[r['sym']])}")
         if own:
             own_row = next((r for r in sectors["rows"] if r["sym"] == own), None)
             if own_row:
                 print(f"    · {ticker} sector: {own} — rank {own_row['rank']}/"
                       f"{len(sectors['rows'])}, {own_row['tag']}")
+        if top_map:
+            print("    · top = 63d ABSOLUTE return among the sector's ~10 largest constituents"
+                  "\n      (Yahoo classification) — biggest names, not full membership")
 
     # 7a. KNOWN CATALYSTS (S46) — catalysts.csv binary events (PDUFA / trial readouts) ≤45d out;
     # until now only the ML layer saw these dates.
@@ -1284,7 +1304,8 @@ def gather_report(ticker, args, interactive, backdrop_base):
             ("pc-oi", args.pc_oi is not None), ("gex", getattr(args, "gex", False)),
             ("vol quote/history", args.vol), ("call", args.call), ("squeeze", args.squeeze),
             ("insider", args.insider), ("geo", args.geo), ("live", args.live),
-            ("street", getattr(args, "street", False))) if on]
+            ("street", getattr(args, "street", False)),
+            ("movers", getattr(args, "movers", False))) if on]
         notes.insert(0, f"AS-OF {asof_ts.date()}: historical mode — report reflects data through "
                         f"that session; current-only blocks disabled"
                         + (f" ({', '.join(on_flags)})" if on_flags else "")
@@ -1476,6 +1497,18 @@ def gather_report(ticker, args, interactive, backdrop_base):
                            "own": own_sector(ticker) if own_sector is not None else None}
         except Exception:
             sectors = None
+    # top performers per sector (--movers; S59, opt-in) — each sector's ~10 largest names
+    # ranked by 63d return, top 3 kept. ~11 constituent lookups + 1 batched download, cached
+    # ~6h. Rides the sectors dict; current-only (skipped with the rotation table in as-of mode).
+    if sectors is not None and getattr(args, "movers", False):
+        try:
+            top = fetch_top_performers(data_dir=args.data_dir) if fetch_top_performers else None
+            if top and top.get("sectors"):
+                sectors["top"] = top["sectors"]
+        except Exception:
+            pass
+        if "top" not in sectors:
+            notes.append("sector top performers unavailable (constituent/price fetch failed).")
 
     # RETAIL ATTENTION (S56, default-on S58) — reddit-board mention rank; cached ~6h, one feed
     # fetch serves every ticker. Ranked → read dict (+history/pct); unranked → explicit state;
@@ -1652,6 +1685,10 @@ if __name__ == "__main__":
                     help="Add a STREET & NEWS block — analyst price-target range, EPS estimate "
                          "revisions (30d momentum), upgrade/downgrade counts, and recent "
                          "headlines via yfinance. ETFs degrade to headlines-only. Cached ~6h.")
+    ap.add_argument("--movers", action="store_true",
+                    help="Add each sector's top 63d performers (top 3 of its ~10 largest "
+                         "constituents) under the SECTOR ROTATION table. ~11 yfinance "
+                         "constituent lookups + 1 batched download; cached ~6h.")
     ap.add_argument("--gex", action="store_true",
                     help="Add a GAMMA EXPOSURE block — dealer GEX by strike off the live Tradier "
                          "chain (expiries ≤60d): net GEX regime, call/put walls, zero-gamma flip, "

@@ -70,7 +70,7 @@ def make_args(flags):
         insider=flags["insider"], squeeze=flags["squeeze"],
         live=flags["live"] and not flags.get("as_of"),
         vol=flags["vol"], call=flags["call"], gex=flags["gex"],
-        street=flags.get("street", False),
+        street=flags.get("street", False), movers=flags.get("movers", False),
     )
 
 
@@ -452,13 +452,17 @@ def _header_tiles(p, df):
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
-def load_seasonality(ticker):
+def load_seasonality(ticker, asof=None):
     """Monthly seasonality base rates (S53) — zero network when the indicators CSV exists
     (yfinance-fallback tickers ride load_daily_full's cache — S55: no second download). Needs
-    the FULL history — decades, not the chart's 320-bar tail."""
+    the FULL history — decades, not the chart's 320-bar tail. `asof` (S57) truncates the
+    history so post-as-of months can't leak into a backtest view."""
     try:
         from modules.seasonality import monthly_seasonality
-        return monthly_seasonality(load_daily_full(ticker)["Close"])
+        close = load_daily_full(ticker)["Close"]
+        if asof:
+            close = close.loc[:pd.Timestamp(asof)]
+        return monthly_seasonality(close)
     except Exception:
         return None
 
@@ -1073,7 +1077,7 @@ known = known_tickers()
 # (explicit intent → debounce bypassed). Consumed on the FIRST run only, before the widgets
 # instantiate; the URL is written back after each successful generate, so the current view
 # is always shareable/bookmarkable.
-FLAG_NAMES = ("vol", "call", "gex", "squeeze", "insider", "street", "geo", "live")
+FLAG_NAMES = ("vol", "call", "gex", "squeeze", "insider", "street", "movers", "geo", "live")
 if "qp_done" not in st.session_state:
     st.session_state["qp_done"] = True
     try:
@@ -1090,7 +1094,10 @@ if "qp_done" not in st.session_state:
         qp_asof = st.query_params.get("asof")            # S57 date range deep links
         if qp_asof:
             st.session_state["asof_on"] = True
-            st.session_state["asof_date"] = pd.Timestamp(qp_asof).date()
+            # clamp to today: the date_input below has max_value=today, and a session-state
+            # value above it raises on EVERY rerun (the widget instantiates outside this try)
+            st.session_state["asof_date"] = min(pd.Timestamp(qp_asof).date(),
+                                                pd.Timestamp.today().date())
         qp_from = st.query_params.get("from")
         if qp_from:
             st.session_state["chart_from"] = pd.Timestamp(qp_from).date()
@@ -1104,17 +1111,19 @@ with c1:
                            max_chars=8).strip().upper()
 with c2:
     st.caption("blocks")
-    f1, f2, f3, f4, f5, f6, f7, f8, f9 = st.columns(9)
+    f1, f2, f3, f4, f5, f6, f7, f8, f9, f10 = st.columns(10)
     vol = f1.checkbox("vol", key="flag_vol")
     call = f2.checkbox("call", key="flag_call")
     gex = f3.checkbox("gex", key="flag_gex")
     squeeze = f4.checkbox("squeeze", key="flag_squeeze")
     insider = f5.checkbox("insider", key="flag_insider")
     street = f6.checkbox("street", key="flag_street")
-    geo = f7.checkbox("geo", key="flag_geo")
-    live = f8.checkbox("live", key="flag_live")
-    pc_oi = f9.selectbox("pc-oi", ["off", "all", "near", "leaps", "monthly"],
-                         key="flag_pc_oi", label_visibility="collapsed")
+    movers = f7.checkbox("movers", key="flag_movers",
+                         help="top 63d performers per sector (largest constituents)")
+    geo = f8.checkbox("geo", key="flag_geo")
+    live = f9.checkbox("live", key="flag_live")
+    pc_oi = f10.selectbox("pc-oi", ["off", "all", "near", "leaps", "monthly"],
+                          key="flag_pc_oi", label_visibility="collapsed")
 
 with st.expander("thesis overlay (optional)"):
     t1, t2 = st.columns(2)
@@ -1161,7 +1170,8 @@ run_clicked = st.button("Run", type="primary")
 # menu Rerun blank the page. Regenerate only when the (ticker, flags) key changes or Run is
 # clicked; otherwise redisplay the stored result (generate_payload's 2-min cache absorbs repeats).
 flags = {"vol": vol, "call": call, "gex": gex, "squeeze": squeeze, "insider": insider,
-         "street": street, "geo": geo, "live": live and not asof_iso, "pc_oi": pc_oi,
+         "street": street, "movers": movers, "geo": geo, "live": live and not asof_iso,
+         "pc_oi": pc_oi,
          "thesis": None if thesis == "none" else thesis,
          "level": level or None, "as_of": asof_iso}
 # NB: `chart_from` is deliberately NOT in flags — it only moves the chart window, so changing
@@ -1271,6 +1281,15 @@ if st.session_state.get("last_payload"):
     # as-of date the SHOWN report was computed for (S57) — None on a normal run; live and
     # as-of are mutually exclusive (flags force live off), so the fragment path is never as-of
     shown_asof = st.session_state["last_payload"].get("as_of_mode")
+    try:
+        # `from` is display-only (changing it never regenerates), so the generate-time URL
+        # write-back can't see later changes — mirror it here to keep the URL shareable
+        if from_iso:
+            st.query_params["from"] = from_iso
+        elif "from" in st.query_params:
+            del st.query_params["from"]
+    except Exception:
+        pass
     if shown_asof:
         st.warning(f"🕰 AS-OF {shown_asof} — historical backtest view: report, chart, and "
                    f"gauges reflect data through that session only (no lookahead); "
@@ -1337,13 +1356,14 @@ if st.session_state.get("last_payload"):
             st.caption(line + " · realized close-to-close moves; the --vol study covers the "
                               "implied side (ramp/crush/straddle P&L)")
     # seasonality (S53) — monthly base rates, DISPLAY-ONLY forever (calendar-time features
-    # are the S31 leak class; never a model input)
-    seas = load_seasonality(shown_ticker)
+    # are the S31 leak class; never a model input). As-of mode truncates the history and
+    # highlights the AS-OF month, not the real-world one.
+    seas = load_seasonality(shown_ticker, asof=shown_asof)
     if seas and seas.get("status") == "ok":
         with st.expander(f"📈 seasonality — monthly base rates over {seas['years']:.0f}y "
                          f"(display-only)"):
             import calendar as _cal
-            cur = pd.Timestamp.today().month
+            cur = (pd.Timestamp(shown_asof) if shown_asof else pd.Timestamp.today()).month
             months, recent = seas["months"], seas["recent"]
 
             def wintxt(s):
@@ -1382,6 +1402,13 @@ if st.session_state.get("last_payload"):
                        f"{medtxt(cs)} (full) · {wintxt(cr)} up, median {medtxt(cr)} (last "
                        f"10y — a month strong in both windows is a real prior; one that "
                        f"flips is noise) · base rates, NOT edge; stays display-only (S31)")
+    elif seas and seas.get("status") == "insufficient":
+        # quiet should be visible, not silent (the S58 buzz lesson): say WHY there's no
+        # seasonality section instead of hiding it — <10y ≈ <10 obs per calendar month,
+        # an anecdote rather than a base rate
+        st.caption(f"seasonality: only {seas['years']:.1f}y of history"
+                   + (f" through {shown_asof}" if shown_asof else "")
+                   + " — monthly base rates need ≥10y (~10 observations per calendar month)")
     # sidebar quick-nav (S56) — anchor links to the section headers below (lens_web_sections
     # stamps a stable slug id on each header div); entries appear only when the payload
     # carries that section
@@ -1393,12 +1420,18 @@ if st.session_state.get("last_payload"):
             ("Setup check", "setup-check", _p.get("setup")),
             ("Options & vol", "options-vol-context", _p.get("ctx")),
             ("Short/squeeze", "short-positioning-squeeze", _p.get("squeeze")),
+            # sec_buzz renders only when the squeeze section is absent — mirror its guard
+            ("Retail attention", "retail-attention",
+             _p.get("buzz") and not _p.get("squeeze")),
             ("Insider activity", "insider-activity", _p.get("insider")),
+            ("Street & news", "street-news", _p.get("street")),
             ("Put/call OI", "put-call-oi", _p.get("pcoi")),
             ("Gamma exposure", "gamma-exposure", _p.get("gex")),
             ("Volatility setup", "volatility-setup", _p.get("vol")),
             ("Long call viability", "long-call-viability", _p.get("callq")),
-            ("Geo backdrop", "geopolitical-cross-asset-backdrop", _p.get("geo"))]
+            ("Geo backdrop", "geopolitical-cross-asset-backdrop", _p.get("geo")),
+            ("Sector rotation", "sector-rotation", _p.get("sectors")),
+            ("Known catalysts", "known-catalysts", _p.get("cats"))]
     with st.sidebar:
         st.markdown(f"**{shown_ticker}** — sections")
         st.markdown("\n".join(f"- [{label}](#{slug})" for label, slug, present in _nav

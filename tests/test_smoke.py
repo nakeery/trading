@@ -1834,6 +1834,41 @@ def test_sector_rotation():
     assert own_sector("XLF") == "XLF"
 
 
+# ─── Test 48b: S59 sector top performers (offline) ─────────────────────────────
+def test_sector_top_performers():
+    """top_performers_read: 63d-descending rank within each sector, TOP_N cap, 20d fallback
+    when a series is too short for 63d, <REL_SHORT+1-session names omitted, empty → {};
+    YF_SECTOR_KEYS covers all 11 SPDR sectors."""
+    import numpy as np
+    import pandas as pd
+    from modules.sectors import (top_performers_read, SECTORS, YF_SECTOR_KEYS,
+                                 TOP_N, REL_SHORT)
+
+    assert set(YF_SECTOR_KEYS) == set(SECTORS)             # every sector reachable
+    n = 70
+    closes = {
+        "AAA": pd.Series(np.linspace(100, 130, n)),        # r63 ≈ +27% — best
+        "BBB": pd.Series(np.linspace(100, 115, n)),        # r63 ≈ +13%
+        "CCC": pd.Series(np.linspace(100, 105, n)),        # r63 ≈ +5% — cut by TOP_N
+        "DDD": pd.Series(np.linspace(100, 101, n)),        # r63 ≈ +1% — cut by TOP_N
+        "SHORT63": pd.Series(np.linspace(100, 120, 40)),   # <64 sessions → r63 None; its r20
+        "TOOSHORT": pd.Series(np.linspace(100, 150, 10)),  # (≈+9%) ranks it above CCC's 63d
+    }
+    cons = {"XLK": [(s, s.title()) for s in
+                    ("AAA", "BBB", "CCC", "DDD", "SHORT63", "TOOSHORT")],
+            "XLE": [("TOOSHORT", "Tooshort")]}             # no usable name → sector omitted
+    out = top_performers_read(cons, closes)
+    assert "XLE" not in out and set(out) == {"XLK"}
+    tk = out["XLK"]
+    assert len(tk) == TOP_N                                # capped
+    # SHORT63's 20d return (~+9%) outranks CCC's 63d (~+5%) under the shared sort key
+    assert [m["sym"] for m in tk] == ["AAA", "BBB", "SHORT63"]
+    assert tk[0]["r63"] is not None and tk[2]["r63"] is None and tk[2]["r20"] > 0
+    assert len(pd.Series(closes["TOOSHORT"])) <= REL_SHORT # the omission premise holds
+    assert top_performers_read({}, {}) == {}
+    assert top_performers_read(None, None) == {}
+
+
 # ─── Test 49: S58 buzz history / unranked sentinel (offline via canned cache) ──
 def test_buzz_history(tmp_path):
     """fetch_buzz off a fresh canned cache (no network): ranked ticker → read + history row
