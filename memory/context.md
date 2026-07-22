@@ -59,7 +59,7 @@ lens_web.py specifics (S48, +S49 native visuals):
   ONE-SHOT events (on_change copies pick into the box then deselects — persistent pill selection
   silently overrode typed tickers before). Flag checkboxes auto-run with a 2s DEBOUNCE
   (`DEBOUNCE_S`; rapid clicks batch; Run bypasses + force-fresh via targeted
-  `generate_report.clear(ticker, flags_key)`).
+  `generate_payload.clear(ticker, flags_key)`).
 - Report: `render_ticker` stdout captured (candle="none"), ansi2html inside **`st.html`** (NOT
   st.markdown — markdown ends HTML blocks at blank lines and shreds the <pre>). Rendered from
   st.session_state on EVERY rerun (menu-Rerun blanked the page when gated on the click).
@@ -145,6 +145,28 @@ lens_web.py specifics (S48, +S49 native visuals):
   generate/Run resets); deprecated `use_container_width` → `width="stretch"` (Streamlit 1.59).
 - Deps: streamlit/ansi2html/plotly. `.claude/launch.json`: lens-web (8501, the user's) +
   lens-web-dev (8502, verification — never collide with the user's instance).
+- **S60 — React + FastAPI successor (user-requested UI migration; Streamlit UNTOUCHED and
+  parallel-runnable until the user retires it)**: `api/` (FastAPI backend — sanitize.py
+  numpy/NaN→JSON boundary, reportgen.py asyncio-locked gather_report + LATEST per-ticker
+  payload store, charts.py = _candle_fig/_iv_fig/chart_frame/event_markers ported VERBATIM
+  (figs built server-side, sent as plotly JSON — the two-axis candle convention never
+  re-implemented in JS; overlay toggles = /api/chart query params), cache.py cachetools
+  TTLs mirroring st.cache_data + post-generate evict, loaders.py = tiles/econ/ledger/
+  seasonality/reactions/snapshot-diff ports — snapshots SHARED with Streamlit under
+  data/payload_history/) + `web/` (Vite+React 19+TS: TanStack Query, react-plotly.js on
+  plotly.js-finance-dist-min, utils/colors.ts = ramp/heat/RSI/ordinal-percentile TS ports,
+  components/sections/* = all 20 renderers w/ per-section error boundaries + anchor nav,
+  2s debounce w/ Run-force + pill bypass, deep links + write-back, 10s live poll w/ 3-miss
+  backoff, watchlist grid, FRED calendar grid, Δ-diff, scored ledger, as-of suppressions).
+  Dev: uvicorn :8000 (`--reload-dir api` ONLY — data/ writes would restart mid-generate) +
+  Vite :5173 (proxy /api → 8000, no CORS anywhere); prod: `npm run build` then FastAPI
+  serves web/dist single-process on :8000. launch.json: lens-api + lens-react (cmd-wrapped
+  npm — spawned procs lack the Node PATH). tests/test_api.py (14 offline; NB the asyncio
+  GENERATE_LOCK test must drive concurrency via httpx.ASGITransport in ONE loop — sync
+  TestClient threads each spin a loop and cross-loop lock waiters deadlock). JS gotcha
+  class: `[]`/`0` truthiness differs from Python when porting payload guards. Node LTS
+  winget-installed (was absent). web/FRONTEND.md = React orientation for the user +
+  parity checklist.
 
 Modules the lens/web stack uses
 -------------------------------

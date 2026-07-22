@@ -1,0 +1,69 @@
+/* LENS dark theme — the Streamlit app's palette (#0e1117 bg etc.) as CSS variables.
+   Components use these instead of hard-coded hex so the look stays consistent. */
+
+:root {
+  --bg: #0e1117;            /* page background (matches plotly plot_bgcolor)   */
+  --panel: #141821;         /* section/card background                          */
+  --border: #2a2f3a;        /* card + table borders                             */
+  --text: #d8dee9;          /* primary text                                     */
+  --muted: #8b95a7;         /* section headers, captions                        */
+  --faint: #6a7686;         /* LVN-gray, de-emphasized                          */
+  --green: #5ec45e;         /* up / bullish / ✓                                 */
+  --red: #d83c34;           /* down / bearish / ✗                               */
+  --amber: #e0a63a;         /* IV, POC, Tier-1, warnings                        */
+  --yellow: #e8c547;        /* price line, today outline                        */
+  --blue: #4ea3d8;          /* HV, MA50, MACD                                   */
+  --bluegray: #9fb4d0;      /* HVN, Tier-2                                      */
+  --purple: #b070d0;        /* MA200, skew                                      */
+  --gold: #d6ba2e;          /* RSI, MA20, event-IV                              */
+
+  color-scheme: dark;
+  font-family: "Segoe UI", system-ui, sans-serif;
+  font-size: 15px;
+  line-height: 1.45;
+  color: var(--text);
+  background: var(--bg);
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  min-height: 100vh;
+  background: var(--bg);
+}
+
+code, pre, .mono {
+  font-family: "Cascadia Mono", Consolas, monospace;
+}
+
+a { color: var(--blue); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+h1, h2, h3 { font-weight: 600; }
+
+button {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 12px;
+  cursor: pointer;
+}
+button:hover { border-color: var(--muted); }
+button.primary {
+  background: var(--red);
+  border-color: var(--red);
+  font-weight: 600;
+}
+
+input, select {
+  font: inherit;
+  color: var(--text);
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+input:focus, select:focus { outline: 1px solid var(--blue); }

@@ -103,6 +103,18 @@ python lens.py --ticker QQQ --as-of 2025-03-10   # AS-OF / BACKTEST mode (S57): 
 # near-always-on during rallies). Rides risk["regime"]; web shows a pill + caption in the risk
 # panel and regime FLIPS surface in the "Δ what changed" diff.
 
+# LENS AS A REACT WEB APP (S60) — the lens_web.py successor: FastAPI (api/) serves the
+# gather_report payload + server-built plotly figs as JSON; a Vite+React+TS app (web/)
+# renders it natively. Streamlit lens_web.py stays runnable in parallel until retired.
+.\trade\Scripts\python.exe -m uvicorn api.main:app --port 8000 --reload --reload-dir api
+npm run dev --prefix web    # Vite dev on :5173 (proxies /api). NB PowerShell: a QUOTED exe
+                            # path needs the call operator — & "C:\...\npm.cmd" run dev …
+# Prod single-process: npm run build --prefix web, then just uvicorn :8000 (serves web/dist).
+# Deep links: ?ticker=QQQ&gex=1&asof=2026-03-10&from=2026-01-02&live=1. Docs: web/FRONTEND.md
+# (React orientation + parity checklist). --reload-dir MUST stay restricted to api/ (a
+# generate writes under data/ — an unrestricted reload restarts the server mid-generate).
+# Never re-implement the candle fig in JS — api/charts.py builds every complex figure.
+
 python lens.py --ticker QQQ --gex           # GAMMA EXPOSURE block (S56): dealer GEX by strike off
 # the live Tradier chain (expiries ≤60d via select_gex_expiries — nearest 5 + monthlies, capped 8;
 # session-stale cache like --pc-oi) — net GEX regime (dealers long/short gamma → stabilizing vs
@@ -155,7 +167,7 @@ Run smoke tests:
 
 ```powershell
 .\trade\Scripts\python.exe -m pytest tests/ -v
-# 52 tests, ~3-10s. Requires data/QQQ_indicators.csv + data/QQQ_backtest_results.csv.
+# 66 tests (52 smoke + 14 API, S60), ~3-12s. Requires data/QQQ_indicators.csv + data/QQQ_backtest_results.csv.
 ```
 
 ### Prompt counts per script (for piped input via Claude Code)
