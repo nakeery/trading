@@ -50,10 +50,12 @@ def parse_cot(rows):
         return None
     series.sort()                                    # oldest → newest
     date, npo, net = series[-1]
-    hist = [x[1] for x in series]
+    hist = [x[1] for x in series[:-1]]               # PRIOR weeks only — self-inclusion put a
+    # 1/n floor under record extremes; strict < matches every sibling percentile
+    # (marketsent eq_pc/aaii, buzz mentions_pct)
     # inline percentile: sentiment.percentile_of floors at ≥63 obs (daily convention) —
     # COT is WEEKLY, so a year is ~52 rows; ≥26 weeks (~6mo) is the sane floor here
-    pct = (sum(1 for h in hist if h <= npo) / len(hist)) if len(hist) >= 26 else None
+    pct = (sum(1 for h in hist if h < npo) / len(hist)) if len(hist) >= 26 else None
     return {"date": date, "net": net, "net_pct_oi": npo,
             "pct": pct, "n_weeks": len(series)}
 
@@ -95,13 +97,17 @@ def fetch_cot(data_dir="data", ttl_hours=TTL_HOURS):
     try:
         if os.path.exists(path) and (time.time() - os.path.getmtime(path)) < ttl_hours * 3600:
             with open(path, encoding="utf-8") as f:
-                return json.load(f)
+                cached = json.load(f)
+            if isinstance(cached, dict):             # shape-corrupt cache (valid JSON, wrong
+                return cached                        # type) must not escape "never raises"
     except Exception:
         pass
     prior = {}
     try:
         with open(path, encoding="utf-8") as f:
             prior = json.load(f) or {}
+        if not isinstance(prior, dict):
+            prior = {}
     except Exception:
         pass
     fresh = {}

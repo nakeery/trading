@@ -1959,3 +1959,158 @@ def test_marketsent_reads():
     lq = liq_read(walcl, tga, rrp)
     assert lq["tag"] == "rising" and abs(lq["chg_13w_bn"] - 130.0) < 1e-6
     assert abs(lq["level_bn"] - (6_890.0 - 800.0 - 100.0)) < 1e-6
+
+
+def test_s61_live_bar_prefers_official_close():
+    """fetch_live_bar (S40) post-bell: the quote's `close` is the OFFICIAL close — `last`
+    keeps updating on after-hours prints and would contaminate a bar presented as the
+    completed session (in_progress False)."""
+    import pandas as pd
+
+    import modules.tradier as tradier
+    from modules.timeframes import fetch_live_bar
+
+    now_ms = int(pd.Timestamp.now(tz="UTC").value // 10**6)
+    base = {"trade_date": now_ms, "open": 420.0, "high": 431.0, "low": 419.0,
+            "volume": 1_000_000}
+    orig = tradier.get_daily_quote
+    try:
+        # session open: close is null → provisional bar rides `last`
+        tradier.get_daily_quote = lambda t: {**base, "last": 425.5, "close": None}
+        bar = fetch_live_bar("QQQ")
+        assert bar["in_progress"] is True and bar["Close"] == 425.5
+        # after the bell: official close present, `last` is an AH print — close wins
+        tradier.get_daily_quote = lambda t: {**base, "last": 421.5, "close": 430.0}
+        bar = fetch_live_bar("QQQ")
+        assert bar["in_progress"] is False and bar["Close"] == 430.0
+    finally:
+        tradier.get_daily_quote = orig
+
+
+def test_s61_buzz_percentile_uses_full_history(tmp_path):
+    """The mentions percentile must see the full retained history (~400d), not the 60-row
+    sparkline tail — a name quiet for 60 days otherwise reads '100th percentile' on any
+    modest uptick. Also guards the sparkline payload staying capped at 60 rows."""
+    import json as _json
+    import time as _time
+
+    import pandas as pd
+
+    from modules.buzz import CACHE_FILE, HISTORY_FILE, fetch_buzz
+
+    days = pd.bdate_range(end=pd.Timestamp.today() - pd.Timedelta(days=1), periods=100)
+    hist = pd.DataFrame({"date": [d.date().isoformat() for d in days],
+                         "ticker": "TST", "rank": 10,
+                         "mentions": list(range(1, 101))})      # 1..100, oldest→newest
+    hist.to_csv(tmp_path / HISTORY_FILE, index=False)
+    results = [{"ticker": "TST", "rank": 5, "mentions": 50, "upvotes": 1,
+                "rank_24h_ago": 6, "mentions_24h_ago": 40}]
+    (tmp_path / CACHE_FILE).write_text(_json.dumps(results), encoding="utf-8")
+
+    read = fetch_buzz("TST", data_dir=str(tmp_path))
+    assert read is not None and read.get("rank") == 5
+    # 49 of the 100 prior days sit below 50 → 0.49; the old 60-row window read ~0.15
+    assert abs(read["pct"] - 0.49) < 1e-9
+    assert len(read["history"]) <= 60                    # sparkline rows stay capped
+    _time.sleep(0)  # (no-op; keeps the import grouped)
+
+
+def test_s61_buzz_cache_read_stamps_fetch_date(tmp_path):
+    """A post-midnight read of yesterday-evening's cache must stamp history under the
+    FETCH date (file mtime), not the read date — keep='first' would otherwise block the
+    day's real snapshot."""
+    import json as _json
+    import os as _os
+    import time as _time
+
+    import pandas as pd
+
+    from modules.buzz import CACHE_FILE, HISTORY_FILE, fetch_buzz
+
+    results = [{"ticker": "TST", "rank": 3, "mentions": 77}]
+    path = tmp_path / CACHE_FILE
+    path.write_text(_json.dumps(results), encoding="utf-8")
+    yesterday_2300 = _time.time() - 4 * 3600             # a 23:00-yesterday-style mtime
+    _os.utime(path, (yesterday_2300, yesterday_2300))
+
+    fetch_buzz("TST", data_dir=str(tmp_path), ttl_hours=6)
+    hist = pd.read_csv(tmp_path / HISTORY_FILE, dtype={"date": str})
+    stamped = _time.strftime("%Y-%m-%d", _time.localtime(yesterday_2300))
+    assert list(hist["date"]) == [stamped]               # mtime date, never the read date
+
+
+def test_s61_marketsent_allfail_never_rewrites(tmp_path, monkeypatch):
+    """All four sources failing must serve the stale cache WITHOUT rewriting it — a
+    rewrite restamps stale gauges with a fresh as_of/mtime and suppresses the retry
+    (cot.py's documented guard, previously missing here)."""
+    import json as _json
+    import os as _os
+
+    import modules.marketsent as ms
+
+    old = {"gauges": {"cboe": {"equity": 0.7, "date": "2026-07-20"}},
+           "hist": {"eq_pc": {}, "naaim": {}}, "as_of_str": "OLD-STAMP"}
+    path = tmp_path / ms.CACHE_FILE
+    path.write_text(_json.dumps(old), encoding="utf-8")
+    stale = _os.path.getmtime(path) - 2 * 86400
+    _os.utime(path, (stale, stale))
+
+    def boom(*a, **k):
+        raise RuntimeError("network down")
+    for name in ("_fetch_cboe", "_fetch_aaii", "_fetch_naaim", "_fetch_liq"):
+        monkeypatch.setattr(ms, name, boom)
+
+    out = ms.fetch_marketsent(data_dir=str(tmp_path), ttl_hours=6)
+    assert out["as_of_str"] == "OLD-STAMP"               # stale served…
+    on_disk = _json.loads(path.read_text(encoding="utf-8"))
+    assert on_disk["as_of_str"] == "OLD-STAMP"           # …and never restamped
+    # shape-corrupt cache (valid JSON, wrong type) must not escape "never raises"
+    path.write_text(_json.dumps(["not", "a", "dict"]), encoding="utf-8")
+    assert ms.fetch_marketsent(data_dir=str(tmp_path), ttl_hours=6) is None
+
+
+def test_s61_cot_percentile_prior_weeks_strict():
+    """parse_cot's percentile: PRIOR weeks only, strict < — self-inclusion with <= put a
+    1/n floor under record extremes (a record low could never read 0th percentile)."""
+    from modules.cot import parse_cot
+
+    def rows(npos):
+        return [{"report_date_as_yyyy_mm_dd": f"2026-{(i // 4) + 1:02d}-{(i % 4) * 7 + 1:02d}",
+                 "lev_money_positions_long": str(1000 + n), "lev_money_positions_short": "1000",
+                 "open_interest_all": "10000"} for i, n in enumerate(npos)]
+
+    up = parse_cot(rows(list(range(30))))                # latest = record high
+    assert up["pct"] == 1.0
+    dn = parse_cot(rows(list(range(29, -1, -1))))        # latest = record low
+    assert dn["pct"] == 0.0
+
+
+def test_s61_sectors_close_frame_single_symbol():
+    """yfinance returns FLAT columns when exactly one symbol survives a list download —
+    the old raw[['Close']] fallback kept the literal column name 'Close' and silently
+    discarded the data in hand."""
+    import pandas as pd
+
+    from modules.sectors import _close_frame
+
+    idx = pd.bdate_range("2026-01-02", periods=5)
+    flat = pd.DataFrame({"Open": 1.0, "Close": [10, 11, 12, 13, 14]}, index=idx)
+    out = _close_frame(flat, ["XLK"])
+    assert "XLK" in out.columns and list(out["XLK"]) == [10, 11, 12, 13, 14]
+
+    multi = pd.DataFrame({("Close", "XLK"): [1.0] * 5, ("Close", "SPY"): [2.0] * 5}, index=idx)
+    multi.columns = pd.MultiIndex.from_tuples(multi.columns)
+    out2 = _close_frame(multi, ["XLK", "SPY"])
+    assert set(out2.columns) == {"XLK", "SPY"}
+
+
+def test_s61_street_nan_price_targets():
+    """NaN is truthy — a NaN mean/median from yfinance previously passed the guards and
+    printed 'median $nan' (and landed as an invalid NaN token in the cache JSON)."""
+    from modules.street import street_read
+
+    assert "pt" not in street_read({"current": 100.0, "mean": float("nan")}, [], {})
+    r = street_read({"current": 100.0, "mean": 120.0, "median": float("nan"),
+                     "high": 150.0, "low": float("nan")}, [], {})
+    assert r["pt"]["median"] is None and r["pt"]["low"] is None
+    assert r["pt"]["high"] == 150.0 and abs(r["pt"]["upside_mean"] - 0.20) < 1e-9

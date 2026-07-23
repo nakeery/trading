@@ -62,9 +62,10 @@ function MonthGrid({ year, month, byDay, today }: {
   const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate()
   const weeks: (number | null)[][] = []
   let week: (number | null)[] = []
-  // pad to Monday of the first week
+  // pad to Monday of the first week — but NOT for Sat/Sun-start months (their first
+  // weekday IS Monday; a full-width null pad rendered a leading all-blank week row)
   const startDow = (first.getUTCDay() + 6) % 7 // 0 = Monday
-  for (let i = 0; i < Math.min(startDow, 5); i++) week.push(null)
+  if (startDow < 5) for (let i = 0; i < startDow; i++) week.push(null)
   for (let day = 1; day <= daysInMonth; day++) {
     const dow = (new Date(Date.UTC(year, month - 1, day)).getUTCDay() + 6) % 7
     if (dow >= 5) continue // skip weekends

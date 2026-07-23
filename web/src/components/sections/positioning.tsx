@@ -191,8 +191,10 @@ interface Gex {
 export function SecGex({ p }: { p: Payload }) {
   const g = p.gex as Gex | null
   if (!g?.by_strike?.length) return null
+  const exp = g.expiries ?? []
+  // Math.max() over an empty spread is -Infinity — guard the payload-without-expiries case
   let hdr = `GAMMA EXPOSURE — dealer positioning, Tradier chain  `
-    + `(≤${Math.max(...(g.expiries ?? []).map((e) => e.dte))}d, ${g.expiries?.length ?? 0} expiries)`
+    + (exp.length ? `(≤${Math.max(...exp.map((e) => e.dte))}d, ${exp.length} expiries)` : '')
   if (g.as_of_str) hdr += ` · as of ${g.as_of_str}${g.stale ? '  (stale)' : ''}`
   const regime = g.net_gex > 0
     ? 'dealers long gamma — stabilizing (sell rallies, buy dips)'

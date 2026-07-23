@@ -137,7 +137,10 @@ def _fetch_cboe(hist):
     if not ratios or ratios.get("equity") is None:
         return None
     today = time.strftime("%Y-%m-%d")
-    hist.setdefault(today, ratios["equity"])        # forward-only accumulation
+    # the page serves the most recent TRADING day's ratios — banking them under a weekend
+    # run date would duplicate Friday's value in the percentile history (up to 3×)
+    if pd.Timestamp(today).weekday() < 5:
+        hist.setdefault(today, ratios["equity"])    # forward-only accumulation
     vals = [v for d, v in hist.items() if d != today]
     pct = (float(sum(float(v) < ratios["equity"] for v in vals) / len(vals))
            if len(vals) >= HIST_MIN_DAILY else None)
@@ -197,7 +200,9 @@ def fetch_marketsent(data_dir="data", ttl_hours=TTL_HOURS):
     try:
         with open(path, encoding="utf-8") as f:
             old = json.load(f)
-        if (time.time() - os.path.getmtime(path)) < ttl_hours * 3600:
+        if not isinstance(old, dict):               # shape-corrupt cache (valid JSON, wrong
+            old = None                              # type) must not escape "never raises"
+        elif (time.time() - os.path.getmtime(path)) < ttl_hours * 3600:
             return old
     except Exception:
         pass
@@ -205,15 +210,20 @@ def fetch_marketsent(data_dir="data", ttl_hours=TTL_HOURS):
     hist.setdefault("eq_pc", {})
     hist.setdefault("naaim", {})
     gauges, prior = {}, (old or {}).get("gauges") or {}
+    fresh_any = False
     for name, call in (("cboe", lambda: _fetch_cboe(hist["eq_pc"])),
                        ("aaii", _fetch_aaii),
                        ("naaim", lambda: _fetch_naaim(hist["naaim"])),
                        ("liq", _fetch_liq)):
         try:
-            gauges[name] = call() or prior.get(name)
+            fresh = call()
         except Exception:
-            gauges[name] = prior.get(name)          # stale gauge beats a hole
-    if not any(gauges.values()):
+            fresh = None
+        fresh_any = fresh_any or fresh is not None
+        gauges[name] = fresh or prior.get(name)     # stale gauge beats a hole
+    if not fresh_any:
+        # nothing fetched fresh — do NOT rewrite the cache: it would restamp stale gauges
+        # with a fresh as_of/mtime and suppress the retry for another TTL (cot.py's guard)
         return old
     out = {"gauges": gauges, "hist": hist, "as_of_str": time.strftime("%Y-%m-%d %H:%M")}
     try:

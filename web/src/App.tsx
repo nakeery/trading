@@ -73,17 +73,24 @@ export default function App() {
     setPendingIn(false)
     setReq({ ticker: t, flags: f, force, nonce: force ? Date.now() : (req?.nonce ?? 0) })
   }
-  const pickTicker = (t: string) => {
-    // pill/tile pick = explicit intent like Run — skips the debounce, but NOT the caches
-    setTicker(t)
-    runNow(false, t)
-  }
-
   const report = useQuery({
     queryKey: ['report', reqKey, req?.force ? req.nonce : 0],
     queryFn: () => fetchReport(req!.ticker, req!.flags, req!.force),
     enabled: req !== null,
   })
+
+  const pickTicker = (t: string) => {
+    // pill/tile pick = explicit intent like Run — skips the debounce, but NOT the caches
+    setTicker(t)
+    const newKey = `${t}|${flagsToParams(flags).toString()}`
+    if (req && newKey === reqKey) {
+      // same-key pick: setReq would be a no-op (identical query key never refetches) —
+      // re-ask the server instead; its 120s report cache still absorbs rapid repeats
+      void report.refetch()
+      return
+    }
+    runNow(false, t)
+  }
   const payload = report.data?.payload ?? null
 
   // shareable URL reflects the current view — written back after each successful generate

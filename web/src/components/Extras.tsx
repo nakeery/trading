@@ -122,7 +122,10 @@ export function SeasonalityGrid({ ticker, asOf }: { ticker: string; asOf?: strin
     )
   }
   if (seas.status !== 'ok' || !seas.months || !seas.recent) return null
-  const cur = (asOf ? new Date(asOf) : new Date()).getMonth() // 0-based; highlights the AS-OF month
+  // 0-based; highlights the AS-OF month. Parse the month straight off the ISO string —
+  // new Date("YYYY-MM-DD") is UTC midnight, so .getMonth() reads the PREVIOUS month for
+  // 1st-of-month as-of dates in any US timezone
+  const cur = asOf ? Number(asOf.slice(5, 7)) - 1 : new Date().getMonth()
   const winTxt = (s: MonthStat) => (s.n ? `${s.up}/${s.n}` : '—')
   const medTxt = (s: MonthStat) => (s.median != null ? sPct(s.median) : '—')
   const winStyle = (s: MonthStat): React.CSSProperties | undefined =>

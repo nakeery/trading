@@ -1310,7 +1310,9 @@ def gather_report(ticker, args, interactive, backdrop_base):
                         f"that session; current-only blocks disabled"
                         + (f" ({', '.join(on_flags)})" if on_flags else "")
                         + "; ex-div, options liquidity, sector rotation, retail buzz, and "
-                          "breadth/F&G/COT/sentiment omitted.")
+                          "breadth/F&G/COT/sentiment omitted. Prices are on TODAY'S dividend-"
+                          "adjusted basis — absolute levels can differ slightly from what a "
+                          "viewer saw then; ratios/trends/percentiles are unaffected.")
 
     ctx = None
     if not args.no_vix and gather_context is not None:
@@ -1432,6 +1434,19 @@ def gather_report(ticker, args, interactive, backdrop_base):
         except Exception:
             pass
 
+    # Tier-1 macro proximity — computed once, used by the --vol scorecard's macro-catalyst
+    # factor (previously never passed: the documented "macro event in Nd" long-vol factor was
+    # unreachable) and by the setup check's catalyst-timing row below
+    macro_t1 = None
+    if next_event_per_series is not None:
+        try:
+            ev = next_event_per_series(as_of=asof_ts, data_dir=args.data_dir)
+            t1 = [days for name, (d, days) in ev.items()
+                  if name in TIER1_MACRO and days is not None]
+            macro_t1 = min(t1) if t1 else None
+        except Exception:
+            macro_t1 = None
+
     vol = None
     if args.vol and vol_setup is not None:
         try:
@@ -1449,7 +1464,8 @@ def gather_report(ticker, args, interactive, backdrop_base):
             # frames + gauges; the live straddle quote and the vol study (full-history CSV read
             # — would see post-as-of sessions) are current-only and skipped.
             vol = {"squeeze": squeeze, "em": em, "earnings": earn,
-                   "setup": vol_setup(reads, squeeze, ctx, earnings=earn, em=em),
+                   "setup": vol_setup(reads, squeeze, ctx, earnings=earn, em=em,
+                                      macro_days=macro_t1),
                    "quote": (straddle_quote(ticker, earnings_date=(earn or {}).get("date"),
                                             interactive=interactive,
                                             data_dir=args.data_dir,
@@ -1552,12 +1568,7 @@ def gather_report(ticker, args, interactive, backdrop_base):
     setup = None
     if setup_check is not None and reads:
         try:
-            macro_t1 = None
-            if next_event_per_series is not None:
-                ev = next_event_per_series(as_of=asof_ts, data_dir=args.data_dir)
-                t1 = [days for name, (d, days) in ev.items()
-                      if name in TIER1_MACRO and days is not None]
-                macro_t1 = min(t1) if t1 else None
+            # macro_t1 hoisted above the vol block (shared with the --vol scorecard)
             rs = (fetch_rs(ticker, frames["1D"], data_dir=args.data_dir)
                   if (fetch_rs is not None and "1D" in frames) else None)
             beta = (fetch_beta(ticker, frames["1D"])

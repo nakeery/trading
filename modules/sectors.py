@@ -127,6 +127,19 @@ def top_performers_read(constituents, closes, top_n=TOP_N):
     return out
 
 
+def _close_frame(raw, symbols):
+    """Close-price frame from a yf.download result with SYMBOL column names in both shapes:
+    MultiIndex (list download) and flat (yfinance returns single-level columns when exactly
+    one symbol survives — the old `raw[["Close"]]` fallback kept the literal column name
+    "Close", so no symbol ever matched and the data in hand was silently discarded)."""
+    if isinstance(raw.columns, pd.MultiIndex):
+        return raw["Close"]
+    close = raw[["Close"]]
+    if len(symbols) == 1:
+        close = close.rename(columns={"Close": symbols[0]})
+    return close
+
+
 def fetch_top_performers(data_dir="data", ttl_hours=TTL_HOURS):
     """Current top performers per sector, cached (S59 — lens --movers). ~11 yf.Sector
     constituent lookups (each in its own try — one bad sector never costs the rest) + ONE
@@ -154,7 +167,7 @@ def fetch_top_performers(data_dir="data", ttl_hours=TTL_HOURS):
         if symbols:
             raw = yf.download(symbols, period="6mo", interval="1d",
                               progress=False, auto_adjust=True)
-            close = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw[["Close"]]
+            close = _close_frame(raw, symbols)
             sectors = top_performers_read(
                 constituents, {s: close[s] for s in symbols if s in close.columns})
             if sectors:
@@ -207,7 +220,7 @@ def fetch_sectors(data_dir="data", ttl_hours=TTL_HOURS):
         symbols = sorted(SECTORS) + [BENCH]
         raw = yf.download(symbols, period="1y", interval="1d",
                           progress=False, auto_adjust=True)
-        close = raw["Close"] if isinstance(raw.columns, pd.MultiIndex) else raw[["Close"]]
+        close = _close_frame(raw, symbols)
         rows = rotation_read({s: close[s] for s in symbols if s in close.columns})
         if rows:
             out = {"rows": rows}

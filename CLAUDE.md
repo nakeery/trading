@@ -167,7 +167,7 @@ Run smoke tests:
 
 ```powershell
 .\trade\Scripts\python.exe -m pytest tests/ -v
-# 66 tests (52 smoke + 14 API, S60), ~3-12s. Requires data/QQQ_indicators.csv + data/QQQ_backtest_results.csv.
+# 78 tests (59 smoke + 19 API, S61), ~3-12s. Requires data/QQQ_indicators.csv + data/QQQ_backtest_results.csv.
 ```
 
 ### Prompt counts per script (for piped input via Claude Code)

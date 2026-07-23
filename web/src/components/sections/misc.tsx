@@ -165,6 +165,24 @@ const EVENTS_HORIZON = 30
 interface EarnLike { date?: string | null; days?: number | null }
 interface ExdLike extends EarnLike { est?: boolean }
 
+/** Mirrors SecEvents' render-vs-null decision — the nav must not link a section that
+ *  renders nothing (e.g. earnings 60d out, no catalysts, macro cache empty). Keep in
+ *  sync with the null-check at the top of SecEvents' return. */
+export function hasUpcomingEvents(p: Payload): boolean {
+  const cats = (p.cats as unknown[] | null) ?? []
+  if (cats.length) return true // even beyond-horizon catalysts render (the table)
+  const earn = p.earn as EarnLike | null
+  const exd = p.exd as ExdLike | null
+  if (earn?.days != null && earn.days <= EVENTS_HORIZON) return true
+  if (exd?.days != null && exd.days <= EVENTS_HORIZON) return true
+  const macro = (p.macro_events as Record<string, [string | null, number | null]> | null) ?? {}
+  for (const [name, [d, days]] of Object.entries(macro)) {
+    if (d == null || days == null) continue
+    if (days <= (TIER1.has(name) ? EVENTS_HORIZON : 10)) return true
+  }
+  return false
+}
+
 export function SecEvents({ p }: { p: Payload }) {
   const cats = (p.cats as [string, number, string, string][] | null) ?? []
   const macro = (p.macro_events as Record<string, [string | null, number | null]> | null) ?? {}

@@ -402,6 +402,12 @@ def build_chart(ticker, payload=None, as_of=None, start=None, live=False,
     on = set(overlays)
     if as_of:
         live = False
+    if payload is not None and payload.get("as_of_mode") != (as_of or None):
+        # data-vintage mismatch: LATEST may hold an as-of (backtest) payload while this is a
+        # current-mode chart request, or vice versa — drawing the other mode's GEX walls/
+        # profile/event markers on these candles would be silent lookahead/staleness. Degrade
+        # to an undecorated chart instead.
+        payload = None
     df, n_view = chart_frame(ticker, as_of, start)
     df = df.copy()
     live_info = None
@@ -469,5 +475,9 @@ def build_chart(ticker, payload=None, as_of=None, start=None, live=False,
                      glevels=gex_levels(payload) if "gex" in on else [],
                      rsi=rsi_s, macd=macd_t,
                      prev_close=df["Close"].shift(1).tail(n_view))
+    if fig is not None:
+        # stable per-view uirevision: plotly preserves the user's zoom/pan across live ticks
+        # and overlay toggles, resetting only when the ticker or the date window changes
+        fig.update_layout(uirevision=f"{ticker}|{as_of or ''}|{start or ''}")
     return {"fig": fig_dict(fig), "range52": range52(df), "live": live_info,
             "as_of": str(df.index[-1].date())}

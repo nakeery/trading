@@ -74,7 +74,8 @@ def record_history(results, data_dir, today=None):
 
 def ticker_history(ticker, data_dir, tail=HISTORY_TAIL):
     """This ticker's accumulated buzz history, oldest→newest: [{date, rank, mentions}] (last
-    `tail` rows) or None when nothing recorded yet. Never raises."""
+    `tail` rows; tail=None = full retained history) or None when nothing recorded yet.
+    Never raises."""
     try:
         import pandas as pd
         path = os.path.join(data_dir, HISTORY_FILE)
@@ -84,7 +85,9 @@ def ticker_history(ticker, data_dir, tail=HISTORY_TAIL):
         df = df[df["ticker"] == (ticker or "").upper()].sort_values("date")
         if df.empty:
             return None
-        return df.tail(tail)[["date", "rank", "mentions"]].to_dict("records")
+        if tail:
+            df = df.tail(tail)
+        return df[["date", "rank", "mentions"]].to_dict("records")
     except Exception:
         return None
 
@@ -106,10 +109,15 @@ def _load_results(data_dir, ttl_hours):
     path = os.path.join(data_dir, CACHE_FILE)
     try:
         if os.path.exists(path) and (time.time() - os.path.getmtime(path)) < ttl_hours * 3600:
+            mtime = os.path.getmtime(path)
             with open(path, encoding="utf-8") as f:
                 results = json.load(f)
-            record_history(results, data_dir)  # S58 — idempotent (date+ticker dedupe): a day
-            return results                     # served entirely from cache still gets its row
+            # stamp under the FETCH date (file mtime), not the read date: a post-midnight
+            # read of yesterday-evening's cache would otherwise bank stale counts under
+            # today, and keep="first" would then block the day's real snapshot
+            record_history(results, data_dir,
+                           today=time.strftime("%Y-%m-%d", time.localtime(mtime)))
+            return results                     # a day served from cache still gets its row
     except Exception:
         pass
     results = []
@@ -155,7 +163,10 @@ def fetch_buzz(ticker, data_dir="data", ttl_hours=TTL_HOURS):
         if read is None:
             return {"unranked": True}
         read["history"] = ticker_history(ticker, data_dir)
-        read["pct"] = mentions_pct(read["history"], read["mentions"])
+        # percentile over the FULL retained history (~400d) — the 60-row sparkline tail
+        # would cap the window at ~59 prior days and read "100th" after any quiet spell
+        read["pct"] = mentions_pct(ticker_history(ticker, data_dir, tail=None),
+                                   read["mentions"])
         return read
     except Exception:
         return None

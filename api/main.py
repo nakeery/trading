@@ -12,7 +12,8 @@ Run from the repo root: DATA_DIR="data" is cwd-relative, exactly like the CLI an
 import asyncio
 import os
 
-from fastapi import FastAPI, Query
+import pandas as pd
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 
 from api import charts, loaders, reportgen
@@ -74,8 +75,12 @@ async def report(ticker: str,
             bundle = await asyncio.to_thread(reportgen.generate, t, flags)
             if bundle["payload"] is not None:
                 report_cache[key] = bundle
-                reportgen.LATEST[t] = bundle["payload"]
                 evict_ticker(t)
+        if bundle["payload"] is not None:
+            # LATEST must track the report the client is actually looking at — on cache HITS
+            # too, or a flag toggle within the TTL leaves /api/chart drawing the OTHER flag
+            # combo's GEX levels/profile/markers under this report's sections
+            reportgen.LATEST[t] = bundle["payload"]
     diff = None
     payload = bundle["payload"]
     if payload is not None and payload.get("as_of_mode") is None:
@@ -94,12 +99,23 @@ def chart(ticker: str, as_of: str | None = None, start: str | None = None,
     fig is rebuilt server-side per combination; the daily frame underneath is cached.
     Profile/events/GEX levels come from the ticker's LATEST generated payload (S54)."""
     t = ticker.strip().upper()
+    for name, val in (("as_of", as_of), ("start", start)):
+        if val:
+            try:
+                pd.Timestamp(val)
+            except Exception:
+                raise HTTPException(422, f"invalid {name} date: {val!r}")
     ov = tuple(x for x in (s.strip() for s in overlays.split(","))
                if x in charts.OVERLAY_TOKENS)
     asp = tuple(x for x in (s.strip() for s in aspects.split(",")) if x in charts.VP_ASPECTS)
-    out = charts.build_chart(t, payload=reportgen.LATEST.get(t),
-                             as_of=as_of or None, start=start or None,
-                             live=live, overlays=ov, aspects=asp)
+    try:
+        out = charts.build_chart(t, payload=reportgen.LATEST.get(t),
+                                 as_of=as_of or None, start=start or None,
+                                 live=live, overlays=ov, aspects=asp)
+    except Exception as e:
+        # no CSV and no yfinance data for the name — the sibling loaders swallow this
+        # internally; here it must not surface as a 500 traceback
+        raise HTTPException(404, f"no daily data for {t}: {type(e).__name__}")
     return sanitize(out)
 
 
@@ -112,6 +128,7 @@ def iv_history(ticker: str, asof: str | None = None):
     fig = charts.iv_fig(hist) if hist else None
     if fig is None:
         return {"fig": None}
+    fig.update_layout(uirevision=f"{t}|{asof or ''}")   # keep zoom across refetches
     cap = ("ATM IV (30d, harvested) vs HV-20 (realized) · shaded spans = pre-earnings "
            "event-IV stamp windows (S44) · gaps = sessions with no harvest")
     if any(v is not None for v in (hist.get("skew") or [])):
@@ -128,13 +145,17 @@ def tile(ticker: str):
 
 
 @app.get("/api/econ_calendar")
-def econ_calendar(refresh: bool = False):
+async def econ_calendar(refresh: bool = False):
     """Two-month FRED release grid (zero network). `refresh=1` is the ONLY network path:
-    force-refreshes dates + headline prints from FRED first (needs $env:FRED_API_KEY)."""
+    force-refreshes dates + headline prints from FRED first (needs $env:FRED_API_KEY).
+    The refresh runs under GENERATE_LOCK: it captures stdout via the process-global
+    redirect_stdout, and overlapping a generate's capture can permanently swap sys.stdout
+    onto a dead buffer (LIFO restore across threads)."""
     result = None
     if refresh:
-        result = loaders.refresh_econ_calendar()
-    cal = loaders.load_econ_calendar()
+        async with reportgen.GENERATE_LOCK:
+            result = await asyncio.to_thread(loaders.refresh_econ_calendar)
+    cal = await asyncio.to_thread(loaders.load_econ_calendar)
     return sanitize({"calendar": cal, "refresh": result})
 
 

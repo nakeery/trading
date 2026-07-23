@@ -212,3 +212,69 @@ def test_evict_ticker():
     evict_ticker("qqq")
     assert "QQQ" not in frame_cache and "QQQ" not in tile_cache
     assert "AMD" in frame_cache
+
+
+# ── S61 bug-fix regression guards ────────────────────────────────────────────
+def test_sanitize_nat():
+    """pd.NaT subclasses datetime — .isoformat() returns the literal string 'NaT'."""
+    assert sanitize(pd.NaT) is None
+    out = sanitize({"d": pd.NaT, "ok": pd.Timestamp("2026-07-21")})
+    assert out == {"d": None, "ok": "2026-07-21T00:00:00"}
+    json.dumps(out, allow_nan=False)
+
+
+def test_latest_tracks_cache_hits(monkeypatch):
+    """LATEST must follow the report the client is LOOKING at, including cache hits —
+    a flag toggle back within the TTL previously left /api/chart drawing the other
+    combo's payload decorations."""
+    def gen(ticker, flags):
+        marker = "withvol" if flags["vol"] else "novol"
+        return {"payload": fake_payload(marker=marker), "preamble": "", "ansi_html": ""}
+
+    monkeypatch.setattr(reportgen, "generate", gen)
+    client.get("/api/report/FAKE")                       # novol generated
+    client.get("/api/report/FAKE?vol=1")                 # withvol generated
+    assert reportgen.LATEST["FAKE"]["marker"] == "withvol"
+    client.get("/api/report/FAKE")                       # cache HIT on the novol bundle
+    assert reportgen.LATEST["FAKE"]["marker"] == "novol"  # LATEST flipped back with it
+
+
+def test_chart_bad_asof_is_422_not_500():
+    r = client.get("/api/chart/QQQ?as_of=garbage")
+    assert r.status_code == 422
+    r = client.get("/api/chart/QQQ?start=not-a-date")
+    assert r.status_code == 422
+
+
+def test_chart_unknown_ticker_is_404_not_500(monkeypatch):
+    from api import charts
+    def boom(*a, **k):
+        raise FileNotFoundError("no csv, no yfinance data")
+    monkeypatch.setattr(charts, "build_chart", boom)
+    r = client.get("/api/chart/ZZZZFAKE")
+    assert r.status_code == 404
+
+
+def _mini_frame():
+    idx = pd.bdate_range("2026-06-01", periods=30)
+    return pd.DataFrame({"Open": 100.0, "High": 101.0, "Low": 99.0,
+                         "Close": 100.5, "Volume": 1e6}, index=idx)
+
+
+def test_chart_ignores_mismatched_vintage_payload(monkeypatch):
+    """An as-of (backtest) payload stored in LATEST must not decorate a current-mode
+    chart (and vice versa) — historical GEX walls / event markers on today's candles
+    would be silent staleness."""
+    from api import charts
+    monkeypatch.setattr(charts, "chart_frame",
+                        lambda t, a=None, s=None: (_mini_frame(), 20))
+    ev_date = (_mini_frame().index[-1] + pd.Timedelta(days=3)).date().isoformat()
+    earn = {"date": ev_date, "days": 3}
+    # mismatched vintage: as-of payload, current-mode request → decorations dropped
+    out = charts.build_chart("FAKE", payload={"as_of_mode": "2026-06-30", "earn": earn},
+                             overlays=("ma20",))
+    assert not out["fig"]["layout"].get("shapes")
+    # matched vintage → the earnings vline renders
+    out2 = charts.build_chart("FAKE", payload={"as_of_mode": None, "earn": earn},
+                              overlays=("ma20",))
+    assert out2["fig"]["layout"].get("shapes")

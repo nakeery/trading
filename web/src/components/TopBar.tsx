@@ -2,6 +2,7 @@
 // + Run. Controlled component: App owns the state (deep links + debounce + pills live
 // there); flag changes auto-run after a 2s debounce, Run/pills commit immediately.
 import type { Flags, PcOiScope } from '../api/types'
+import { localToday } from '../utils/dates'
 
 const BOOL_FLAGS = ['vol', 'call', 'gex', 'squeeze', 'insider', 'street', 'movers', 'geo', 'live'] as const
 
@@ -17,7 +18,7 @@ export default function TopBar({ ticker, flags, chartFrom, known, onTicker, onFl
   onPill: (t: string) => void
 }) {
   const setFlag = (k: keyof Flags, v: Flags[keyof Flags]) => onFlags({ ...flags, [k]: v })
-  const today = new Date().toISOString().slice(0, 10)
+  const today = localToday() // local tz — UTC would offer tomorrow's date in a US evening
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
@@ -99,7 +100,12 @@ export default function TopBar({ ticker, flags, chartFrom, known, onTicker, onFl
           <input
             type="checkbox"
             checked={flags.as_of != null}
-            onChange={(e) => setFlag('as_of', e.target.checked ? today : null)}
+            onChange={(e) => {
+              setFlag('as_of', e.target.checked ? today : null)
+              // clear the chart-from window with it — its input only renders under as-of,
+              // so an orphaned value would keep the chart clipped with no visible control
+              if (!e.target.checked) onChartFrom(null)
+            }}
           />
           🕰 as-of backtest
         </label>

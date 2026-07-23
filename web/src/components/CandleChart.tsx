@@ -63,11 +63,18 @@ export default function CandleChart({ ticker, payload, asOf, start, live = false
     queryKey: ['chart', ticker, payload.as_of, asOf, start, overlays.sort().join(','),
       on.has('vp') ? [...aspects].sort().join(',') : '', isLive],
     queryFn: async () => {
-      const d = await fetchChart(ticker, {
-        asOf, start, overlays, aspects: on.has('vp') ? [...aspects] : [], live: isLive,
-      })
-      if (isLive) setMisses((m) => (d.live?.found ? 0 : m + 1))
-      return d
+      try {
+        const d = await fetchChart(ticker, {
+          asOf, start, overlays, aspects: on.has('vp') ? [...aspects] : [], live: isLive,
+        })
+        if (isLive) setMisses((m) => (d.live?.found ? 0 : m + 1))
+        return d
+      } catch (e) {
+        // HTTP errors must count toward the backoff too — otherwise a dead endpoint is
+        // polled every 10s all night, the exact scenario the miss counter exists to stop
+        if (isLive) setMisses((m) => m + 1)
+        throw e
+      }
     },
     refetchInterval: isLive && misses < LIVE_MISS_LIMIT ? LIVE_EVERY_MS : false,
   })

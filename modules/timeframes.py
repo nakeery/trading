@@ -185,10 +185,15 @@ def fetch_live_bar(ticker):
         o, h, l, last = q.get("open"), q.get("high"), q.get("low"), q.get("last")
         if any(v is None for v in (o, h, l, last)):
             return None
+        # post-bell the quote carries the OFFICIAL close — use it, not `last`, which keeps
+        # updating on after-hours prints (an AH move would otherwise contaminate a bar
+        # presented as the completed session, and can sit outside the session high/low)
+        official = q.get("close")
         return {"ts": now_et.normalize().tz_localize(None),
-                "Open": float(o), "High": float(h), "Low": float(l), "Close": float(last),
+                "Open": float(o), "High": float(h), "Low": float(l),
+                "Close": float(official) if official is not None else float(last),
                 "Volume": float(q.get("volume") or 0),
-                "in_progress": q.get("close") is None,
+                "in_progress": official is None,
                 "hhmm": now_et.strftime("%H:%M")}
     except Exception:
         return None

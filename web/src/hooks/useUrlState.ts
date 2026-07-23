@@ -4,6 +4,7 @@
 import type { Flags, PcOiScope } from '../api/types'
 import { DEFAULT_FLAGS } from '../api/types'
 import { flagsToParams } from '../api/client'
+import { localToday } from '../utils/dates'
 
 const BOOLS = ['vol', 'call', 'gex', 'squeeze', 'insider', 'street', 'movers', 'geo', 'live'] as const
 
@@ -22,8 +23,9 @@ export function readUrl(): UrlState {
   if (pc && ['all', 'near', 'leaps', 'monthly'].includes(pc)) flags.pc_oi = pc as PcOiScope
   const asof = q.get('asof')
   if (asof) {
-    // clamp to today, mirroring the Streamlit guard
-    const today = new Date().toISOString().slice(0, 10)
+    // clamp to LOCAL today, mirroring the Streamlit guard (UTC "today" is already
+    // tomorrow in a US evening — the clamp would admit a phantom session)
+    const today = localToday()
     flags.as_of = asof > today ? today : asof
     flags.live = false
   }

@@ -24,7 +24,8 @@ def sanitize(obj):
     if isinstance(obj, np.generic):                      # numpy scalar (incl. np.bool_)
         return sanitize(obj.item())
     if isinstance(obj, (pd.Timestamp, _dt.datetime, _dt.date)):
-        return obj.isoformat()
+        # NaTType subclasses datetime and .isoformat() returns the literal string "NaT"
+        return None if pd.isna(obj) else obj.isoformat()
     if isinstance(obj, dict):
         return {str(k): sanitize(v) for k, v in obj.items()}
     if isinstance(obj, (list, tuple, set, frozenset)):

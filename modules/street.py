@@ -17,6 +17,7 @@ None when nothing is available. Caveat printed by the lens: targets follow price
 
 import json
 import logging
+import math
 import os
 import time
 
@@ -35,12 +36,21 @@ def street_read(pt, ud_rows, eps, now=None):
     (yfinance keys: current=SPOT, mean/median/high/low = targets); `ud_rows` =
     [{date, firm, to_grade, action, pt_action}]; `eps` = {period: {current, 30daysAgo, ...}}.
     Returns {} for an ETF/uncovered name (all inputs empty). Offline-testable."""
+    def _num(v):
+        # yfinance can emit NaN here — NaN is truthy, so a bare .get() check lets it print
+        # as "median $nan" and land as an invalid NaN token in the cache JSON
+        try:
+            v = float(v)
+            return v if math.isfinite(v) else None
+        except (TypeError, ValueError):
+            return None
+
     out = {}
-    if pt and pt.get("mean") and pt.get("current"):
-        spot, mean = float(pt["current"]), float(pt["mean"])
-        out["pt"] = {"spot": spot, "mean": mean, "median": pt.get("median"),
-                     "high": pt.get("high"), "low": pt.get("low"),
-                     "upside_mean": mean / spot - 1 if spot else None}
+    spot, mean = _num((pt or {}).get("current")), _num((pt or {}).get("mean"))
+    if spot and mean:
+        out["pt"] = {"spot": spot, "mean": mean, "median": _num(pt.get("median")),
+                     "high": _num(pt.get("high")), "low": _num(pt.get("low")),
+                     "upside_mean": mean / spot - 1}
     revs = []
     for period in ("0q", "+1q", "0y", "+1y"):
         d = (eps or {}).get(period) or {}
