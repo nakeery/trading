@@ -7,7 +7,9 @@ import {
   AMBER, ARROW, BLUE, GRAY, GREEN, HEAT_DEAD, INK, OB, RED,
   heatHex, rsiHex,
 } from '../../utils/colors'
-import { Bullets, Caption, DataTable, Metric, MetricRow, Net, Pill, Sec, Warning } from '../shared'
+import { Bullets, Caption, Collapsible, DataTable, Metric, MetricRow, Net, Pill, Sec, Warning } from '../shared'
+import { BalanceBar, RangeStrip, type StripMarker } from '../viz'
+import { SPOT_GOLD } from '../../utils/plotly'
 
 // ── payload slices (typed just enough for rendering) ─────────────────────────
 interface VolRead {
@@ -186,11 +188,39 @@ export function SecVolumeProfile({ p }: { p: Payload }) {
         <Metric label="Value area" value={`${fmt2(profile.va_low)} – ${fmt2(profile.va_high)}`} />
         <div style={{ marginTop: '1.6em' }}><Pill text={locTxt} color={locCol} /></div>
       </MetricRow>
-      <Caption>HVN shelves — above price: {lv(above)}  ·  below price: {lv(below)}</Caption>
-      <Caption>
-        LVN gaps: {lv(profile.lvns ?? [])}   ·   drawn on the chart via the "vol profile"
-        toggle above
-      </Caption>
+      {(() => {
+        // level strip: value area band + POC/price markers, HVN shelves, LVN gaps (S61)
+        const lvns = profile.lvns ?? []
+        const all = [profile.va_low, profile.va_high, poc, price, ...hvns, ...lvns]
+          .filter((v): v is number => v != null && isFinite(v))
+        if (!all.length) return null
+        const span = Math.max(...all) - Math.min(...all) || 1
+        const [lo, hi] = [Math.min(...all) - span * 0.03, Math.max(...all) + span * 0.03]
+        const markers: StripMarker[] = [
+          ...(poc != null ? [{ value: poc, label: 'POC', color: AMBER, shape: 'line' as const }] : []),
+          ...(price != null ? [{ value: price, label: fmt2(price), color: SPOT_GOLD, shape: 'tri' as const }] : []),
+          ...hvns.map((h) => ({ value: h, color: '#9fb4d0', shape: 'dot' as const })),
+          ...lvns.map((l) => ({ value: l, shape: 'tick' as const })),
+        ]
+        return (
+          <>
+            <RangeStrip lo={lo} hi={hi} width={520}
+              bands={[{ from: profile.va_low, to: profile.va_high, color: 'rgba(78,163,216,0.15)' }]}
+              markers={markers} />
+            <Caption>
+              blue band = value area · ▲ = price · dots = HVN shelves · ticks = LVN gaps ·
+              drawn on the chart via the "vol profile" toggle above
+            </Caption>
+          </>
+        )
+      })()}
+      <Collapsible title="levels detail (HVN shelves · LVN gaps)">
+        <Caption>HVN shelves — above price: {lv(above)}  ·  below price: {lv(below)}</Caption>
+        <Caption>
+          LVN gaps: {lv(profile.lvns ?? [])}   ·   drawn on the chart via the "vol profile"
+          toggle above
+        </Caption>
+      </Collapsible>
     </>
   )
 }
@@ -217,20 +247,26 @@ export function SecRisk({ p }: { p: Payload }) {
           {reg.note && <Caption>↳ {reg.note}</Caption>}
         </div>
       )}
-      <div style={{ display: 'flex', gap: 32, flexWrap: 'wrap' }}>
-        {!!risk.drawdown?.length && (
-          <div style={{ flex: 1, minWidth: 320 }}>
-            <div style={{ color: RED, fontWeight: 600, marginTop: 6 }}>drawdown-risk factors</div>
-            <Bullets items={risk.drawdown} />
+      <BalanceBar left={risk.drawdown?.length ?? 0} right={risk.rally?.length ?? 0}
+        leftLabel="drawdown-risk" rightLabel="rally-favorable" leftColor={RED} rightColor={GREEN} />
+      {((risk.drawdown?.length ?? 0) + (risk.rally?.length ?? 0)) > 0 && (
+        <Collapsible title={`factor details (${risk.drawdown?.length ?? 0} drawdown · ${risk.rally?.length ?? 0} rally)`}>
+          <div style={{ display: 'flex', gap: 32, flexWrap: 'wrap' }}>
+            {!!risk.drawdown?.length && (
+              <div style={{ flex: 1, minWidth: 320 }}>
+                <div style={{ color: RED, fontWeight: 600, marginTop: 6 }}>drawdown-risk factors</div>
+                <Bullets items={risk.drawdown} />
+              </div>
+            )}
+            {!!risk.rally?.length && (
+              <div style={{ flex: 1, minWidth: 320 }}>
+                <div style={{ color: GREEN, fontWeight: 600, marginTop: 6 }}>rally-favorable factors</div>
+                <Bullets items={risk.rally} />
+              </div>
+            )}
           </div>
-        )}
-        {!!risk.rally?.length && (
-          <div style={{ flex: 1, minWidth: 320 }}>
-            <div style={{ color: GREEN, fontWeight: 600, marginTop: 6 }}>rally-favorable factors</div>
-            <Bullets items={risk.rally} />
-          </div>
-        )}
-      </div>
+        </Collapsible>
+      )}
     </>
   )
 }

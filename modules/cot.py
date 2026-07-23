@@ -98,23 +98,28 @@ def fetch_cot(data_dir="data", ttl_hours=TTL_HOURS):
                 return json.load(f)
     except Exception:
         pass
-    out = {}
+    prior = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            prior = json.load(f) or {}
+    except Exception:
+        pass
+    fresh = {}
     for sym, name in CONTRACTS.items():
         try:
-            read = parse_cot(_fetch_contract(name))
+            fresh[sym] = parse_cot(_fetch_contract(name))
         except Exception:
-            read = None
-        if read:
-            out[sym] = read
-    if out:
+            fresh[sym] = None
+    # per-contract stale fallback (marketsent pattern) — a partial fetch must not evict the
+    # contracts that failed this run from the cache (they'd vanish from every future fallback)
+    out = {sym: fresh.get(sym) or prior.get(sym) for sym in CONTRACTS}
+    out = {k: v for k, v in out.items() if v}
+    if any(fresh.values()):
+        # write only when something fetched fresh — an all-fail rewrite would bump the file
+        # mtime and suppress the retry for another TTL window
         try:
             with open(path, "w", encoding="utf-8") as f:
                 json.dump(out, f)
         except Exception:
             pass
-        return out
-    try:
-        with open(path, encoding="utf-8") as f:
-            return json.load(f)                      # stale fallback beats nothing
-    except Exception:
-        return None
+    return out or None

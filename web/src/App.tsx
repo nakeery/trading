@@ -54,7 +54,15 @@ export default function App() {
     setPendingIn(true)
     const t = setTimeout(() => {
       setPendingIn(false)
-      setReq({ ticker, flags, force: false, nonce: req?.nonce ?? 0 })
+      // functional update, re-checked at FIRE time: clicking Run doesn't change the draft, so
+      // this timer keeps ticking with a stale closure — committing unconditionally would
+      // overwrite Run's force-nonce request with a non-forced twin ~2s later (served from the
+      // server's 120s cache, silently replacing the force-refreshed data)
+      setReq((prev) => {
+        const prevKey = prev ? `${prev.ticker}|${flagsToParams(prev.flags).toString()}` : ''
+        if (prevKey === draftKey) return prev // Run/pill already committed this exact draft
+        return { ticker, flags, force: false, nonce: prev?.nonce ?? 0 }
+      })
     }, DEBOUNCE_MS)
     return () => clearTimeout(t)
     // eslint-disable-next-line react-hooks/exhaustive-deps

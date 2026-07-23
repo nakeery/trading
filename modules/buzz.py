@@ -122,7 +122,10 @@ def _load_results(data_dir, ttl_hours):
             if len(batch) < 100:
                 break
     except Exception:
-        results = results or None
+        # a mid-pagination failure leaves a TRUNCATED list — caching it would serve a partial
+        # feed for 6h and manufacture false "unranked" reads for tickers on the missing pages;
+        # discard and fall through to the stale cache instead
+        results = None
     if results:
         try:
             with open(path, "w", encoding="utf-8") as f:

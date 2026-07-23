@@ -2,7 +2,9 @@
 // quote tables with at-ask honesty lines, expected-move tiles, IV-by-expiry curve).
 import type { Payload, PlotlyFig } from '../../api/types'
 import { AMBER, BLUE, GRAY, GREEN, RED, ordinalPercentile } from '../../utils/colors'
-import { Bullets, Caption, DataTable, Metric, MetricRow, Net, Pill, Sec, Warning } from '../shared'
+import { DARK_LAYOUT, SPOT_GOLD } from '../../utils/plotly'
+import { Bullets, Caption, Collapsible, DataTable, Metric, MetricRow, Net, Pill, Sec, Warning } from '../shared'
+import { BalanceBar, RangeStrip } from '../viz'
 import type { Gauge } from './gauges'
 import Plot from '../Plot'
 
@@ -96,6 +98,36 @@ export function SecVol({ p }: { p: Payload }) {
           )}
         </MetricRow>
       )}
+      {em && (() => {
+        // EM band strip (S61): the IV-implied ±move vs the realized-vol band on one axis.
+        // lo + hi = 2·spot exactly (symmetric bands), so the midpoint IS spot when the
+        // live quote is absent.
+        const spot = q?.spot ?? (em.lo + em.hi) / 2
+        const hvLo = em.hv_pct != null ? spot * (1 - em.hv_pct) : null
+        const hvHi = em.hv_pct != null ? spot * (1 + em.hv_pct) : null
+        const all = [em.lo, em.hi, hvLo, hvHi].filter((v): v is number => v != null)
+        const span = Math.max(...all) - Math.min(...all) || 1
+        return (
+          <>
+            <RangeStrip
+              lo={Math.min(...all) - span * 0.06} hi={Math.max(...all) + span * 0.06} width={520}
+              bands={[
+                { from: em.lo, to: em.hi, color: 'rgba(78,163,216,0.15)' },
+                ...(hvLo != null && hvHi != null
+                  ? [{ from: hvLo, to: hvHi, color: 'rgba(154,164,178,0.12)' }] : []),
+              ]}
+              markers={[
+                { value: em.lo, label: `−${(em.pct * 100).toFixed(1)}%`, color: BLUE, shape: 'line' },
+                { value: em.hi, label: `+${(em.pct * 100).toFixed(1)}%`, color: BLUE, shape: 'line' },
+                { value: spot, label: 'spot', color: SPOT_GOLD, shape: 'tri' },
+              ]} />
+            <Caption>
+              blue band = expected move (±{(em.pct * 100).toFixed(1)}%, ~{em.dte}d)
+              {em.hv_pct != null ? ` · gray band = realized HV (±${(em.hv_pct * 100).toFixed(1)}%)` : ''}
+            </Caption>
+          </>
+        )
+      })()}
       {eg?.date && (
         <Caption>
           earnings: {eg.date} ({eg.days}d{eg.hist_move ? `, typ. ±${(eg.hist_move * 100).toFixed(1)}%` : ''})
@@ -110,26 +142,31 @@ export function SecVol({ p }: { p: Payload }) {
       )}
       <Net label="NET" text={s.net ?? 'n/a'} />
       {(s.notes ?? []).map((n, i) => <Caption key={i}>· {n}</Caption>)}
-      <div style={{ display: 'flex', gap: 32, flexWrap: 'wrap' }}>
-        {!!s.long_vol?.length && (
-          <div style={{ flex: 1, minWidth: 320 }}>
-            <div style={{ color: GREEN, fontWeight: 600 }}>favors BUYING vol</div>
-            <Bullets items={s.long_vol} />
+      <BalanceBar left={s.long_vol?.length ?? 0} right={s.short_vol?.length ?? 0}
+        leftLabel="buy vol" rightLabel="sell premium" leftColor={GREEN} rightColor={RED} />
+      {((s.long_vol?.length ?? 0) + (s.short_vol?.length ?? 0)) > 0 && (
+        <Collapsible title={`vol factors (${s.long_vol?.length ?? 0} buy · ${s.short_vol?.length ?? 0} sell)`}>
+          <div style={{ display: 'flex', gap: 32, flexWrap: 'wrap' }}>
+            {!!s.long_vol?.length && (
+              <div style={{ flex: 1, minWidth: 320 }}>
+                <div style={{ color: GREEN, fontWeight: 600 }}>favors BUYING vol</div>
+                <Bullets items={s.long_vol} />
+              </div>
+            )}
+            {!!s.short_vol?.length && (
+              <div style={{ flex: 1, minWidth: 320 }}>
+                <div style={{ color: RED, fontWeight: 600 }}>favors SELLING premium</div>
+                <Bullets items={s.short_vol} />
+              </div>
+            )}
           </div>
-        )}
-        {!!s.short_vol?.length && (
-          <div style={{ flex: 1, minWidth: 320 }}>
-            <div style={{ color: RED, fontWeight: 600 }}>favors SELLING premium</div>
-            <Bullets items={s.short_vol} />
-          </div>
-        )}
-      </div>
+        </Collapsible>
+      )}
       {s.hint && <Caption>{s.hint}</Caption>}
       {q?.quotes?.length ? (
-        <>
-          <div style={{ fontWeight: 600, margin: '8px 0 2px' }}>
-            live quote — spot {q.spot.toFixed(2)}, as of {q.as_of_str}{q.stale ? '  (stale)' : ''}
-          </div>
+        <Collapsible
+          title={`straddle/strangle quotes — spot ${q.spot.toFixed(2)}, as of ${q.as_of_str}${q.stale ? '  (stale)' : ''}`}
+        >
           {(q.notes ?? []).map((n, i) => <Caption key={i}>· {n}</Caption>)}
           {q.quotes.map((blk, bi) => {
             const rows: Record<string, string>[] = []
@@ -182,7 +219,7 @@ export function SecVol({ p }: { p: Payload }) {
             vega: straddle = max vega (enter close to the print) · strangle = cheaper + lower
             theta (enter earlier / run more names / vega convexity)
           </Caption>
-        </>
+        </Collapsible>
       ) : null}
     </>
   )
@@ -254,7 +291,7 @@ export function SecCall({ p }: { p: Payload }) {
           mode: 'lines+markers', line: { color: BLUE, width: 2 }, marker: { size: 8, color: BLUE },
         }],
         layout: {
-          template: 'plotly_dark', paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(14,17,23,1)',
+          ...DARK_LAYOUT,
           height: 220, margin: { l: 10, r: 10, t: 24, b: 10 },
           yaxis: { title: { text: 'ATM IV %' } },
           title: { text: `IV by expiry — ${curve.tag ?? ''}`, font: { size: 13 } },

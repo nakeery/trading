@@ -7,13 +7,10 @@ import {
   BLUE, GOLD, GRAY, GREEN, INK, LEAPS_MAX_DTE, LEAPS_MIN_DTE, RED,
   ordinalPercentile, pcLabel,
 } from '../../utils/colors'
-import { Bullets, Caption, DataTable, Metric, MetricRow, Net, Pill, Sec } from '../shared'
+import { Bullets, Caption, Collapsible, DataTable, Metric, MetricRow, Net, Pill, Sec } from '../shared'
+import { DARK_LAYOUT, SPOT_GOLD } from '../../utils/plotly'
+import { BalanceBar, PctBar, RangeStrip } from '../viz'
 import Plot from '../Plot'
-
-const DARK_LAYOUT = {
-  template: 'plotly_dark', paper_bgcolor: 'rgba(0,0,0,0)', plot_bgcolor: 'rgba(14,17,23,1)',
-  margin: { l: 10, r: 10, t: 10, b: 10 },
-}
 
 // ── PUT/CALL OI ──────────────────────────────────────────────────────────────
 interface PcRow {
@@ -99,9 +96,9 @@ function strikeWallsFig(pc: Pc): PlotlyFig | null {
       legend: { orientation: 'h', y: 1.04, x: 0, font: { size: 11 } },
       xaxis: { showticklabels: false, title: { text: '← puts   ·   calls →', font: { size: 11 } } },
       yaxis: { title: { text: 'strike', font: { size: 11 } } },
-      shapes: spot ? [{ type: 'line', xref: 'paper', x0: 0, x1: 1, y0: spot, y1: spot, line: { dash: 'dot', width: 1, color: '#e8c547' } }] : [],
+      shapes: spot ? [{ type: 'line', xref: 'paper', x0: 0, x1: 1, y0: spot, y1: spot, line: { dash: 'dot', width: 1, color: SPOT_GOLD } }] : [],
       annotations: [
-        ...(spot ? [{ x: 1, xref: 'paper', xanchor: 'left', y: spot, text: `spot ${spot.toFixed(2)}`, showarrow: false, font: { color: '#e8c547', size: 10 } }] : []),
+        ...(spot ? [{ x: 1, xref: 'paper', xanchor: 'left', y: spot, text: `spot ${spot.toFixed(2)}`, showarrow: false, font: { color: SPOT_GOLD, size: 10 } }] : []),
         { y: wallC, x: 0, text: `call wall ${wallC}`, showarrow: false, xanchor: 'center', font: { color: GREEN, size: 10 }, bgcolor: 'rgba(14,17,23,0.75)' },
         { y: wallP, x: 0, text: `put wall ${wallP}`, showarrow: false, xanchor: 'center', font: { color: RED, size: 10 }, bgcolor: 'rgba(14,17,23,0.75)' },
       ],
@@ -219,11 +216,11 @@ export function SecGex({ p }: { p: Payload }) {
       legend: { orientation: 'h', y: 1.08, x: 0, font: { size: 11 } },
       shapes: [
         { type: 'line', xref: 'paper', x0: 0, x1: 1, y0: 0, y1: 0, line: { width: 0.8, color: '#4a5160' } },
-        ...(g.spot ? [{ type: 'line', yref: 'paper', y0: 0, y1: 1, x0: g.spot, x1: g.spot, line: { dash: 'dot', width: 1, color: '#e8c547' } }] : []),
+        ...(g.spot ? [{ type: 'line', yref: 'paper', y0: 0, y1: 1, x0: g.spot, x1: g.spot, line: { dash: 'dot', width: 1, color: SPOT_GOLD } }] : []),
         ...(g.zero_gamma != null ? [{ type: 'line', yref: 'paper', y0: 0, y1: 1, x0: g.zero_gamma, x1: g.zero_gamma, line: { dash: 'dash', width: 1, color: GOLD } }] : []),
       ],
       annotations: [
-        ...(g.spot ? [{ x: g.spot, yref: 'paper', y: 1, text: 'spot', showarrow: false, font: { color: '#e8c547', size: 10 } }] : []),
+        ...(g.spot ? [{ x: g.spot, yref: 'paper', y: 1, text: 'spot', showarrow: false, font: { color: SPOT_GOLD, size: 10 } }] : []),
         ...(g.zero_gamma != null ? [{ x: g.zero_gamma, yref: 'paper', y: 0, yanchor: 'bottom', text: 'zero-γ', showarrow: false, font: { color: GOLD, size: 10 } }] : []),
       ],
     },
@@ -313,11 +310,15 @@ export function SecSqueeze({ p }: { p: Payload }) {
           <Caption>short interest n/a — no data from the NASDAQ API or FINRA's consolidated feed</Caption>
         )}
         {sv.now != null && (
-          <Metric
-            label="Short-volume (latest)" value={`${(sv.now * 100).toFixed(0)}%`}
-            delta={sv.pct != null ? `${ordinalPercentile(sv.pct)} of ${sv.n} sessions` : null}
-            deltaColor="off"
-          />
+          <div>
+            <Metric label="Short-volume (latest)" value={`${(sv.now * 100).toFixed(0)}%`} />
+            {sv.pct != null && (
+              <div style={{ fontSize: 12.5, color: 'var(--faint)', display: 'flex', alignItems: 'center', gap: 6 }}>
+                <PctBar pct={sv.pct} width={70} showText={false} />
+                {ordinalPercentile(sv.pct)} of {sv.n} sessions
+              </div>
+            )}
+          </div>
         )}
       </MetricRow>
       {sv.avg5 != null && sv.avg20 != null && (
@@ -332,21 +333,27 @@ export function SecSqueeze({ p }: { p: Payload }) {
         </div>
       )}
       <Net label="NET" text={read.net ?? 'n/a'} />
-      <div style={{ display: 'flex', gap: 32, flexWrap: 'wrap' }}>
-        {!!read.fuel?.length && (
-          <div style={{ flex: 1, minWidth: 320 }}>
-            <div style={{ color: GREEN, fontWeight: 600 }}>squeeze fuel</div>
-            <Bullets items={read.fuel} />
+      <BalanceBar left={read.fuel?.length ?? 0} right={read.counter?.length ?? 0}
+        leftLabel="squeeze fuel" rightLabel="counter" leftColor={GREEN} rightColor={RED} />
+      {((read.fuel?.length ?? 0) + (read.counter?.length ?? 0)) > 0 && (
+        <Collapsible title={`squeeze factors (${read.fuel?.length ?? 0} fuel · ${read.counter?.length ?? 0} counter)`}>
+          <div style={{ display: 'flex', gap: 32, flexWrap: 'wrap' }}>
+            {!!read.fuel?.length && (
+              <div style={{ flex: 1, minWidth: 320 }}>
+                <div style={{ color: GREEN, fontWeight: 600 }}>squeeze fuel</div>
+                <Bullets items={read.fuel} />
+              </div>
+            )}
+            {!!read.counter?.length && (
+              <div style={{ flex: 1, minWidth: 320 }}>
+                <div style={{ color: RED, fontWeight: 600 }}>counter</div>
+                <Bullets items={read.counter} />
+              </div>
+            )}
           </div>
-        )}
-        {!!read.counter?.length && (
-          <div style={{ flex: 1, minWidth: 320 }}>
-            <div style={{ color: RED, fontWeight: 600 }}>counter</div>
-            <Bullets items={read.counter} />
-          </div>
-        )}
-      </div>
-      {(read.caveats ?? []).map((c, i) => <Caption key={i}>· {c}</Caption>)}
+          {(read.caveats ?? []).map((c, i) => <Caption key={i}>· {c}</Caption>)}
+        </Collapsible>
+      )}
       {bz && <Caption>· buzz = attention, not direction — crowded names gap on headlines both ways</Caption>}
     </>
   )
@@ -433,9 +440,15 @@ export function SecInsider({ p }: { p: Payload }) {
         </Caption>
       )}
       <Net label="NET" text={rd.net ?? 'n/a'} />
-      <Bullets items={rd.positive} color={GREEN} />
-      <Bullets items={rd.flags} color="var(--amber)" marker="⚑" />
-      {(rd.caveats ?? []).map((c, i) => <Caption key={i}>· {c}</Caption>)}
+      <BalanceBar left={rd.n_buys ?? 0} right={rd.n_sells ?? 0}
+        leftLabel="buys" rightLabel="sells" leftColor={GREEN} rightColor={RED} />
+      {((rd.positive?.length ?? 0) + (rd.flags?.length ?? 0) + (rd.caveats?.length ?? 0)) > 0 && (
+        <Collapsible title="insider detail">
+          <Bullets items={rd.positive} color={GREEN} />
+          <Bullets items={rd.flags} color="var(--amber)" marker="⚑" />
+          {(rd.caveats ?? []).map((c, i) => <Caption key={i}>· {c}</Caption>)}
+        </Collapsible>
+      )}
     </>
   )
 }
@@ -488,15 +501,40 @@ export function SecStreet({ p }: { p: Payload }) {
       ) : (
         <Caption>no analyst coverage data (ETF or uncovered name) — headlines only</Caption>
       )}
-      {news.map((n, i) => (
-        <div key={i} style={{ margin: '2px 0', color: INK }}>
-          · <span style={{ color: GRAY }}>{n.when}</span>{' '}
-          {n.url
-            ? <a href={n.url} target="_blank" rel="noreferrer" style={{ color: INK }}>{n.title}</a>
-            : n.title}{' '}
-          <span style={{ color: GRAY }}>({n.provider})</span>
-        </div>
-      ))}
+      {pt && pt.low != null && pt.high != null && (() => {
+        // PT range strip (S61): where spot sits inside the analyst low–high range. The
+        // domain includes spot — a spot beyond the range IS the stale-ink tell.
+        const all = [pt.low, pt.high, pt.spot, pt.mean]
+        const span = Math.max(...all) - Math.min(...all) || 1
+        return (
+          <RangeStrip
+            lo={Math.min(...all) - span * 0.05} hi={Math.max(...all) + span * 0.05} width={520}
+            bands={[{ from: pt.low, to: pt.high, color: 'rgba(154,164,178,0.12)' }]}
+            markers={[
+              { value: pt.mean, label: `mean ${Math.round(pt.mean)}`, color: pt.upside_mean >= 0 ? GREEN : RED, shape: 'line' },
+              ...(pt.median != null ? [{ value: pt.median, label: `med ${Math.round(pt.median)}`, color: GRAY, shape: 'line' as const }] : []),
+              { value: pt.spot, label: `spot ${pt.spot.toFixed(0)}`, color: SPOT_GOLD, shape: 'tri' },
+            ]}
+            fmt={(v) => `$${Math.round(v)}`} />
+        )
+      })()}
+      {ud && (
+        <BalanceBar left={ud.n_up} right={ud.n_down}
+          leftLabel="↑ upgrades" rightLabel="↓ downgrades" leftColor={GREEN} rightColor={RED} />
+      )}
+      {news.length > 0 && (
+        <Collapsible title={`headlines (${news.length})`}>
+          {news.map((n, i) => (
+            <div key={i} style={{ margin: '2px 0', color: INK }}>
+              · <span style={{ color: GRAY }}>{n.when}</span>{' '}
+              {n.url
+                ? <a href={n.url} target="_blank" rel="noreferrer" style={{ color: INK }}>{n.title}</a>
+                : n.title}{' '}
+              <span style={{ color: GRAY }}>({n.provider})</span>
+            </div>
+          ))}
+        </Collapsible>
+      )}
       {pt && (
         <Caption>
           · targets follow price — a wide "upside" right after a selloff is stale ink, not a signal

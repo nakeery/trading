@@ -10,7 +10,7 @@ import {
 import { SecGeo, SecOptions } from './gauges'
 import { SecBuzz, SecGex, SecInsider, SecPcOi, SecSqueeze, SecStreet } from './positioning'
 import { SecCall, SecVol } from './volcall'
-import { SecCatalysts, SecMacro, SecNotes, SecSectors, SecThesis } from './misc'
+import { SecEvents, SecNotes, SecSectors, SecThesis } from './misc'
 
 // print_report order (sec_header is rendered by the chart block instead — skip_header)
 const SECTIONS: [string, ({ p }: { p: Payload }) => React.ReactElement | null][] = [
@@ -31,8 +31,7 @@ const SECTIONS: [string, ({ p }: { p: Payload }) => React.ReactElement | null][]
   ['long call viability', SecCall],
   ['geo backdrop', SecGeo],
   ['sector rotation', SecSectors],
-  ['known catalysts', SecCatalysts],
-  ['macro', SecMacro],
+  ['upcoming events', SecEvents], // S61 — merges the catalysts + macro tables onto one timeline
   ['thesis check', SecThesis],
   ['notes', SecNotes],
 ]
@@ -68,7 +67,9 @@ const NAV: [string, string, (p: Payload) => unknown][] = [
   ['Geo backdrop', 'geopolitical-cross-asset-backdrop', (p) => p.geo],
   ['Sector rotation', 'sector-rotation', (p) => p.sectors],
   // NB: [] is truthy in JS (falsy in Python) — length-check array-valued sections
-  ['Known catalysts', 'known-catalysts', (p) => (p.cats as unknown[] | null)?.length],
+  ['Upcoming events', 'upcoming-events',
+    (p) => (p.cats as unknown[] | null)?.length || p.earn || p.exd
+      || Object.keys((p.macro_events as object | null) ?? {}).length],
 ]
 
 export function SectionNav({ p }: { p: Payload }) {

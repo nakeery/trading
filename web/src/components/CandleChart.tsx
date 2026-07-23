@@ -5,7 +5,7 @@
 // Live mode: the query polls every 10s with live=1 — each tick fetches ONE Tradier quote
 // server-side and appends it as a provisional today-bar; after LIVE_MISS_LIMIT consecutive
 // empty quotes polling pauses (market closed / no token — don't hit Tradier all night).
-import { useRef, useState } from 'react'
+import { useState } from 'react'
 import { useQuery } from '@tanstack/react-query'
 import { fetchChart } from '../api/client'
 import type { Payload } from '../api/types'
@@ -36,7 +36,11 @@ export default function CandleChart({ ticker, payload, asOf, start, live = false
   start?: string | null
   live?: boolean
 }) {
-  const misses = useRef(0)
+  // state, NOT a ref: an empty-quote poll returns a structurally identical response, so
+  // TanStack never re-renders the component — a ref counter would leave refetchInterval
+  // un-re-evaluated and the backoff could never engage (polling all night, the exact
+  // scenario this exists for)
+  const [misses, setMisses] = useState(0)
   const [on, setOn] = useState<Set<string>>(
     () => new Set(OVERLAYS.filter((o) => o.default).map((o) => o.token)),
   )
@@ -62,10 +66,10 @@ export default function CandleChart({ ticker, payload, asOf, start, live = false
       const d = await fetchChart(ticker, {
         asOf, start, overlays, aspects: on.has('vp') ? [...aspects] : [], live: isLive,
       })
-      if (isLive) misses.current = d.live?.found ? 0 : misses.current + 1
+      if (isLive) setMisses((m) => (d.live?.found ? 0 : m + 1))
       return d
     },
-    refetchInterval: isLive && misses.current < LIVE_MISS_LIMIT ? LIVE_EVERY_MS : false,
+    refetchInterval: isLive && misses < LIVE_MISS_LIMIT ? LIVE_EVERY_MS : false,
   })
   const liveInfo = chart.data?.live ?? null
 
@@ -81,7 +85,7 @@ export default function CandleChart({ ticker, payload, asOf, start, live = false
       )}
       {isLive && liveInfo && !liveInfo.found && (
         <div style={{ color: 'var(--faint)', fontSize: 13.5, margin: '2px 0' }}>
-          {misses.current >= LIVE_MISS_LIMIT
+          {misses >= LIVE_MISS_LIMIT
             ? `live: polling paused after ${LIVE_MISS_LIMIT} empty Tradier responses (market closed / no token?) — showing last close; Run resumes`
             : 'live: no Tradier session data right now (market closed / no token?) — showing last close'}
         </div>

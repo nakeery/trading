@@ -23,6 +23,18 @@ HORIZONS = (15, 63)          # sessions — Phase 2 / Phase 2B forward windows
 MIN_SCORED_NOTE = 10         # below this many scored rows, print the small-sample caveat
 
 
+def _thresh(v):
+    """Stamped threshold cell → positive float, or None when missing/NaN/0 (row scores as
+    unscored '—', never a fake loss — float('nan' or 0) is NaN and NaN comparisons are False)."""
+    try:
+        if v is None or pd.isna(v):
+            return None
+        f = float(v)
+        return f if f else None
+    except (TypeError, ValueError):
+        return None
+
+
 def _fwd(close, i, n):
     """Return over n SESSIONS from position i (close-to-close), or None when the window
     extends past the data."""
@@ -63,8 +75,8 @@ def score(ticker, data_dir="data"):
                 fwd15 = fwd63 = None
             else:
                 fwd15, fwd63 = _fwd(close, pos, 15), _fwd(close, pos, 63)
-            th15 = float(r.get("win_threshold") or 0) or None
-            th63 = float(r.get("win_threshold_63") or 0) or None
+            th15 = _thresh(r.get("win_threshold"))
+            th63 = _thresh(r.get("win_threshold_63"))
             rows.append({
                 "date": d.date().isoformat(), "signal": str(r.get("signal", "")),
                 "fwd15": fwd15, "win15": (fwd15 >= th15) if (fwd15 is not None and th15) else None,

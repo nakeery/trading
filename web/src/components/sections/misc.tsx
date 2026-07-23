@@ -1,9 +1,13 @@
-// SECTOR ROTATION, KNOWN CATALYSTS, MACRO (next 10d), THESIS CHECK, notes — ports of the
-// same-named sec_* renderers.
+// SECTOR ROTATION (RRG quadrant scatter), UPCOMING EVENTS (merged catalysts/macro/earnings
+// timeline), THESIS CHECK, notes — ports of the same-named sec_* renderers, visual-first
+// since S61 (tables fold into expanders, nothing dropped).
 import type { CSSProperties } from 'react'
-import type { Payload } from '../../api/types'
+import type { Payload, PlotlyFig } from '../../api/types'
 import { AMBER, BLUE, GRAY, GREEN, RED } from '../../utils/colors'
-import { Bullets, Caption, DataTable, Sec, Warning } from '../shared'
+import { DARK_LAYOUT, SPOT_GOLD } from '../../utils/plotly'
+import { Bullets, Caption, Collapsible, DataTable, Sec, Warning } from '../shared'
+import { BalanceBar, TimelineStrip, type TimelineEvent } from '../viz'
+import Plot from '../Plot'
 
 const pctS = (v: number) => `${v >= 0 ? '+' : ''}${(v * 100).toFixed(1)}%`
 
@@ -25,6 +29,70 @@ interface Sectors {
 
 const TAG_COLOR: Record<string, string> = {
   leading: GREEN, improving: BLUE, weakening: AMBER, lagging: RED,
+}
+
+/** RRG-style quadrant scatter: x = 63d RS (the ranking horizon), y = 20d RS (recent
+ *  momentum) — quadrant signs then match the tag definitions exactly. */
+function rrgFig(rows: SectorRow[], own?: string | null): PlotlyFig | null {
+  const pts = rows.filter((r): r is SectorRow & { rel_63d: number } => r.rel_63d != null)
+  if (!pts.length) return null
+  const maxAbs = Math.max(...pts.map((r) => Math.max(Math.abs(r.rel_63d), Math.abs(r.rel_20d))))
+  const R = Math.max(0.02, maxAbs * 1.2)
+  const data = Object.keys(TAG_COLOR)
+    .map((tag) => {
+      const sub = pts.filter((r) => r.tag === tag)
+      return {
+        type: 'scatter', mode: 'markers+text', name: tag,
+        x: sub.map((r) => r.rel_63d), y: sub.map((r) => r.rel_20d),
+        text: sub.map((r) => (own && r.sym === own ? `► ${r.sym}` : r.sym)),
+        textposition: 'top center',
+        textfont: { size: 10.5, color: TAG_COLOR[tag] },
+        marker: {
+          size: sub.map((r) => (own && r.sym === own ? 12 : 9)),
+          color: TAG_COLOR[tag],
+          line: { width: sub.map((r) => (own && r.sym === own ? 2 : 0)), color: SPOT_GOLD },
+        },
+        customdata: sub.map((r) => [r.name, r.tag]),
+        hovertemplate: '<b>%{customdata[0]}</b><br>63d %{x:+.1%} · 20d %{y:+.1%} · %{customdata[1]}<extra></extra>',
+      }
+    })
+    .filter((t) => t.x.length)
+  const hexA = (hex: string, a: number) => {
+    const n = parseInt(hex.slice(1), 16)
+    return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${a})`
+  }
+  const quad = (x0: number, x1: number, y0: number, y1: number, fill: string) => ({
+    type: 'rect', x0, x1, y0, y1, line: { width: 0 }, fillcolor: fill, layer: 'below',
+  })
+  return {
+    data,
+    layout: {
+      ...DARK_LAYOUT, height: 380, showlegend: false,
+      margin: { l: 10, r: 10, t: 18, b: 10 },
+      xaxis: { title: { text: 'RS vs SPY — 63d', font: { size: 11 } }, tickformat: '+.0%', range: [-R, R], zeroline: false },
+      yaxis: { title: { text: '20d', font: { size: 11 } }, tickformat: '+.0%', range: [-R, R], zeroline: false },
+      shapes: [
+        quad(0, R, 0, R, hexA(GREEN, 0.05)),
+        quad(-R, 0, 0, R, hexA(BLUE, 0.05)),
+        quad(0, R, -R, 0, hexA(AMBER, 0.05)),
+        quad(-R, 0, -R, 0, hexA(RED, 0.05)),
+        // the ±0.5% flat band the table's tint also uses — inside it, RS is noise
+        { type: 'rect', x0: -0.005, x1: 0.005, y0: -R, y1: R, line: { width: 0 }, fillcolor: 'rgba(154,164,178,0.06)', layer: 'below' },
+        { type: 'rect', x0: -R, x1: R, y0: -0.005, y1: 0.005, line: { width: 0 }, fillcolor: 'rgba(154,164,178,0.06)', layer: 'below' },
+        { type: 'line', x0: 0, x1: 0, y0: -R, y1: R, line: { width: 0.8, color: '#4a5160' } },
+        { type: 'line', x0: -R, x1: R, y0: 0, y1: 0, line: { width: 0.8, color: '#4a5160' } },
+      ],
+      annotations: ([
+        ['leading', 0.99, 0.99, 'right', 'top'],
+        ['improving', 0.01, 0.99, 'left', 'top'],
+        ['weakening', 0.99, 0.01, 'right', 'bottom'],
+        ['lagging', 0.01, 0.01, 'left', 'bottom'],
+      ] as const).map(([tag, ax, ay, xa, ya]) => ({
+        xref: 'paper', yref: 'paper', x: ax, y: ay, xanchor: xa, yanchor: ya,
+        text: tag, showarrow: false, font: { size: 10, color: TAG_COLOR[tag] }, opacity: 0.8,
+      })),
+    },
+  }
 }
 
 export function SecSectors({ p }: { p: Payload }) {
@@ -53,79 +121,118 @@ export function SecSectors({ p }: { p: Payload }) {
     v == null || Math.abs(v) <= 0.005 ? undefined // mirror the CLI ±0.5% noise band
       : { color: v > 0 ? GREEN : RED, fontWeight: 600 }
   const ownRow = own ? rows.find((r) => r.sym === own) : null
+  const fig = rrgFig(rows, own)
   return (
     <>
       <Sec title="SECTOR ROTATION  (RS vs SPY, ranked by 63d)" />
-      <DataTable
-        rows={data}
-        rowStyle={(r) => (own && r._r.sym === own
-          ? { backgroundColor: 'rgba(78,163,216,0.12)' } : undefined)}
-        columns={[
-          { key: 'sector', header: 'Sector' },
-          { key: 'd20', header: '20d', style: (r) => rsStyle(r._r.rel_20d) },
-          { key: 'd63', header: '63d', style: (r) => rsStyle(r._r.rel_63d) },
-          { key: 'tag', header: 'Tag', style: (r) => ({ color: TAG_COLOR[r._r.tag] ?? GRAY }) },
-          ...(hasTop
-            ? [{ key: 'top', header: 'Top performers (63d)',
-                 style: () => ({ whiteSpace: 'normal' as const }) }]
-            : []),
-        ]}
-      />
+      {fig && <Plot fig={fig} />}
       {ownRow && (
         <Caption>
           · {String(p.ticker ?? '')} sector: {own} — rank {ownRow.rank}/{rows.length}, {ownRow.tag}
         </Caption>
       )}
-      {hasTop && (
-        <Caption>
-          top performers = 63d ABSOLUTE return among the sector's ~10 largest constituents
-          (Yahoo classification) — biggest names, not full membership
-        </Caption>
-      )}
+      <Collapsible title="sector table (RS vs SPY, ranked by 63d)" defaultOpen={!fig}>
+        <DataTable
+          rows={data}
+          rowStyle={(r) => (own && r._r.sym === own
+            ? { backgroundColor: 'rgba(78,163,216,0.12)' } : undefined)}
+          columns={[
+            { key: 'sector', header: 'Sector' },
+            { key: 'd20', header: '20d', style: (r) => rsStyle(r._r.rel_20d) },
+            { key: 'd63', header: '63d', style: (r) => rsStyle(r._r.rel_63d) },
+            { key: 'tag', header: 'Tag', style: (r) => ({ color: TAG_COLOR[r._r.tag] ?? GRAY }) },
+            ...(hasTop
+              ? [{ key: 'top', header: 'Top performers (63d)',
+                   style: () => ({ whiteSpace: 'normal' as const }) }]
+              : []),
+          ]}
+        />
+        {hasTop && (
+          <Caption>
+            top performers = 63d ABSOLUTE return among the sector's ~10 largest constituents
+            (Yahoo classification) — biggest names, not full membership
+          </Caption>
+        )}
+      </Collapsible>
     </>
   )
 }
 
-// ── KNOWN CATALYSTS ──────────────────────────────────────────────────────────
-export function SecCatalysts({ p }: { p: Payload }) {
-  const cats = p.cats as [string, number, string, string][] | null
-  if (!cats?.length) return null
-  return (
-    <>
-      <Sec title="KNOWN CATALYSTS (catalysts.csv)" />
-      <DataTable
-        rows={cats.map(([d, days, typ, desc]) => ({
-          date: d, days: String(days), type: typ, desc,
-        }))}
-        columns={[
-          { key: 'date', header: 'Date' }, { key: 'days', header: 'Days' },
-          { key: 'type', header: 'Type' },
-          { key: 'desc', header: 'Description', style: () => ({ whiteSpace: 'normal' }) },
-        ]}
-      />
-    </>
-  )
-}
+// ── UPCOMING EVENTS (S61: catalysts + macro + earnings + ex-div on one timeline) ──
+const TIER1 = new Set(['FOMC', 'CPI', 'NFP', 'PCE'])
+const EVENTS_HORIZON = 30
 
-// ── MACRO (next 10d) ─────────────────────────────────────────────────────────
-export function SecMacro({ p }: { p: Payload }) {
-  const ev = p.macro_events as Record<string, [string | null, number | null]> | null
-  if (!ev) return null
-  const soon = Object.entries(ev)
+interface EarnLike { date?: string | null; days?: number | null }
+interface ExdLike extends EarnLike { est?: boolean }
+
+export function SecEvents({ p }: { p: Payload }) {
+  const cats = (p.cats as [string, number, string, string][] | null) ?? []
+  const macro = (p.macro_events as Record<string, [string | null, number | null]> | null) ?? {}
+  const earn = p.earn as EarnLike | null
+  const exd = p.exd as ExdLike | null
+
+  const events: TimelineEvent[] = []
+  let beyond = 0
+  for (const [d, days, typ, desc] of cats) {
+    if (days == null) continue
+    if (days > EVENTS_HORIZON) { beyond += 1; continue }
+    events.push({ label: typ, days, date: d, color: RED, title: desc })
+  }
+  for (const [name, [d, days]] of Object.entries(macro)) {
+    if (d == null || days == null) continue
+    const tier1 = TIER1.has(name)
+    if (days > (tier1 ? EVENTS_HORIZON : 10)) {
+      if (tier1) beyond += 1
+      continue
+    }
+    events.push({
+      label: name, days, date: String(d).slice(0, 10),
+      color: tier1 ? '#8b95a7' : '#6a7686',
+    })
+  }
+  if (earn?.days != null && earn.days <= EVENTS_HORIZON) {
+    events.push({ label: 'earnings', days: earn.days, date: earn.date ?? undefined, color: AMBER })
+  } else if (earn?.days != null) beyond += 1
+  if (exd?.days != null && exd.days <= EVENTS_HORIZON) {
+    events.push({ label: `ex-div${exd.est ? '~' : ''}`, days: exd.days, date: exd.date ?? undefined, color: GRAY })
+  }
+
+  const macroSoon = Object.entries(macro)
     .filter(([, [d, days]]) => d != null && days != null && days <= 10)
     .map(([name, [d, days]]) => ({ name, date: String(d).slice(0, 10), days: days! }))
     .sort((a, b) => a.days - b.days)
-  if (!soon.length) return null
+
+  if (!events.length && !cats.length && !macroSoon.length) return null
   return (
     <>
-      <Sec title="MACRO (next 10d)" />
-      <DataTable
-        rows={soon.map((s) => ({ release: s.name, date: s.date, days: String(s.days) }))}
-        columns={[
-          { key: 'release', header: 'Release' }, { key: 'date', header: 'Date' },
-          { key: 'days', header: 'Days' },
-        ]}
-      />
+      <Sec title={`UPCOMING EVENTS (next ${EVENTS_HORIZON}d)`} />
+      <TimelineStrip events={events} horizon={EVENTS_HORIZON} />
+      {beyond > 0 && <Caption>+{beyond} further out (see tables)</Caption>}
+      {!!cats.length && (
+        <Collapsible title="catalysts table (catalysts.csv)">
+          <DataTable
+            rows={cats.map(([d, days, typ, desc]) => ({
+              date: d, days: String(days), type: typ, desc,
+            }))}
+            columns={[
+              { key: 'date', header: 'Date' }, { key: 'days', header: 'Days' },
+              { key: 'type', header: 'Type' },
+              { key: 'desc', header: 'Description', style: () => ({ whiteSpace: 'normal' }) },
+            ]}
+          />
+        </Collapsible>
+      )}
+      {!!macroSoon.length && (
+        <Collapsible title="macro releases (next 10d)">
+          <DataTable
+            rows={macroSoon.map((s) => ({ release: s.name, date: s.date, days: String(s.days) }))}
+            columns={[
+              { key: 'release', header: 'Release' }, { key: 'date', header: 'Date' },
+              { key: 'days', header: 'Days' },
+            ]}
+          />
+        </Collapsible>
+      )}
     </>
   )
 }
@@ -145,19 +252,25 @@ export function SecThesis({ p }: { p: Payload }) {
   for (const tf of Object.keys(reads)) {
     if (reads[tf]._vol?.unconfirmed) blind.push(`${tf} move is on falling volume (unconfirmed)`)
   }
+  const nC = confirm?.length ?? 0
+  const nX = contra?.length ?? 0
   return (
     <>
       <Sec title={`THESIS CHECK — you are ${thesis.toUpperCase()}${level ? ` (level ${level})` : ''}`} />
-      <div style={{ display: 'flex', gap: 32, flexWrap: 'wrap' }}>
-        <div style={{ flex: 1, minWidth: 320 }}>
-          <div style={{ color: GREEN, fontWeight: 600 }}>CONFIRMATIONS ({confirm?.length ?? 0})</div>
-          <Bullets items={confirm?.length ? confirm : ['— none']} marker="✓" />
+      <BalanceBar left={nC} right={nX} leftLabel="confirmations" rightLabel="contradictions"
+        leftColor={GREEN} rightColor={RED} />
+      <Collapsible title={`detail — ✓ ${nC} confirmations · ✗ ${nX} contradictions`}>
+        <div style={{ display: 'flex', gap: 32, flexWrap: 'wrap' }}>
+          <div style={{ flex: 1, minWidth: 320 }}>
+            <div style={{ color: GREEN, fontWeight: 600 }}>CONFIRMATIONS ({nC})</div>
+            <Bullets items={confirm?.length ? confirm : ['— none']} marker="✓" />
+          </div>
+          <div style={{ flex: 1, minWidth: 320 }}>
+            <div style={{ color: RED, fontWeight: 600 }}>CONTRADICTIONS ({nX})</div>
+            <Bullets items={contra?.length ? contra : ['— none']} marker="✗" />
+          </div>
         </div>
-        <div style={{ flex: 1, minWidth: 320 }}>
-          <div style={{ color: RED, fontWeight: 600 }}>CONTRADICTIONS ({contra?.length ?? 0})</div>
-          <Bullets items={contra?.length ? contra : ['— none']} marker="✗" />
-        </div>
-      </div>
+      </Collapsible>
       {blind.map((b, i) => <Warning key={i}>blind spot: {b}</Warning>)}
     </>
   )

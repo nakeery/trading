@@ -169,8 +169,11 @@ def gather_context(ticker, data_dir="data", with_vix=True, as_of=None):
     SKEW/VVIX only reach ~2y back (period-limited fetch) and drop out silently beyond that.
     """
     df = compute_hv_features(_load_indicators(ticker, data_dir))   # adds HV_20, IV_rank, IV_pct
-    if as_of is not None:
-        df = df.loc[:pd.Timestamp(as_of).normalize()]
+    # asof_ts = the historical-mode flag; `as_of` is reused below as the display stamp, so the
+    # parameter must not be tested after this point (the SKEW/VVIX cut ran on EVERY run before)
+    asof_ts = pd.Timestamp(as_of).normalize() if as_of is not None else None
+    if asof_ts is not None:
+        df = df.loc[:asof_ts]
         if len(df) == 0:
             raise ValueError(f"no {ticker} indicator rows on/before {as_of}")
     gauges, notes = [], []
@@ -306,11 +309,11 @@ def gather_context(ticker, data_dir="data", with_vix=True, as_of=None):
                                progress=False, auto_adjust=True)["Close"]
             sk = tail["^SKEW"].dropna() if "^SKEW" in tail else pd.Series(dtype=float)
             vv = tail["^VVIX"].dropna() if "^VVIX" in tail else pd.Series(dtype=float)
-            if as_of is not None:                      # 2y fetch window — empty beyond it → skipped
+            if asof_ts is not None:                    # 2y fetch window — empty beyond it → skipped
                 def _cut(s):
                     if not len(s):
                         return s
-                    c = pd.Timestamp(as_of).normalize()
+                    c = asof_ts
                     if getattr(s.index, "tz", None) is not None:
                         c = c.tz_localize(s.index.tz)
                     return s.loc[:c]

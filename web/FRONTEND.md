@@ -124,6 +124,14 @@ you retire it. Feature parity checklist against it:
 | Live mode (10s tick, provisional today-bar, tiles ride the tick, 3-miss backoff) | ✅ |
 | 2s debounce on flag changes; Run = force-fresh; pills bypass debounce | ✅ |
 
+**Parity is one-way (S61):** nothing from Streamlit is missing, but React now EXCEEDS it
+visually — the S61 readability pass made sections visual-first (gauge percentile bars,
+two-sided balance bars, range/level strips, a sector-rotation RRG quadrant scatter, and a
+merged UPCOMING EVENTS timeline replacing the catalysts + macro tables), with every
+original table/factor list preserved inside "details" expanders. These are React-only
+extras (`src/components/viz.tsx` + section rewiring); the Streamlit app intentionally does
+not get them.
+
 ---
 *Written for the S60 migration. The Streamlit entries in .claude/launch.json (lens-web /
 lens-web-dev) are now legacy but intentionally kept until you retire lens_web.py.*

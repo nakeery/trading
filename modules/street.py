@@ -47,7 +47,9 @@ def street_read(pt, ud_rows, eps, now=None):
         cur, ago = d.get("current"), d.get("30daysAgo")
         if cur is None or not ago or pd.isna(cur) or pd.isna(ago):
             continue
-        chg = float(cur) / float(ago) - 1
+        # (cur − ago) / |ago|, NOT cur/ago − 1: for negative estimates the ratio flips sign
+        # (−5.0 → −4.5 is an IMPROVEMENT but reads −10% as a ratio)
+        chg = (float(cur) - float(ago)) / abs(float(ago))
         revs.append({"period": period, "label": PERIOD_LABELS[period], "chg30": chg,
                      "tag": "up" if chg > REV_DEAD else "down" if chg < -REV_DEAD else "flat"})
     if revs:

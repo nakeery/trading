@@ -2,8 +2,8 @@
 // sec_options/sec_geo + the shared _gauge_table (value via the gauge's own format, read
 // label, ordinal percentile, inline sparkline when the gauge carries its trailing series).
 import type { Payload } from '../../api/types'
-import { ordinalPercentile } from '../../utils/colors'
 import { Caption, DataTable, Net, Sec, Sparkline } from '../shared'
+import { PctBar } from '../viz'
 
 export interface Gauge {
   group?: string
@@ -38,7 +38,7 @@ export function GaugeTable({ gauges, groups }: { gauges: Gauge[]; groups?: strin
       name: g.name,
       value: pyFormat(g.fmt, g.value),
       read: g.label ?? '',
-      pct: g.pct != null ? ordinalPercentile(g.pct, false) : '—',
+      pct: g.pct ?? null, // raw 0–1 — PctBar renders bar + ordinal (S61)
       spark: g.spark ?? null,
     }))
   if (!rows.length) return null
@@ -47,11 +47,19 @@ export function GaugeTable({ gauges, groups }: { gauges: Gauge[]; groups?: strin
     <DataTable
       rows={rows}
       columns={[
-        { key: 'group', header: 'Group' },
+        {
+          key: 'group', header: 'Group',
+          // group label only on its first row — a cheap group-header effect
+          cell: (r, i) => (i > 0 && rows[i - 1].group === r.group ? '' : r.group),
+          style: () => ({ color: 'var(--muted)', fontSize: 12.5 }),
+        },
         { key: 'name', header: 'Gauge' },
         { key: 'value', header: 'Value' },
         { key: 'read', header: 'Read', style: () => ({ whiteSpace: 'normal' }) },
-        { key: 'pct', header: 'Percentile' },
+        {
+          key: 'pct', header: 'Percentile',
+          cell: (r) => <PctBar pct={r.pct} />,
+        },
         ...(hasSpark
           ? [{
               key: 'spark', header: '1y',
