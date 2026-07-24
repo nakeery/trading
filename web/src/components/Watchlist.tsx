@@ -22,13 +22,14 @@ function TileSpark({ closes }: { closes: number[] }) {
   const w = 220
   const h = 44
   const up = closes[closes.length - 1] >= closes[0]
+  const color = up ? 'var(--green)' : 'var(--red)'
   const pts = closes.map((v, i) =>
     `${((i / (closes.length - 1)) * w).toFixed(1)},${(h - 2 - ((v - min) / span) * (h - 4)).toFixed(1)}`)
   return (
     <svg width="100%" height={h} viewBox={`0 0 ${w} ${h}`} preserveAspectRatio="none"
       style={{ display: 'block' }}>
-      <polyline points={pts.join(' ')} fill="none"
-        stroke={up ? 'var(--green)' : 'var(--red)'} strokeWidth={1.4} />
+      <polygon points={`0,${h} ${pts.join(' ')} ${w},${h}`} fill={color} opacity={0.10} />
+      <polyline points={pts.join(' ')} fill="none" stroke={color} strokeWidth={1.4} />
     </svg>
   )
 }
@@ -44,12 +45,17 @@ function WatchTile({ ticker, onPick }: { ticker: string; onPick: (t: string) => 
   })
   const t = q.data
   return (
-    <div style={{
-      border: '1px solid var(--border)', borderRadius: 10, padding: 10,
-      background: 'var(--panel)',
-    }}>
+    <div
+      className="wtile num"
+      onClick={() => onPick(ticker)}
+      title={`run the lens on ${ticker}`}
+      style={{
+        border: '1px solid var(--border)', borderRadius: 'var(--r-lg)', padding: 10,
+        background: 'var(--panel)',
+      }}
+    >
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline' }}>
-        <button onClick={() => onPick(ticker)} style={{ fontWeight: 700 }}>{ticker}</button>
+        <span style={{ fontWeight: 700, fontSize: 16 }}>{ticker}</span>
         {t && (
           <div style={{ textAlign: 'right', lineHeight: 1.25 }}>
             <span style={{ fontWeight: 600 }}>

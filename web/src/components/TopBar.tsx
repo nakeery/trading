@@ -1,6 +1,6 @@
-// Ticker search + recent-data pills + flag checkboxes + pc-oi scope + thesis/as-of panels
-// + Run. Controlled component: App owns the state (deep links + debounce + pills live
-// there); flag changes auto-run after a 2s debounce, Run/pills commit immediately.
+// Ticker search + recent-data pills + flag toggle chips + pc-oi scope + thesis/as-of
+// panels + Run. Controlled component: App owns the state (deep links + debounce + pills
+// live there); flag changes auto-run after a 2s debounce, Run/pills commit immediately.
 import type { Flags, PcOiScope } from '../api/types'
 import { localToday } from '../utils/dates'
 
@@ -21,37 +21,45 @@ export default function TopBar({ ticker, flags, chartFrom, known, onTicker, onFl
   const today = localToday() // local tz — UTC would offer tomorrow's date in a US evening
 
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-      <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+    <div className="card" style={{
+      display: 'flex', flexDirection: 'column', gap: 10, padding: '12px 16px', margin: '0 0 14px',
+    }}>
+      <div style={{ display: 'flex', gap: 10, alignItems: 'center', flexWrap: 'wrap' }}>
         <input
           value={ticker}
           onChange={(e) => onTicker(e.target.value.toUpperCase())}
           onKeyDown={(e) => e.key === 'Enter' && onRun()}
           placeholder="e.g. CRSP"
           maxLength={8}
-          style={{ width: 110, fontSize: 17 }}
+          style={{ width: 110, fontSize: 17, fontWeight: 600, background: 'var(--bg)' }}
         />
         {BOOL_FLAGS.map((k) => (
-          <label key={k} style={{ display: 'flex', gap: 4, alignItems: 'center', color: 'var(--muted)' }}>
-            <input
-              type="checkbox"
-              checked={flags[k]}
-              onChange={(e) => setFlag(k, e.target.checked)}
-            />
+          <button
+            key={k}
+            className="chip"
+            aria-pressed={flags[k]}
+            onClick={() => setFlag(k, !flags[k])}
+            title={`toggle the --${k} block`}
+          >
             {k}
-          </label>
+          </button>
         ))}
         <select
           value={flags.pc_oi}
           onChange={(e) => setFlag('pc_oi', e.target.value as PcOiScope)}
           title="put/call OI scope"
+          style={{
+            borderRadius: 999,
+            // read as "on" alongside the chips when a scope is active
+            ...(flags.pc_oi !== 'off' && { borderColor: 'var(--accent)', color: 'var(--accent)' }),
+          }}
         >
           {['off', 'all', 'near', 'leaps', 'monthly'].map((s) => (
             <option key={s} value={s}>pc-oi: {s}</option>
           ))}
         </select>
         <button className="primary" onClick={onRun} title="run now — bypasses the debounce and every cache">
-          Run
+          ▶ Run
         </button>
       </div>
 
@@ -61,12 +69,10 @@ export default function TopBar({ ticker, flags, chartFrom, known, onTicker, onFl
           {known.map((t) => (
             <button
               key={t}
+              className="chip"
+              aria-pressed={t === ticker}
               onClick={() => onPill(t)}
-              style={{
-                fontSize: 12.5, padding: '1px 9px', borderRadius: 10,
-                borderColor: t === ticker ? 'var(--blue)' : 'var(--border)',
-                color: t === ticker ? 'var(--blue)' : 'var(--muted)',
-              }}
+              style={{ fontSize: 12.5, padding: '1px 10px' }}
             >
               {t}
             </button>
@@ -74,7 +80,10 @@ export default function TopBar({ ticker, flags, chartFrom, known, onTicker, onFl
         </div>
       )}
 
-      <div style={{ display: 'flex', gap: 16, alignItems: 'center', flexWrap: 'wrap', color: 'var(--muted)' }}>
+      <div style={{
+        display: 'flex', gap: 16, alignItems: 'center', flexWrap: 'wrap', color: 'var(--muted)',
+        borderTop: '1px solid var(--track)', paddingTop: 10, fontSize: 14,
+      }}>
         <label style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
           bias
           <select

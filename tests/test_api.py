@@ -296,3 +296,20 @@ def test_chart_ignores_mismatched_vintage_payload(monkeypatch):
     out2 = charts.build_chart("FAKE", payload={"as_of_mode": None, "earn": earn},
                               overlays=("ma20",))
     assert out2["fig"]["layout"].get("shapes")
+
+
+def test_chart_asof_noncanonical_matches_payload(monkeypatch):
+    """A valid-but-non-canonical as_of ("2026-6-30") must canonicalize to the payload's
+    as_of_mode ("2026-06-30") — otherwise the string compare spuriously nulls the payload and
+    the chart silently loses its GEX/profile/event decorations on a hand-edited ?asof= link."""
+    from api import charts
+    monkeypatch.setattr(charts, "chart_frame",
+                        lambda t, a=None, s=None: (_mini_frame(), 20))
+    ev_date = (_mini_frame().index[-1] + pd.Timedelta(days=3)).date().isoformat()
+    earn = {"date": ev_date, "days": 3}
+    payload = {"as_of_mode": "2026-06-30", "earn": earn}
+    canon = charts.build_chart("FAKE", payload=payload, as_of="2026-06-30", overlays=("ma20",))
+    noncanon = charts.build_chart("FAKE", payload=payload, as_of="2026-6-30", overlays=("ma20",))
+    # both retain the payload → both draw the earnings vline
+    assert canon["fig"]["layout"].get("shapes")
+    assert noncanon["fig"]["layout"].get("shapes")

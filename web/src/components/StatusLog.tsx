@@ -13,7 +13,7 @@ export default function StatusLog({ preamble }: { preamble: string }) {
       </button>
       {open && (
         <pre style={{
-          background: 'var(--panel)', border: '1px solid var(--border)', borderRadius: 8,
+          background: 'var(--panel)', border: '1px solid var(--border)', borderRadius: 'var(--r-md)',
           padding: 10, fontSize: 12.5, color: 'var(--muted)', whiteSpace: 'pre-wrap',
         }}>
           {lines.join('\n')}

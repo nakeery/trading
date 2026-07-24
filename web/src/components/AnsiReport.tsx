@@ -13,14 +13,11 @@ export default function AnsiReport({ html }: { html: string }) {
       </button>
       {open && (
         <div style={{
-          background: '#0e1117', border: '1px solid var(--border)', borderRadius: 8,
+          background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 'var(--r-md)',
           padding: 14, overflowX: 'auto', marginTop: 6,
         }}>
           <pre
-            style={{
-              fontFamily: 'Cascadia Mono, Consolas, monospace', fontSize: 13,
-              lineHeight: 1.35, color: '#d8dee9', margin: 0,
-            }}
+            style={{ fontSize: 13, lineHeight: 1.35, color: 'var(--text)', margin: 0 }}
             dangerouslySetInnerHTML={{ __html: html }}
           />
         </div>

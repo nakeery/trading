@@ -1810,10 +1810,12 @@ def test_trend_regime():
 
 
 # ─── Test 48: S58 sector rotation (offline) ─────────────────────────────────────
-def test_sector_rotation():
+def test_sector_rotation(monkeypatch, tmp_path):
     """rotation_read: RS math vs SPY, quadrant tags, 63d-descending rank; own_sector maps via
-    TICKER_BENCHMARK without network (AMD → XLK though its FIRST benchmark is ^SOX; QQQ → None
-    — ^GSPC is not a sector; a sector ETF maps to itself)."""
+    TICKER_BENCHMARK without network (AMD → XLK though its FIRST benchmark is ^SOX; a sector
+    ETF maps to itself); QQQ (only benchmark ^GSPC, not a sector) falls through to the .info
+    fallback, which is patched to fail here — proving the last-resort branch degrades to None
+    instead of raising, without touching the network."""
     import numpy as np
     import pandas as pd
     from modules.sectors import rotation_read, own_sector, _quadrant, ROT_DEAD
@@ -1833,8 +1835,89 @@ def test_sector_rotation():
     assert _quadrant(-0.02, 0.05) == "weakening"
     assert _quadrant(-0.02, -0.05) == "lagging"
     assert _quadrant(ROT_DEAD / 2, ROT_DEAD / 2) == "in line"
-    assert own_sector("AMD") == "XLK" and own_sector("QQQ") is None
-    assert own_sector("XLF") == "XLF"
+    monkeypatch.setattr("yfinance.Ticker",
+                         lambda t: (_ for _ in ()).throw(RuntimeError("no network in tests")))
+    assert own_sector("AMD", data_dir=str(tmp_path)) == "XLK"
+    assert own_sector("QQQ", data_dir=str(tmp_path)) is None
+    assert own_sector("XLF", data_dir=str(tmp_path)) == "XLF"
+
+
+# ─── Test 48a: own_sector .info primary lookup (offline) ───────────────────────
+def test_own_sector_info_fallback(monkeypatch, tmp_path):
+    """own_sector's live yfinance .info lookup: a ticker absent from SECTORS resolves via
+    .info['sector'] -> benchmarks.SECTOR_BENCHMARK, the result is cached to disk (a second
+    call makes no further yf.Ticker call), an unmapped/empty sector (e.g. an ETF, and not a
+    TICKER_BENCHMARK member) degrades to None, and a raising .info (401, etc.) never
+    propagates (and, absent a TICKER_BENCHMARK/stale-cache match, also degrades to None)."""
+    from modules.sectors import own_sector, LOOKUP_CACHE_FILE
+
+    calls = []
+
+    class FakeTicker:
+        def __init__(self, sym):
+            calls.append(sym)
+            self.info = {"sector": "Technology"}
+
+    monkeypatch.setattr("yfinance.Ticker", FakeTicker)
+    assert own_sector("MSFT", data_dir=str(tmp_path)) == "XLK"
+    assert calls == ["MSFT"]
+    assert (tmp_path / LOOKUP_CACHE_FILE).exists()
+
+    assert own_sector("MSFT", data_dir=str(tmp_path)) == "XLK"   # served from cache
+    assert calls == ["MSFT"]                                     # no second network call
+
+    class EmptyTicker:
+        def __init__(self, sym):
+            self.info = {}
+    monkeypatch.setattr("yfinance.Ticker", EmptyTicker)
+    assert own_sector("SPY", data_dir=str(tmp_path)) is None      # unmapped, not in TICKER_BENCHMARK
+
+    monkeypatch.setattr("yfinance.Ticker",
+                         lambda t: (_ for _ in ()).throw(RuntimeError("401")))
+    assert own_sector("ZZZZ", data_dir=str(tmp_path)) is None     # raises, not in TICKER_BENCHMARK
+
+
+# ─── Test 48a-ii: own_sector — network takes priority over TICKER_BENCHMARK ────
+def test_own_sector_network_priority(monkeypatch, tmp_path):
+    """A live .info resolution now WINS over TICKER_BENCHMARK, even for a ticker
+    TICKER_BENCHMARK already covers: AMD's TICKER_BENCHMARK entry implies XLK, but a
+    successful live .info read of "Communication Services" resolves it to XLC instead,
+    proving the network call fires and takes priority rather than TICKER_BENCHMARK
+    short-circuiting it. calls confirms yf.Ticker really was invoked for AMD."""
+    from modules.sectors import own_sector
+
+    calls = []
+
+    class FakeTicker:
+        def __init__(self, sym):
+            calls.append(sym)
+            self.info = {"sector": "Communication Services"}
+
+    monkeypatch.setattr("yfinance.Ticker", FakeTicker)
+    assert own_sector("AMD", data_dir=str(tmp_path)) == "XLC"
+    assert calls == ["AMD"]
+
+
+# ─── Test 48a-iii: own_sector — TICKER_BENCHMARK fallback, then stale cache ────
+def test_own_sector_ticker_benchmark_and_stale_fallback(monkeypatch, tmp_path):
+    """When the live lookup fails, own_sector falls back to TICKER_BENCHMARK (AMD -> XLK,
+    matching test_sector_rotation). Once a ticker has EVER resolved, that resolution
+    survives as a last-resort fallback past its cache TTL even if BOTH the live lookup and
+    TICKER_BENCHMARK subsequently fail for it (a stale answer beats none)."""
+    import json
+    import time
+    from modules.sectors import own_sector, LOOKUP_CACHE_FILE
+
+    monkeypatch.setattr("yfinance.Ticker",
+                         lambda t: (_ for _ in ()).throw(RuntimeError("no network")))
+    assert own_sector("AMD", data_dir=str(tmp_path)) == "XLK"     # TICKER_BENCHMARK fallback
+
+    # Ticker not in TICKER_BENCHMARK at all, seeded with an expired-but-resolved cache entry.
+    cache_path = tmp_path / LOOKUP_CACHE_FILE
+    cache = json.loads(cache_path.read_text(encoding="utf-8"))
+    cache["MSFT"] = {"sym": "XLK", "ts": time.time() - 999 * 24 * 3600}   # far past the 30d TTL
+    cache_path.write_text(json.dumps(cache), encoding="utf-8")
+    assert own_sector("MSFT", data_dir=str(tmp_path)) == "XLK"    # stale-cache last resort
 
 
 # ─── Test 48b: S59 sector top performers (offline) ─────────────────────────────

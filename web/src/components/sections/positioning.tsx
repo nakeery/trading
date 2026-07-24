@@ -4,10 +4,10 @@
 // over payload data), unlike the candle/IV figures which come pre-built from the API.
 import type { Payload, PlotlyFig } from '../../api/types'
 import {
-  BLUE, GOLD, GRAY, GREEN, INK, LEAPS_MAX_DTE, LEAPS_MIN_DTE, RED,
-  ordinalPercentile, pcLabel,
+  AMBER, BG, BLUE, GRAY, GREEN, GRID, INK, LEAPS_MAX_DTE, LEAPS_MIN_DTE, RED,
+  hexToRgba, ordinalPercentile, pcLabel,
 } from '../../utils/colors'
-import { Bullets, Caption, Collapsible, DataTable, Metric, MetricRow, Net, Pill, Sec } from '../shared'
+import { Bullets, Caption, Collapsible, DataTable, FactorColumns, Metric, MetricRow, Net, Pill, PillRow, Sec } from '../shared'
 import { DARK_LAYOUT, SPOT_GOLD } from '../../utils/plotly'
 import { BalanceBar, PctBar, RangeStrip } from '../viz'
 import Plot from '../Plot'
@@ -46,8 +46,8 @@ function pcOiFig(rows: PcRow[]): PlotlyFig | null {
     // latest-session FLOW beneath the POSITIONING pane — translucent (the price chart's
     // volume-pane convention) so the two panes aren't misread as one scale
     data.push(
-      { type: 'bar', x, y: rows.map((r) => r.call_vol), name: 'Call Vol', yaxis: 'y2', marker: { color: 'rgba(94,196,94,0.55)', line: { width: 0 } } },
-      { type: 'bar', x, y: rows.map((r) => r.put_vol), name: 'Put Vol', yaxis: 'y2', marker: { color: 'rgba(216,60,52,0.55)', line: { width: 0 } } },
+      { type: 'bar', x, y: rows.map((r) => r.call_vol), name: 'Call Vol', yaxis: 'y2', marker: { color: hexToRgba(GREEN, 0.55), line: { width: 0 } } },
+      { type: 'bar', x, y: rows.map((r) => r.put_vol), name: 'Put Vol', yaxis: 'y2', marker: { color: hexToRgba(RED, 0.55), line: { width: 0 } } },
     )
   }
   return {
@@ -99,8 +99,8 @@ function strikeWallsFig(pc: Pc): PlotlyFig | null {
       shapes: spot ? [{ type: 'line', xref: 'paper', x0: 0, x1: 1, y0: spot, y1: spot, line: { dash: 'dot', width: 1, color: SPOT_GOLD } }] : [],
       annotations: [
         ...(spot ? [{ x: 1, xref: 'paper', xanchor: 'left', y: spot, text: `spot ${spot.toFixed(2)}`, showarrow: false, font: { color: SPOT_GOLD, size: 10 } }] : []),
-        { y: wallC, x: 0, text: `call wall ${wallC}`, showarrow: false, xanchor: 'center', font: { color: GREEN, size: 10 }, bgcolor: 'rgba(14,17,23,0.75)' },
-        { y: wallP, x: 0, text: `put wall ${wallP}`, showarrow: false, xanchor: 'center', font: { color: RED, size: 10 }, bgcolor: 'rgba(14,17,23,0.75)' },
+        { y: wallC, x: 0, text: `call wall ${wallC}`, showarrow: false, xanchor: 'center', font: { color: GREEN, size: 10 }, bgcolor: hexToRgba(BG, 0.75) },
+        { y: wallP, x: 0, text: `put wall ${wallP}`, showarrow: false, xanchor: 'center', font: { color: RED, size: 10 }, bgcolor: hexToRgba(BG, 0.75) },
       ],
     },
   }
@@ -203,7 +203,7 @@ export function SecGex({ p }: { p: Payload }) {
   if (g.call_wall != null) chips.push([`call wall ${g.call_wall}  (${gexFmt(g.call_wall_gex ?? 0, false)})`, GREEN])
   if (g.put_wall != null) chips.push([`put wall ${g.put_wall}  (${gexFmt(Math.abs(g.put_wall_gex ?? 0), false)})`, RED])
   if (g.zero_gamma != null) {
-    chips.push([`zero-gamma ~${g.zero_gamma.toFixed(2)} (${g.zero_gamma < (g.spot ?? 0) ? 'below' : 'above'} spot)`, GOLD])
+    chips.push([`zero-gamma ~${g.zero_gamma.toFixed(2)} (${g.zero_gamma < (g.spot ?? 0) ? 'below' : 'above'} spot)`, AMBER])
   }
   if (g.max_pain) chips.push([`max pain ${g.max_pain.strike} (${g.max_pain.expiry}, ${g.max_pain.dte}d)`, GRAY])
 
@@ -217,13 +217,13 @@ export function SecGex({ p }: { p: Payload }) {
       yaxis: { title: { text: 'dealer $Γ / 1% move', font: { size: 11 } } },
       legend: { orientation: 'h', y: 1.08, x: 0, font: { size: 11 } },
       shapes: [
-        { type: 'line', xref: 'paper', x0: 0, x1: 1, y0: 0, y1: 0, line: { width: 0.8, color: '#4a5160' } },
+        { type: 'line', xref: 'paper', x0: 0, x1: 1, y0: 0, y1: 0, line: { width: 0.8, color: GRID } },
         ...(g.spot ? [{ type: 'line', yref: 'paper', y0: 0, y1: 1, x0: g.spot, x1: g.spot, line: { dash: 'dot', width: 1, color: SPOT_GOLD } }] : []),
-        ...(g.zero_gamma != null ? [{ type: 'line', yref: 'paper', y0: 0, y1: 1, x0: g.zero_gamma, x1: g.zero_gamma, line: { dash: 'dash', width: 1, color: GOLD } }] : []),
+        ...(g.zero_gamma != null ? [{ type: 'line', yref: 'paper', y0: 0, y1: 1, x0: g.zero_gamma, x1: g.zero_gamma, line: { dash: 'dash', width: 1, color: AMBER } }] : []),
       ],
       annotations: [
         ...(g.spot ? [{ x: g.spot, yref: 'paper', y: 1, text: 'spot', showarrow: false, font: { color: SPOT_GOLD, size: 10 } }] : []),
-        ...(g.zero_gamma != null ? [{ x: g.zero_gamma, yref: 'paper', y: 0, yanchor: 'bottom', text: 'zero-γ', showarrow: false, font: { color: GOLD, size: 10 } }] : []),
+        ...(g.zero_gamma != null ? [{ x: g.zero_gamma, yref: 'paper', y: 0, yanchor: 'bottom', text: 'zero-γ', showarrow: false, font: { color: AMBER, size: 10 } }] : []),
       ],
     },
   }
@@ -232,9 +232,9 @@ export function SecGex({ p }: { p: Payload }) {
       <Sec title={hdr} />
       <Net label={`net GEX ${gexFmt(g.net_gex)}/1%`} text={regime} />
       {chips.length > 0 && (
-        <div style={{ lineHeight: 2.3, margin: '4px 0', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+        <PillRow>
           {chips.map(([t, c], i) => <Pill key={i} text={t} color={c} />)}
-        </div>
+        </PillRow>
       )}
       <Plot fig={fig} />
       {!!g.unusual?.length && (
@@ -339,20 +339,10 @@ export function SecSqueeze({ p }: { p: Payload }) {
         leftLabel="squeeze fuel" rightLabel="counter" leftColor={GREEN} rightColor={RED} />
       {((read.fuel?.length ?? 0) + (read.counter?.length ?? 0)) > 0 && (
         <Collapsible title={`squeeze factors (${read.fuel?.length ?? 0} fuel · ${read.counter?.length ?? 0} counter)`}>
-          <div style={{ display: 'flex', gap: 32, flexWrap: 'wrap' }}>
-            {!!read.fuel?.length && (
-              <div style={{ flex: 1, minWidth: 320 }}>
-                <div style={{ color: GREEN, fontWeight: 600 }}>squeeze fuel</div>
-                <Bullets items={read.fuel} />
-              </div>
-            )}
-            {!!read.counter?.length && (
-              <div style={{ flex: 1, minWidth: 320 }}>
-                <div style={{ color: RED, fontWeight: 600 }}>counter</div>
-                <Bullets items={read.counter} />
-              </div>
-            )}
-          </div>
+          <FactorColumns columns={[
+            { title: 'squeeze fuel', items: read.fuel, color: GREEN },
+            { title: 'counter', items: read.counter, color: RED },
+          ]} />
         </Collapsible>
       )}
       {/* caveats OUTSIDE the fold: squeeze_read always returns them even with zero
@@ -376,7 +366,7 @@ export function SecBuzz({ p }: { p: Payload }) {
     )
   }
   const chips: [string, string][] = [
-    [`rank #${bz.rank}${bz.rank_prev ? ` (was #${bz.rank_prev})` : ''}`, GOLD],
+    [`rank #${bz.rank}${bz.rank_prev ? ` (was #${bz.rank_prev})` : ''}`, AMBER],
     [`${bz.mentions} mentions${bz.chg != null ? `, ${bz.chg >= 0 ? '+' : ''}${(bz.chg * 100).toFixed(0)}% vs 24h` : ''}`, INK],
   ]
   if (bz.pct != null) chips.push([`${ordinalPercentile(bz.pct)} of own history`, BLUE])
@@ -384,15 +374,15 @@ export function SecBuzz({ p }: { p: Payload }) {
   return (
     <>
       <Sec title="RETAIL ATTENTION  (reddit stock boards, ApeWisdom)" />
-      <div style={{ lineHeight: 2.3, margin: '4px 0', display: 'flex', gap: 8, flexWrap: 'wrap' }}>
+      <PillRow>
         {chips.map(([t, c], i) => <Pill key={i} text={t} color={c} />)}
-      </div>
+      </PillRow>
       {hist && hist.length >= 5 && (
         <Plot fig={{
           data: [{
             type: 'scatter', x: hist.map((h) => h.date), y: hist.map((h) => h.mentions),
-            mode: 'lines', line: { color: GOLD, width: 1.5 },
-            fill: 'tozeroy', fillcolor: 'rgba(224,166,58,0.15)',
+            mode: 'lines', line: { color: AMBER, width: 1.5 },
+            fill: 'tozeroy', fillcolor: hexToRgba(AMBER, 0.15),
           }],
           layout: {
             ...DARK_LAYOUT, height: 120, margin: { l: 10, r: 10, t: 6, b: 6 }, showlegend: false,
@@ -513,7 +503,7 @@ export function SecStreet({ p }: { p: Payload }) {
         return (
           <RangeStrip
             lo={Math.min(...all) - span * 0.05} hi={Math.max(...all) + span * 0.05} width={520}
-            bands={[{ from: pt.low, to: pt.high, color: 'rgba(154,164,178,0.12)' }]}
+            bands={[{ from: pt.low, to: pt.high, color: hexToRgba(GRAY, 0.12) }]}
             markers={[
               { value: pt.mean, label: `mean ${Math.round(pt.mean)}`, color: pt.upside_mean >= 0 ? GREEN : RED, shape: 'line' },
               ...(pt.median != null ? [{ value: pt.median, label: `med ${Math.round(pt.median)}`, color: GRAY, shape: 'line' as const }] : []),

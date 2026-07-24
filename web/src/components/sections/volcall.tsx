@@ -1,9 +1,9 @@
 // VOLATILITY SETUP + LONG CALL VIABILITY — ports of sec_vol/sec_call (straddle/strangle
 // quote tables with at-ask honesty lines, expected-move tiles, IV-by-expiry curve).
 import type { Payload, PlotlyFig } from '../../api/types'
-import { AMBER, BLUE, GRAY, GREEN, RED, ordinalPercentile } from '../../utils/colors'
+import { AMBER, BLUE, GRAY, GREEN, RED, hexToRgba, ordinalPercentile } from '../../utils/colors'
 import { DARK_LAYOUT, SPOT_GOLD } from '../../utils/plotly'
-import { Bullets, Caption, Collapsible, DataTable, Metric, MetricRow, Net, Pill, Sec, Warning } from '../shared'
+import { Caption, Collapsible, DataTable, FactorColumns, Metric, MetricRow, Net, Pill, Sec, Warning } from '../shared'
 import { BalanceBar, RangeStrip } from '../viz'
 import type { Gauge } from './gauges'
 import Plot from '../Plot'
@@ -112,9 +112,9 @@ export function SecVol({ p }: { p: Payload }) {
             <RangeStrip
               lo={Math.min(...all) - span * 0.06} hi={Math.max(...all) + span * 0.06} width={520}
               bands={[
-                { from: em.lo, to: em.hi, color: 'rgba(78,163,216,0.15)' },
+                { from: em.lo, to: em.hi, color: hexToRgba(BLUE, 0.15) },
                 ...(hvLo != null && hvHi != null
-                  ? [{ from: hvLo, to: hvHi, color: 'rgba(154,164,178,0.12)' }] : []),
+                  ? [{ from: hvLo, to: hvHi, color: hexToRgba(GRAY, 0.12) }] : []),
               ]}
               markers={[
                 { value: em.lo, label: `−${(em.pct * 100).toFixed(1)}%`, color: BLUE, shape: 'line' },
@@ -146,20 +146,10 @@ export function SecVol({ p }: { p: Payload }) {
         leftLabel="buy vol" rightLabel="sell premium" leftColor={GREEN} rightColor={RED} />
       {((s.long_vol?.length ?? 0) + (s.short_vol?.length ?? 0)) > 0 && (
         <Collapsible title={`vol factors (${s.long_vol?.length ?? 0} buy · ${s.short_vol?.length ?? 0} sell)`}>
-          <div style={{ display: 'flex', gap: 32, flexWrap: 'wrap' }}>
-            {!!s.long_vol?.length && (
-              <div style={{ flex: 1, minWidth: 320 }}>
-                <div style={{ color: GREEN, fontWeight: 600 }}>favors BUYING vol</div>
-                <Bullets items={s.long_vol} />
-              </div>
-            )}
-            {!!s.short_vol?.length && (
-              <div style={{ flex: 1, minWidth: 320 }}>
-                <div style={{ color: RED, fontWeight: 600 }}>favors SELLING premium</div>
-                <Bullets items={s.short_vol} />
-              </div>
-            )}
-          </div>
+          <FactorColumns columns={[
+            { title: 'favors BUYING vol', items: s.long_vol, color: GREEN },
+            { title: 'favors SELLING premium', items: s.short_vol, color: RED },
+          ]} />
         </Collapsible>
       )}
       {s.hint && <Caption>{s.hint}</Caption>}

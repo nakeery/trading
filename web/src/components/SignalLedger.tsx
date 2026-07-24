@@ -3,7 +3,7 @@
 // (showing realized outcomes would defeat the no-lookahead point); App enforces that.
 import { useQuery } from '@tanstack/react-query'
 import { getJson } from '../api/client'
-import { Caption, Collapsible } from './shared'
+import { Caption, Collapsible, DataTable } from './shared'
 
 interface ScoreRow {
   date: string
@@ -50,40 +50,26 @@ export default function SignalLedger({ ticker }: { ticker: string }) {
   return (
     <Collapsible title={`signal ledger — entry.py forward ledger, last ${led.rows.length} rows`
       + `${scored ? ' (scored vs realized returns)' : ' (unscored)'}`}>
-      <div style={{ overflowX: 'auto' }}>
-        <table style={{ borderCollapse: 'collapse', fontSize: 13 }}>
-          <thead>
-            <tr>
-              {cols.map((c) => (
-                <th key={c} style={{
-                  textAlign: 'left', color: 'var(--muted)', fontWeight: 500,
-                  borderBottom: '1px solid var(--border)', padding: '3px 9px 3px 2px',
-                  whiteSpace: 'nowrap',
-                }}>{c}</th>
-              ))}
-            </tr>
-          </thead>
-          <tbody>
-            {led.rows.map((r, i) => (
-              <tr key={i}>
-                {cols.map((c) => {
-                  const v = c === 'fwd 15d' ? cell(r.date, 'fwd15', 'win15')
-                    : c === 'fwd 63d' ? cell(r.date, 'fwd63', 'win63')
-                    : String(r[c] ?? '')
-                  const color = v.includes('✓') ? 'var(--green)'
-                    : v.includes('✗') ? 'var(--red)' : undefined
-                  return (
-                    <td key={c} style={{
-                      padding: '2px 9px 2px 2px', borderBottom: '1px solid #1a1f29',
-                      whiteSpace: 'nowrap', color,
-                    }}>{v}</td>
-                  )
-                })}
-              </tr>
-            ))}
-          </tbody>
-        </table>
-      </div>
+      <DataTable
+        rows={led.rows}
+        columns={cols.map((c) => {
+          const val = (r: Record<string, unknown>) =>
+            c === 'fwd 15d' ? cell(r.date, 'fwd15', 'win15')
+            : c === 'fwd 63d' ? cell(r.date, 'fwd63', 'win63')
+            : String(r[c] ?? '')
+          return {
+            key: c,
+            header: c,
+            cell: val,
+            style: (r: Record<string, unknown>) => {
+              const v = val(r)
+              const color = v.includes('✓') ? 'var(--green)'
+                : v.includes('✗') ? 'var(--red)' : undefined
+              return color ? { color, fontWeight: 600 } : undefined
+            },
+          }
+        })}
+      />
       {scored ? (
         <Caption>
           one row per as-of run date (S30) · {segs.length ? `${segs.join(' · ')} · ` : ''}

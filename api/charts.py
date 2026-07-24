@@ -400,9 +400,18 @@ def build_chart(ticker, payload=None, as_of=None, start=None, live=False,
     {fig, range52, live: {found, hhmm, in_progress, close, chg} | None}.
     `payload` (the ticker's latest generated report) supplies profile/events/GEX levels."""
     on = set(overlays)
+    # Normalize as_of to the payload's canonical YYYY-MM-DD (payload["as_of_mode"] is stamped
+    # asof_ts.date().isoformat()). _check_date accepts non-canonical-but-valid dates ("2025-3-5",
+    # ISO-with-time), so comparing the raw string would spuriously null the payload on those.
     if as_of:
         live = False
-    if payload is not None and payload.get("as_of_mode") != (as_of or None):
+        try:
+            as_of_key = pd.Timestamp(as_of).date().isoformat()
+        except (ValueError, TypeError):
+            as_of_key = as_of          # upstream _check_date should prevent this
+    else:
+        as_of_key = None
+    if payload is not None and payload.get("as_of_mode") != as_of_key:
         # data-vintage mismatch: LATEST may hold an as-of (backtest) payload while this is a
         # current-mode chart request, or vice versa — drawing the other mode's GEX walls/
         # profile/event markers on these candles would be silent lookahead/staleness. Degrade

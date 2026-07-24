@@ -2,13 +2,29 @@
 // lens_web_sections.py _ramp_hex/_heat_hex/_rsi_hex/_net_color) — pure functions, so the
 // web tables read exactly like the terminal ones.
 
+// Names + values match theme.css (--green/--red/--amber/--gold/…) — Plotly/SVG can't
+// read CSS vars from attributes, so these mirror them. Keep the two files in lockstep.
 export const GREEN = '#5ec45e'
 export const RED = '#d83c34'
-export const AMBER = '#d6ba2e'
+export const AMBER = '#e0a63a'   // = --amber (IV, POC, Tier-1, warnings)
 export const BLUE = '#4ea3d8'
-export const GOLD = '#e0a63a'
+export const GOLD = '#d6ba2e'    // = --gold (RSI, MA20, event-IV)
 export const GRAY = '#9aa4b2'
-export const INK = '#d8dee9'
+export const INK = '#d8dee9'     // = --text
+export const MUTED = '#8b95a7'   // = --muted
+export const FAINT = '#6a7686'   // = --faint
+export const BLUEGRAY = '#9fb4d0' // = --bluegray
+export const YELLOW = '#e8c547'  // = --yellow (spot/price-line gold)
+export const TRACK = '#1a1f29'   // = --track (row borders, bar tracks)
+export const GRID = '#4a5160'    // plotly zero-lines / axis grid accents
+export const BG = '#0e1117'      // = --bg
+
+/** '#rrggbb' → 'rgba(r,g,b,a)' — the one place translucent tints are mixed. */
+export function hexToRgba(hex: string, alpha: number): string {
+  if (!hex.startsWith('#') || hex.length !== 7) return hex
+  const n = parseInt(hex.slice(1), 16)
+  return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${alpha})`
+}
 
 // red · amber · green — identical stops to lens._ramp
 const RAMP_STOPS: [number, number, number][] = [[216, 60, 52], [214, 186, 46], [94, 196, 94]]

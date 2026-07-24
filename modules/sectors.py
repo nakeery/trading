@@ -21,6 +21,10 @@ import pandas as pd
 
 CACHE_FILE = "sectors_cache.json"
 TTL_HOURS = 6
+LOOKUP_CACHE_FILE = "sector_lookup_cache.json"
+LOOKUP_TTL_HOURS = 24 * 30          # resolved hits: sector classification is stable, cache ~30d
+LOOKUP_MISS_TTL_HOURS = TTL_HOURS   # unresolved/failed lookups: retry every ~6h so a transient
+                                     # .info 401 self-heals instead of sticking for a month
 BENCH = "SPY"
 SECTORS = {
     "XLK":  "Technology",
@@ -187,22 +191,67 @@ def fetch_top_performers(data_dir="data", ttl_hours=TTL_HOURS):
         return None
 
 
-def own_sector(ticker):
-    """The ticker's own sector ETF symbol, no network: the ticker itself when it IS one,
-    else the first SPDR-sector entry in benchmarks.TICKER_BENCHMARK (e.g. AMD → XLK via its
-    second entry — ^SOX isn't a sector). None when unknown (yfinance .info 401s, so no
-    lookup fallback)."""
+def own_sector(ticker, data_dir="data"):
+    """The ticker's own sector ETF symbol. Order: (1) the ticker itself when it IS a SPDR
+    (instant, no lookup needed); (2) a live yfinance .info sector lookup mapped through
+    benchmarks.SECTOR_BENCHMARK (e.g. AAPL → "Technology" → XLK) — the primary source,
+    skipped when a fresh cached resolution already covers this ticker; (3) if the live
+    lookup fails or the sector is unmapped, the first SPDR-sector entry in
+    benchmarks.TICKER_BENCHMARK (e.g. AMD → XLK via its second entry — ^SOX isn't a sector);
+    (4) if that also misses, the last resolved value on disk even past TTL (a stale answer
+    beats none — sector classification rarely changes). Cached per ticker in
+    data/sector_lookup_cache.json — resolved hits ~30d, unresolved misses only ~6h (so a
+    transient .info 401 self-heals instead of sticking for a month). Best-effort: never
+    raises, None when nothing resolves anywhere."""
     t = (ticker or "").upper()
     if t in SECTORS:
         return t
+
+    path = os.path.join(data_dir, LOOKUP_CACHE_FILE)
+    cache = {}
     try:
-        from modules.benchmarks import TICKER_BENCHMARK
-        for sym, _name in TICKER_BENCHMARK.get(t, []):
-            if sym in SECTORS:
-                return sym
+        with open(path, encoding="utf-8") as f:
+            cache = json.load(f)
+    except Exception:
+        cache = {}
+    entry = cache.get(t)
+    if entry is not None:
+        ttl = LOOKUP_TTL_HOURS if entry.get("sym") else LOOKUP_MISS_TTL_HOURS
+        if (time.time() - entry.get("ts", 0)) < ttl * 3600:
+            return entry.get("sym")
+
+    sym = None
+    try:
+        import yfinance as yf
+        from modules.benchmarks import SECTOR_BENCHMARK
+        sector = yf.Ticker(t).info.get("sector", "")
+        if sector in SECTOR_BENCHMARK:
+            spdr, _name = SECTOR_BENCHMARK[sector]
+            if spdr in SECTORS:
+                sym = spdr
+    except Exception:
+        sym = None
+
+    if sym is None:
+        try:
+            from modules.benchmarks import TICKER_BENCHMARK
+            for bsym, _name in TICKER_BENCHMARK.get(t, []):
+                if bsym in SECTORS:
+                    sym = bsym
+                    break
+        except Exception:
+            pass
+
+    if sym is None and entry is not None and entry.get("sym"):
+        sym = entry["sym"]              # stale-but-resolved beats nothing
+
+    cache[t] = {"sym": sym, "ts": time.time()}
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(cache, f)
     except Exception:
         pass
-    return None
+    return sym
 
 
 def fetch_sectors(data_dir="data", ttl_hours=TTL_HOURS):

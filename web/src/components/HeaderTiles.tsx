@@ -10,8 +10,8 @@ function Tile({ label, value, sub, color }: {
   color?: string
 }) {
   return (
-    <div style={{
-      background: 'var(--panel)', border: '1px solid var(--border)', borderRadius: 8,
+    <div className="num" style={{
+      background: 'var(--bg)', border: '1px solid var(--border)', borderRadius: 'var(--r-md)',
       padding: '8px 14px', minWidth: 120,
     }}>
       <div style={{ color: 'var(--muted)', fontSize: 12 }}>{label}</div>

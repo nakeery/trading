@@ -3,9 +3,9 @@
 // since S61 (tables fold into expanders, nothing dropped).
 import type { CSSProperties } from 'react'
 import type { Payload, PlotlyFig } from '../../api/types'
-import { AMBER, BLUE, GRAY, GREEN, RED } from '../../utils/colors'
+import { AMBER, BLUE, FAINT, GRAY, GREEN, GRID, MUTED, RED, hexToRgba } from '../../utils/colors'
 import { DARK_LAYOUT, SPOT_GOLD } from '../../utils/plotly'
-import { Bullets, Caption, Collapsible, DataTable, Sec, Warning } from '../shared'
+import { Caption, Collapsible, DataTable, FactorColumns, Sec, Warning } from '../shared'
 import { BalanceBar, TimelineStrip, type TimelineEvent } from '../viz'
 import Plot from '../Plot'
 
@@ -60,10 +60,6 @@ function rrgFig(rows: SectorRow[], own?: string | null): PlotlyFig | null {
       }
     })
     .filter((t) => t.x.length)
-  const hexA = (hex: string, a: number) => {
-    const n = parseInt(hex.slice(1), 16)
-    return `rgba(${(n >> 16) & 255}, ${(n >> 8) & 255}, ${n & 255}, ${a})`
-  }
   const quad = (x0: number, x1: number, y0: number, y1: number, fill: string) => ({
     type: 'rect', x0, x1, y0, y1, line: { width: 0 }, fillcolor: fill, layer: 'below',
   })
@@ -75,18 +71,18 @@ function rrgFig(rows: SectorRow[], own?: string | null): PlotlyFig | null {
       xaxis: { title: { text: 'RS vs SPY — 63d', font: { size: 11 } }, tickformat: '+.0%', range: [-R, R], zeroline: false },
       yaxis: { title: { text: '20d', font: { size: 11 } }, tickformat: '+.0%', range: [-R, R], zeroline: false },
       shapes: [
-        quad(0, R, 0, R, hexA(GREEN, 0.05)),
-        quad(-R, 0, 0, R, hexA(BLUE, 0.05)),
-        quad(0, R, -R, 0, hexA(AMBER, 0.05)),
-        quad(-R, 0, -R, 0, hexA(RED, 0.05)),
+        quad(0, R, 0, R, hexToRgba(GREEN, 0.05)),
+        quad(-R, 0, 0, R, hexToRgba(BLUE, 0.05)),
+        quad(0, R, -R, 0, hexToRgba(AMBER, 0.05)),
+        quad(-R, 0, -R, 0, hexToRgba(RED, 0.05)),
         // the ±0.5% flat band the table's tint also uses — inside it, RS is noise.
         // NB a point flat on ONE axis is tagged by the other axis's sign (_quadrant),
         // so its marker color can differ from the quadrant tint it sits in — inherent
         // to overlaying a hard tag on a continuous scatter; these stripes are the cue
-        { type: 'rect', x0: -0.005, x1: 0.005, y0: -R, y1: R, line: { width: 0 }, fillcolor: 'rgba(154,164,178,0.06)', layer: 'below' },
-        { type: 'rect', x0: -R, x1: R, y0: -0.005, y1: 0.005, line: { width: 0 }, fillcolor: 'rgba(154,164,178,0.06)', layer: 'below' },
-        { type: 'line', x0: 0, x1: 0, y0: -R, y1: R, line: { width: 0.8, color: '#4a5160' } },
-        { type: 'line', x0: -R, x1: R, y0: 0, y1: 0, line: { width: 0.8, color: '#4a5160' } },
+        { type: 'rect', x0: -0.005, x1: 0.005, y0: -R, y1: R, line: { width: 0 }, fillcolor: hexToRgba(GRAY, 0.06), layer: 'below' },
+        { type: 'rect', x0: -R, x1: R, y0: -0.005, y1: 0.005, line: { width: 0 }, fillcolor: hexToRgba(GRAY, 0.06), layer: 'below' },
+        { type: 'line', x0: 0, x1: 0, y0: -R, y1: R, line: { width: 0.8, color: GRID } },
+        { type: 'line', x0: -R, x1: R, y0: 0, y1: 0, line: { width: 0.8, color: GRID } },
       ],
       annotations: ([
         ['leading', 0.99, 0.99, 'right', 'top'],
@@ -141,7 +137,7 @@ export function SecSectors({ p }: { p: Payload }) {
         <DataTable
           rows={data}
           rowStyle={(r) => (own && r._r.sym === own
-            ? { backgroundColor: 'rgba(78,163,216,0.12)' } : undefined)}
+            ? { backgroundColor: hexToRgba(BLUE, 0.12) } : undefined)}
           columns={[
             { key: 'sector', header: 'Sector' },
             { key: 'd20', header: '20d', style: (r) => rsStyle(r._r.rel_20d) },
@@ -212,7 +208,7 @@ export function SecEvents({ p }: { p: Payload }) {
     }
     events.push({
       label: name, days, date: String(d).slice(0, 10),
-      color: tier1 ? '#8b95a7' : '#6a7686',
+      color: tier1 ? MUTED : FAINT,
     })
   }
   if (earn?.days != null && earn.days <= EVENTS_HORIZON) {
@@ -292,16 +288,10 @@ export function SecThesis({ p }: { p: Payload }) {
       <BalanceBar left={nC} right={nX} leftLabel="confirmations" rightLabel="contradictions"
         leftColor={GREEN} rightColor={RED} />
       <Collapsible title={`detail — ✓ ${nC} confirmations · ✗ ${nX} contradictions`}>
-        <div style={{ display: 'flex', gap: 32, flexWrap: 'wrap' }}>
-          <div style={{ flex: 1, minWidth: 320 }}>
-            <div style={{ color: GREEN, fontWeight: 600 }}>CONFIRMATIONS ({nC})</div>
-            <Bullets items={confirm?.length ? confirm : ['— none']} marker="✓" />
-          </div>
-          <div style={{ flex: 1, minWidth: 320 }}>
-            <div style={{ color: RED, fontWeight: 600 }}>CONTRADICTIONS ({nX})</div>
-            <Bullets items={contra?.length ? contra : ['— none']} marker="✗" />
-          </div>
-        </div>
+        <FactorColumns columns={[
+          { title: `CONFIRMATIONS (${nC})`, items: confirm?.length ? confirm : ['— none'], color: GREEN, marker: '✓' },
+          { title: `CONTRADICTIONS (${nX})`, items: contra?.length ? contra : ['— none'], color: RED, marker: '✗' },
+        ]} />
       </Collapsible>
       {blind.map((b, i) => <Warning key={i}>blind spot: {b}</Warning>)}
     </>

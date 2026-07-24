@@ -4,10 +4,10 @@
 import type { CSSProperties } from 'react'
 import type { Payload } from '../../api/types'
 import {
-  AMBER, ARROW, BLUE, GRAY, GREEN, HEAT_DEAD, INK, OB, RED,
-  heatHex, rsiHex,
+  AMBER, ARROW, BLUE, BLUEGRAY, GRAY, GREEN, HEAT_DEAD, INK, OB, RED,
+  heatHex, hexToRgba, rsiHex,
 } from '../../utils/colors'
-import { Bullets, Caption, Collapsible, DataTable, Metric, MetricRow, Net, Pill, Sec, Warning } from '../shared'
+import { Caption, Collapsible, DataTable, FactorColumns, Metric, MetricRow, Net, Pill, Sec, Warning } from '../shared'
 import { BalanceBar, RangeStrip, type StripMarker } from '../viz'
 import { SPOT_GOLD } from '../../utils/plotly'
 
@@ -121,9 +121,9 @@ export function SecMultiTf({ p }: { p: Payload }) {
           { key: 'rsi', header: 'RSI', style: heat('rsi') },
           { key: 'stoch', header: 'Stoch' },
           { key: 'macd', header: 'MACD' },
-          { key: 'rvol', header: 'RVOL', style: heat('rvol') },
-          { key: 'dprc', header: 'ΔPrc%', style: heat('dprc') },
-          { key: 'dvol', header: 'ΔVol%', style: heat('dvol') },
+          { key: 'rvol', header: 'RVOL', style: heat('rvol'), align: 'right' },
+          { key: 'dprc', header: 'ΔPrc%', style: heat('dprc'), align: 'right' },
+          { key: 'dvol', header: 'ΔVol%', style: heat('dvol'), align: 'right' },
           { key: 'voltrend', header: 'VolTrend' },
         ]}
       />
@@ -186,7 +186,7 @@ export function SecVolumeProfile({ p }: { p: Payload }) {
       <MetricRow>
         <Metric label="POC (fair value)" value={poc != null ? fmt2(poc) : '—'} />
         <Metric label="Value area" value={`${fmt2(profile.va_low)} – ${fmt2(profile.va_high)}`} />
-        <div style={{ marginTop: '1.6em' }}><Pill text={locTxt} color={locCol} /></div>
+        <div style={{ alignSelf: 'center' }}><Pill text={locTxt} color={locCol} /></div>
       </MetricRow>
       {(() => {
         // level strip: value area band + POC/price markers, HVN shelves, LVN gaps (S61)
@@ -199,13 +199,13 @@ export function SecVolumeProfile({ p }: { p: Payload }) {
         const markers: StripMarker[] = [
           ...(poc != null ? [{ value: poc, label: 'POC', color: AMBER, shape: 'line' as const }] : []),
           ...(price != null ? [{ value: price, label: fmt2(price), color: SPOT_GOLD, shape: 'tri' as const }] : []),
-          ...hvns.map((h) => ({ value: h, color: '#9fb4d0', shape: 'dot' as const })),
+          ...hvns.map((h) => ({ value: h, color: BLUEGRAY, shape: 'dot' as const })),
           ...lvns.map((l) => ({ value: l, shape: 'tick' as const })),
         ]
         return (
           <>
             <RangeStrip lo={lo} hi={hi} width={520}
-              bands={[{ from: profile.va_low, to: profile.va_high, color: 'rgba(78,163,216,0.15)' }]}
+              bands={[{ from: profile.va_low, to: profile.va_high, color: hexToRgba(BLUE, 0.15) }]}
               markers={markers} />
             <Caption>
               blue band = value area · ▲ = price · dots = HVN shelves · ticks = LVN gaps ·
@@ -251,20 +251,10 @@ export function SecRisk({ p }: { p: Payload }) {
         leftLabel="drawdown-risk" rightLabel="rally-favorable" leftColor={RED} rightColor={GREEN} />
       {((risk.drawdown?.length ?? 0) + (risk.rally?.length ?? 0)) > 0 && (
         <Collapsible title={`factor details (${risk.drawdown?.length ?? 0} drawdown · ${risk.rally?.length ?? 0} rally)`}>
-          <div style={{ display: 'flex', gap: 32, flexWrap: 'wrap' }}>
-            {!!risk.drawdown?.length && (
-              <div style={{ flex: 1, minWidth: 320 }}>
-                <div style={{ color: RED, fontWeight: 600, marginTop: 6 }}>drawdown-risk factors</div>
-                <Bullets items={risk.drawdown} />
-              </div>
-            )}
-            {!!risk.rally?.length && (
-              <div style={{ flex: 1, minWidth: 320 }}>
-                <div style={{ color: GREEN, fontWeight: 600, marginTop: 6 }}>rally-favorable factors</div>
-                <Bullets items={risk.rally} />
-              </div>
-            )}
-          </div>
+          <FactorColumns columns={[
+            { title: 'drawdown-risk factors', items: risk.drawdown, color: RED },
+            { title: 'rally-favorable factors', items: risk.rally, color: GREEN },
+          ]} />
         </Collapsible>
       )}
     </>

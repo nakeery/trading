@@ -4,6 +4,7 @@
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
 import { getJson } from '../api/client'
+import { AMBER, BLUE, BLUEGRAY, hexToRgba } from '../utils/colors'
 import { Caption, Collapsible } from './shared'
 
 interface EconEvent {
@@ -24,8 +25,8 @@ interface Calendar {
 }
 
 const TIER_STYLE: Record<number, { bg: string; fg: string }> = {
-  1: { bg: 'rgba(224,166,58,0.18)', fg: '#e0a63a' }, // Tier 1 — amber (FOMC/CPI/NFP/PCE)
-  2: { bg: 'rgba(78,163,216,0.15)', fg: '#9fb4d0' }, // Tier 2 — blue-gray
+  1: { bg: hexToRgba(AMBER, 0.18), fg: AMBER },   // Tier 1 — amber (FOMC/CPI/NFP/PCE)
+  2: { bg: hexToRgba(BLUE, 0.15), fg: BLUEGRAY }, // Tier 2 — blue-gray
 }
 
 const MONTH_NAME = ['', 'January', 'February', 'March', 'April', 'May', 'June', 'July',
@@ -102,7 +103,7 @@ function MonthGrid({ year, month, byDay, today }: {
                 const iso = `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`
                 return (
                   <td key={di} style={{
-                    border: iso === today ? '1.5px solid #e8c547' : '1px solid var(--border)',
+                    border: iso === today ? '1.5px solid var(--yellow)' : '1px solid var(--border)',
                     verticalAlign: 'top', padding: 3, height: 54,
                   }}>
                     <div style={{ color: 'var(--muted)', fontSize: '0.7em' }}>{day}</div>

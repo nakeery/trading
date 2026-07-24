@@ -2,6 +2,7 @@
 // SectionBoundary so one bad payload slice degrades to a warning instead of a blank page
 // (the ANSI report below stays the lossless fallback). SectionNav mirrors the sidebar
 // quick-nav: an entry appears only when the payload carries that section.
+import { useEffect, useState } from 'react'
 import type { Payload } from '../../api/types'
 import { SectionBoundary } from '../shared'
 import {
@@ -40,9 +41,12 @@ export default function Sections({ p }: { p: Payload }) {
   return (
     <>
       {SECTIONS.map(([name, Fn]) => (
-        <SectionBoundary key={name} name={name}>
-          <Fn p={p} />
-        </SectionBoundary>
+        // a renderer that returns null leaves the card empty — .card:empty hides it
+        <section className="card" key={name}>
+          <SectionBoundary name={name}>
+            <Fn p={p} />
+          </SectionBoundary>
+        </section>
       ))}
     </>
   )
@@ -77,18 +81,65 @@ const NAV: [string, string, (p: Payload) => unknown][] = [
 
 export function SectionNav({ p }: { p: Payload }) {
   const items = NAV.filter(([, , present]) => present(p))
+  const [active, setActive] = useState<string | null>(null)
+
+  // scrollspy: the active section is the last one whose header sits above the upper
+  // third of the viewport — tracks what you're reading, not what crossed the bottom edge
+  const anchorsKey = items.map(([, a]) => a).join(',')
+  useEffect(() => {
+    const anchors = anchorsKey ? anchorsKey.split(',') : []
+    if (!anchors.length) return
+    // cheap enough (≤ ~16 rect reads) to run unthrottled per scroll event
+    const spy = () => {
+      const line = window.innerHeight * 0.33
+      let current: string | null = null
+      for (const a of anchors) {
+        const el = document.getElementById(a)
+        if (el && el.getBoundingClientRect().top <= line) current = a
+      }
+      setActive(current)
+    }
+    spy()
+    window.addEventListener('scroll', spy, { passive: true })
+    window.addEventListener('resize', spy, { passive: true })
+    return () => {
+      window.removeEventListener('scroll', spy)
+      window.removeEventListener('resize', spy)
+    }
+    // p.ticker: same anchor set for a new ticker still re-runs the spy against the
+    // freshly mounted section elements
+  }, [anchorsKey, p.ticker])
+
   if (!items.length) return null
   return (
     <nav style={{
-      position: 'sticky', top: 12, fontSize: 13, lineHeight: 1.9,
-      borderLeft: '1px solid var(--border)', paddingLeft: 12,
+      position: 'sticky', top: 12, fontSize: 13, lineHeight: 1.4,
+      // the fix: a sticky nav taller than the viewport was clipped with no way to
+      // reach the lower entries — cap it to the viewport and scroll inside
+      maxHeight: 'calc(100vh - 24px)', overflowY: 'auto',
+      borderLeft: '1px solid var(--border)', padding: '2px 6px 8px 0',
     }}>
-      <div style={{ fontWeight: 600, marginBottom: 4 }}>{p.ticker} — sections</div>
-      {items.map(([label, anchor]) => (
-        <div key={anchor}>
-          <a href={`#${anchor}`} style={{ color: 'var(--muted)' }}>{label}</a>
-        </div>
-      ))}
+      <div style={{ fontWeight: 600, margin: '0 0 6px 14px', color: 'var(--text)' }}>
+        {p.ticker} — sections
+      </div>
+      {items.map(([label, anchor]) => {
+        const on = anchor === active
+        return (
+          <div key={anchor} style={{
+            borderLeft: `2px solid ${on ? 'var(--accent)' : 'transparent'}`,
+            marginLeft: -1.5, transition: 'border-color 0.15s',
+          }}>
+            <a href={`#${anchor}`} style={{
+              display: 'block', padding: '3px 6px 3px 12px', borderRadius: '0 6px 6px 0',
+              color: on ? 'var(--text)' : 'var(--muted)',
+              fontWeight: on ? 600 : 400,
+              transition: 'color 0.15s',
+            }}>
+              {label}
+            </a>
+          </div>
+        )
+      })}
     </nav>
   )
 }

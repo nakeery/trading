@@ -12,7 +12,7 @@
 import type { ReactNode } from 'react'
 import { BLUE, GREEN, RED, ordinalPercentile } from '../utils/colors'
 
-const TRACK = '#1a1f29' // the DataTable row-border tone
+const TRACK = 'var(--track)' // the DataTable row-border tone (theme.css)
 
 // ── PctBar — percentile bullet bar ───────────────────────────────────────────
 /** 0–1 percentile as a small filled track + ordinal text. Neutral BLUE by default —
@@ -32,12 +32,12 @@ export function PctBar({ pct, width = 90, height = 8, color = BLUE, showText = t
     <span style={{ display: 'inline-flex', alignItems: 'center', gap: 7, whiteSpace: 'nowrap' }}>
       <span style={{
         width, height, background: TRACK, border: '1px solid var(--border)',
-        borderRadius: 3, display: 'inline-block', position: 'relative', flexShrink: 0,
+        borderRadius: 999, display: 'inline-block', position: 'relative', flexShrink: 0,
       }}>
         <span style={{
           position: 'absolute', left: 0, top: 0, bottom: 0,
-          width: `${(t * 100).toFixed(1)}%`, background: color, borderRadius: 2,
-          minWidth: t > 0 ? 2 : 0,
+          width: `${(t * 100).toFixed(1)}%`, background: color, borderRadius: 999,
+          minWidth: t > 0 ? 3 : 0,
         }} />
       </span>
       {showText && <span>{ordinalPercentile(t, false)}</span>}

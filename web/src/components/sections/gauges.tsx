@@ -51,10 +51,10 @@ export function GaugeTable({ gauges, groups }: { gauges: Gauge[]; groups?: strin
           key: 'group', header: 'Group',
           // group label only on its first row — a cheap group-header effect
           cell: (r, i) => (i > 0 && rows[i - 1].group === r.group ? '' : r.group),
-          style: () => ({ color: 'var(--muted)', fontSize: 12.5 }),
+          style: () => ({ color: 'var(--muted)', fontSize: 12.5, fontWeight: 600 }),
         },
         { key: 'name', header: 'Gauge' },
-        { key: 'value', header: 'Value' },
+        { key: 'value', header: 'Value', align: 'right', style: () => ({ fontWeight: 600 }) },
         { key: 'read', header: 'Read', style: () => ({ whiteSpace: 'normal' }) },
         {
           key: 'pct', header: 'Percentile',

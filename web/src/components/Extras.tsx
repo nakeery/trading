@@ -4,7 +4,7 @@
 import { useQuery } from '@tanstack/react-query'
 import { fetchIvHistory, getJson } from '../api/client'
 import type { Payload } from '../api/types'
-import { GREEN, RED, rampHex } from '../utils/colors'
+import { GREEN, RED, YELLOW, hexToRgba, rampHex } from '../utils/colors'
 import { Caption, Collapsible, DataTable, Sec } from './shared'
 import Plot from './Plot'
 
@@ -148,8 +148,10 @@ export function SeasonalityGrid({ ticker, asOf }: { ticker: string; asOf?: strin
               <th />
               {MONTHS.map((m, j) => (
                 <th key={m} style={{
-                  color: 'var(--muted)', fontWeight: 500, padding: '3px 8px',
-                  background: j === cur ? 'rgba(232,197,71,0.10)' : undefined,
+                  color: 'var(--muted)', fontWeight: 600, fontSize: 11.5,
+                  letterSpacing: '0.05em', textTransform: 'uppercase', padding: '4px 8px',
+                  borderBottom: '1px solid var(--border)',
+                  background: j === cur ? hexToRgba(YELLOW, 0.10) : undefined,
                 }}>{m}</th>
               ))}
             </tr>
@@ -157,11 +159,12 @@ export function SeasonalityGrid({ ticker, asOf }: { ticker: string; asOf?: strin
           <tbody>
             {bands.map(([label, stats, txt, style]) => (
               <tr key={label}>
-                <td style={{ color: 'var(--muted)', padding: '2px 8px', whiteSpace: 'nowrap' }}>{label}</td>
+                <td style={{ color: 'var(--muted)', padding: '3px 8px', whiteSpace: 'nowrap' }}>{label}</td>
                 {stats.map((s, j) => (
                   <td key={j} style={{
-                    padding: '2px 8px', textAlign: 'center',
-                    background: j === cur ? 'rgba(232,197,71,0.10)' : undefined,
+                    padding: '3px 8px', textAlign: 'center',
+                    borderBottom: '1px solid var(--track)',
+                    background: j === cur ? hexToRgba(YELLOW, 0.10) : undefined,
                     ...style(s),
                   }}>{txt(s)}</td>
                 ))}

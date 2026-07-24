@@ -1510,7 +1510,8 @@ def gather_report(ticker, args, interactive, backdrop_base):
             sec = fetch_sectors(data_dir=args.data_dir)
             if sec and sec.get("rows"):
                 sectors = {"rows": sec["rows"],
-                           "own": own_sector(ticker) if own_sector is not None else None}
+                           "own": (own_sector(ticker, data_dir=args.data_dir)
+                                   if own_sector is not None else None)}
         except Exception:
             sectors = None
     # top performers per sector (--movers; S59, opt-in) — each sector's ~10 largest names

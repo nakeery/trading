@@ -1,10 +1,14 @@
 /* LENS dark theme — the Streamlit app's palette (#0e1117 bg etc.) as CSS variables.
-   Components use these instead of hard-coded hex so the look stays consistent. */
+   Components use these instead of hard-coded hex so the look stays consistent.
+   utils/colors.ts mirrors the same hex values for Plotly/SVG contexts (which can't
+   read CSS vars from attributes) — keep the two files in lockstep. */
 
 :root {
   --bg: #0e1117;            /* page background (matches plotly plot_bgcolor)   */
   --panel: #141821;         /* section/card background                          */
+  --panel-2: #1a2029;       /* hover lift on cards/rows                         */
   --border: #2a2f3a;        /* card + table borders                             */
+  --track: #1a1f29;         /* table row borders, bar tracks (sub-border tone)  */
   --text: #d8dee9;          /* primary text                                     */
   --muted: #8b95a7;         /* section headers, captions                        */
   --faint: #6a7686;         /* LVN-gray, de-emphasized                          */
@@ -16,6 +20,15 @@
   --bluegray: #9fb4d0;      /* HVN, Tier-2                                      */
   --purple: #b070d0;        /* MA200, skew                                      */
   --gold: #d6ba2e;          /* RSI, MA20, event-IV                              */
+  --accent: var(--blue);    /* interactive accent (focus, active chips, Run)    */
+
+  /* scale tokens — use these instead of new magic numbers */
+  --r-sm: 4px;
+  --r-md: 8px;
+  --r-lg: 12px;
+  --fs-xs: 11.5px;
+  --fs-sm: 13px;
+  --fs-base: 15px;
 
   color-scheme: dark;
   font-family: "Segoe UI", system-ui, sans-serif;
@@ -27,11 +40,24 @@
 
 * { box-sizing: border-box; }
 
+html { scroll-behavior: smooth; }
+
 body {
   margin: 0;
   min-height: 100vh;
   background: var(--bg);
 }
+
+/* thin dark scrollbars everywhere (report tables, section nav, ANSI report) */
+* { scrollbar-width: thin; scrollbar-color: var(--border) transparent; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 5px;
+  border: 2px solid var(--bg);
+}
+::-webkit-scrollbar-thumb:hover { background: var(--muted); }
 
 code, pre, .mono {
   font-family: "Cascadia Mono", Consolas, monospace;
@@ -50,11 +76,30 @@ button {
   border-radius: 6px;
   padding: 4px 12px;
   cursor: pointer;
+  transition: border-color 0.15s, background 0.15s, color 0.15s, filter 0.15s;
 }
 button:hover { border-color: var(--muted); }
 button.primary {
-  background: var(--red);
-  border-color: var(--red);
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #0b0e14;
+  font-weight: 600;
+}
+button.primary:hover { filter: brightness(1.12); }
+
+/* toggle chip — the flag controls (aria-pressed carries the state) */
+button.chip {
+  border-radius: 999px;
+  padding: 3px 13px;
+  font-size: var(--fs-sm);
+  color: var(--muted);
+  background: transparent;
+}
+button.chip:hover { color: var(--text); border-color: var(--muted); }
+button.chip[aria-pressed='true'] {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: rgba(78, 163, 216, 0.12);
   font-weight: 600;
 }
 
@@ -65,5 +110,44 @@ input, select {
   border: 1px solid var(--border);
   border-radius: 6px;
   padding: 4px 8px;
+  transition: border-color 0.15s;
 }
-input:focus, select:focus { outline: 1px solid var(--blue); }
+input:focus, select:focus {
+  outline: 1px solid var(--accent);
+  border-color: var(--accent);
+}
+
+/* section card — Sections wraps every renderer in <section class="card">; a renderer
+   that returns null leaves the element empty, and :empty collapses it entirely */
+.card {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: var(--r-lg);
+  padding: 14px 18px 16px;
+  margin: 14px 0;
+}
+.card:empty { display: none; }
+.card > .sec-h:first-child { margin-top: 0; }
+
+/* aligned digits in every table/metric — prices and percentages line up */
+table, .num { font-variant-numeric: tabular-nums; }
+
+/* shared DataTable row hover */
+.dtable tbody tr:hover td { background: rgba(255, 255, 255, 0.025); }
+
+/* collapsible (<details>) chevron — replaces the native marker */
+summary { list-style: none; }
+summary::-webkit-details-marker { display: none; }
+summary:hover { border-color: var(--muted) !important; }
+.chev {
+  display: inline-block;
+  transition: transform 0.15s;
+  margin-right: 8px;
+  color: var(--muted);
+  font-size: 0.8em;
+}
+details[open] > summary .chev { transform: rotate(90deg); }
+
+/* clickable watchlist tile */
+.wtile { cursor: pointer; transition: border-color 0.15s, background 0.15s; }
+.wtile:hover { border-color: var(--muted); background: var(--panel-2); }

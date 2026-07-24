@@ -21,6 +21,19 @@ import SignalLedger from './components/SignalLedger'
 
 const DEBOUNCE_MS = 2000
 
+/** Slim inline status banner — colored left edge, no layout jump between states. */
+function Status({ color, children }: { color: string; children: React.ReactNode }) {
+  return (
+    <div style={{
+      borderLeft: `3px solid ${color}`, background: 'var(--panel)', color,
+      padding: '6px 12px', borderRadius: '0 var(--r-md) var(--r-md) 0',
+      margin: '10px 0', fontSize: 14,
+    }}>
+      {children}
+    </div>
+  )
+}
+
 interface Submitted {
   ticker: string
   flags: Flags
@@ -103,7 +116,12 @@ export default function App() {
 
   return (
     <div style={{ maxWidth: 1280, margin: '0 auto', padding: 16 }}>
-      <h2 style={{ marginTop: 0 }}>🔭 LENS — multi-timeframe market-structure &amp; risk</h2>
+      <h2 style={{ margin: '0 0 12px', fontSize: 22 }}>
+        🔭 LENS{' '}
+        <span style={{ color: 'var(--muted)', fontWeight: 400, fontSize: 15 }}>
+          — multi-timeframe market-structure &amp; risk
+        </span>
+      </h2>
       <TopBar
         ticker={ticker} flags={flags} chartFrom={chartFrom}
         known={tickers.data?.tickers ?? []}
@@ -111,15 +129,9 @@ export default function App() {
         onRun={() => runNow(true)} onPill={pickTicker}
       />
 
-      {pendingIn && (
-        <p style={{ color: 'var(--faint)' }}>⏳ applying changes — keep clicking to batch…</p>
-      )}
-      {report.isFetching && (
-        <p style={{ color: 'var(--amber)' }}>running the lens on {req?.ticker}…</p>
-      )}
-      {report.isError && (
-        <p style={{ color: 'var(--red)' }}>lens failed: {String(report.error)}</p>
-      )}
+      {pendingIn && <Status color="var(--faint)">⏳ applying changes — keep clicking to batch…</Status>}
+      {report.isFetching && <Status color="var(--amber)">running the lens on {req?.ticker}…</Status>}
+      {report.isError && <Status color="var(--red)">lens failed: {String(report.error)}</Status>}
 
       {report.data && !report.isFetching && (
         <>
@@ -131,24 +143,33 @@ export default function App() {
           ) : (
             <>
               {shownAsOf && (
-                <p style={{ color: 'var(--amber)' }}>
+                <Status color="var(--amber)">
                   🕰 AS-OF {shownAsOf} — historical backtest view: report, chart, and gauges
                   reflect data through that session only (no lookahead); live-chain/
                   current-only blocks are disabled
-                </p>
+                </Status>
               )}
-              <div style={{ display: 'flex', gap: 20, alignItems: 'flex-start' }}>
+              {/* default (stretch) alignment is load-bearing: the nav column must be as
+                  tall as the report column or the sticky nav has no room to travel and
+                  scrolls off with the page */}
+              <div style={{ display: 'flex', gap: 20 }}>
                 <div style={{ flex: 1, minWidth: 0 }}>
-                  <CandleChart
-                    ticker={payload.ticker}
-                    payload={payload}
-                    asOf={shownAsOf}
-                    start={chartFrom}
-                    live={shownLive}
-                  />
+                  <section className="card">
+                    <CandleChart
+                      ticker={payload.ticker}
+                      payload={payload}
+                      asOf={shownAsOf}
+                      start={chartFrom}
+                      live={shownLive}
+                    />
+                  </section>
                   {!shownAsOf && <DiffPanel diff={report.data.diff} />}
                   <EconCalendar />
-                  <IvHistoryChart ticker={payload.ticker} asOf={shownAsOf} />
+                  {/* IvHistoryChart renders null for tickers without harvested IV —
+                      .card:empty collapses the wrapper */}
+                  <section className="card">
+                    <IvHistoryChart ticker={payload.ticker} asOf={shownAsOf} />
+                  </section>
                   <EarningsReactions ticker={payload.ticker} asOf={shownAsOf}
                     payload={payload} />
                   <SeasonalityGrid ticker={payload.ticker} asOf={shownAsOf} />
@@ -158,7 +179,7 @@ export default function App() {
                   {!shownAsOf && <SignalLedger ticker={payload.ticker} />}
                   <AnsiReport html={report.data.ansi_html} />
                 </div>
-                <div style={{ width: 180, flexShrink: 0 }}>
+                <div style={{ width: 190, flexShrink: 0 }}>
                   <SectionNav p={payload} />
                 </div>
               </div>
