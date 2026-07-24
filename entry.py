@@ -240,7 +240,8 @@ def read_iv_from_csv(df, hv_20):
     atm_iv = latest.get("atm_iv_30d")
     if atm_iv is None or pd.isna(atm_iv):
         print(f"  WARNING: atm_iv_30d is NaN for {df.index[-1].date()} — "
-              f"re-run indicators.py to refresh the IV snapshot.")
+              f"re-run indicators.py to refresh the IV snapshot "
+              f"(requires an active Massive subscription).")
         return None
     if hv_20 is None or hv_20 <= 0:
         return None

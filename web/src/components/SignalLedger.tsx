@@ -2,6 +2,7 @@
 // ✓/✗ = fwd return vs the row's OWN stamped vol-adjusted threshold. Hidden in as-of mode
 // (showing realized outcomes would defeat the no-lookahead point); App enforces that.
 import { useQuery } from '@tanstack/react-query'
+import { getJson } from '../api/client'
 import { Caption, Collapsible } from './shared'
 
 interface ScoreRow {
@@ -25,10 +26,8 @@ interface Ledger {
 export default function SignalLedger({ ticker }: { ticker: string }) {
   const q = useQuery({
     queryKey: ['ledger', ticker],
-    queryFn: async () => {
-      const res = await fetch(`/api/ledger/${ticker}`)
-      return (await res.json() as { ledger: Ledger | null }).ledger
-    },
+    queryFn: async () =>
+      (await getJson<{ ledger: Ledger | null }>(`/api/ledger/${ticker}`)).ledger,
   })
   const led = q.data
   if (!led?.rows?.length) return null

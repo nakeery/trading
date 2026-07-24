@@ -71,6 +71,17 @@ N_INVERT_GOAL    = 5
 MAX_INVERT_TRIES = 40
 
 
+def _fetch_fail_msg(e):
+    """One-line failure message for a chain fetch — auth failures (401/403) get an
+    actionable hint: a PAUSED/INACTIVE subscription rejects the key, and re-running the
+    harvest cannot help until it's restored (the price pipeline is unaffected either way)."""
+    code = getattr(getattr(e, "response", None), "status_code", None)
+    if code in (401, 403):
+        return (f"Massive auth rejected ({code}) — subscription inactive/paused? "
+                f"IV harvest disabled until restored; price pipeline unaffected.")
+    return f"Massive chain fetch failed: {e}"
+
+
 def _get(url, params=None):
     if not MASSIVE_API_KEY:
         raise RuntimeError("MASSIVE_API_KEY env var not set — cannot call Massive API")
@@ -150,7 +161,7 @@ def get_chain_summary(ticker, underlying_price, target_dte=30):
         )
         rows = front_rows + back_rows
     except Exception as e:
-        print(f"  Massive chain fetch failed: {e}")
+        print(f"  {_fetch_fail_msg(e)}")
         return None
     if not rows:
         return None
@@ -311,7 +322,7 @@ def get_event_iv(ticker, underlying_price, earn_days, max_after=EVENT_MAX_AFTER)
             strike_max=underlying_price * 1.06,
         )
     except Exception as e:
-        print(f"  Massive event-expiry fetch failed: {e}")
+        print(f"  event-expiry {_fetch_fail_msg(e)}")
         return None
     return pick_event_atm(_parse_snapshot_rows(rows), underlying_price)
 

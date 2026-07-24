@@ -222,7 +222,8 @@ def gather_context(ticker, data_dir="data", with_vix=True, as_of=None):
                        "label": iv_stale.strip(), "pct": percentile_of(df["atm_iv_30d"], atm_iv),
                        "spark": spark_of(df["atm_iv_30d"])})
     else:
-        notes.append("atm_iv_30d NaN — options-IV block skipped (re-run indicators.py to harvest).")
+        notes.append("atm_iv_30d NaN — options-IV block skipped (re-run indicators.py to "
+                     "harvest; requires an active Massive subscription).")
 
     # ~180d ATM IV (S47) — the LEAPS-entry tenor. Label shows the ratio to the front tenor
     # (long-dated vol blends quiet weeks, so an event-bid front reads >1x its 180d). Percentile
@@ -251,7 +252,8 @@ def gather_context(ticker, data_dir="data", with_vix=True, as_of=None):
                        "spark": spark_of(df["put_call_oi_ratio"])})
     if stale_ages:
         notes.append(f"harvested options gauges lag the CSV by up to {max(stale_ages)} sessions "
-                     f"(flagged 'stale') — re-run indicators.py to refresh the Massive harvest.")
+                     f"(flagged 'stale') — re-run indicators.py to refresh the Massive harvest "
+                     f"(requires an active Massive subscription).")
 
     n_hist = int(df["iv_skew_25d"].dropna().shape[0]) if "iv_skew_25d" in df.columns else 0
     if 0 < n_hist < 63:

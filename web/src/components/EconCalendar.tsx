@@ -3,6 +3,7 @@
 // Zero network server-side; the refresh button is the only network path (FRED key needed).
 import { useState } from 'react'
 import { useQuery, useQueryClient } from '@tanstack/react-query'
+import { getJson } from '../api/client'
 import { Caption, Collapsible } from './shared'
 
 interface EconEvent {
@@ -123,20 +124,20 @@ export default function EconCalendar() {
   const [refreshing, setRefreshing] = useState(false)
   const q = useQuery({
     queryKey: ['econ_calendar'],
-    queryFn: async () => {
-      const res = await fetch('/api/econ_calendar')
-      return (await res.json() as { calendar: Calendar | null }).calendar
-    },
+    queryFn: async () =>
+      (await getJson<{ calendar: Calendar | null }>('/api/econ_calendar')).calendar,
     staleTime: 10 * 60_000,
   })
   const cal = q.data
   const refresh = async () => {
     setRefreshing(true)
     try {
-      const res = await fetch('/api/econ_calendar?refresh=1')
-      const d = await res.json() as { refresh: { status: string; message: string } | null }
+      const d = await getJson<{ refresh: { status: string; message: string } | null }>(
+        '/api/econ_calendar?refresh=1')
       setRefreshMsg(d.refresh ? `${d.refresh.status}: ${d.refresh.message}` : null)
       qc.invalidateQueries({ queryKey: ['econ_calendar'] })
+    } catch (e) {
+      setRefreshMsg(`refresh failed: ${String(e)}`)
     } finally {
       setRefreshing(false)
     }

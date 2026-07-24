@@ -38,18 +38,21 @@ function rrgFig(rows: SectorRow[], own?: string | null): PlotlyFig | null {
   if (!pts.length) return null
   const maxAbs = Math.max(...pts.map((r) => Math.max(Math.abs(r.rel_63d), Math.abs(r.rel_20d))))
   const R = Math.max(0.02, maxAbs * 1.2)
-  const data = Object.keys(TAG_COLOR)
+  // 'in line' is _quadrant's 5th tag (both horizons inside the ±0.5% dead band) — without
+  // its own trace those sectors would silently vanish from the scatter
+  const data = [...Object.keys(TAG_COLOR), 'in line']
     .map((tag) => {
       const sub = pts.filter((r) => r.tag === tag)
+      const color = TAG_COLOR[tag] ?? GRAY
       return {
         type: 'scatter', mode: 'markers+text', name: tag,
         x: sub.map((r) => r.rel_63d), y: sub.map((r) => r.rel_20d),
         text: sub.map((r) => (own && r.sym === own ? `► ${r.sym}` : r.sym)),
         textposition: 'top center',
-        textfont: { size: 10.5, color: TAG_COLOR[tag] },
+        textfont: { size: 10.5, color },
         marker: {
           size: sub.map((r) => (own && r.sym === own ? 12 : 9)),
-          color: TAG_COLOR[tag],
+          color,
           line: { width: sub.map((r) => (own && r.sym === own ? 2 : 0)), color: SPOT_GOLD },
         },
         customdata: sub.map((r) => [r.name, r.tag]),
@@ -76,7 +79,10 @@ function rrgFig(rows: SectorRow[], own?: string | null): PlotlyFig | null {
         quad(-R, 0, 0, R, hexA(BLUE, 0.05)),
         quad(0, R, -R, 0, hexA(AMBER, 0.05)),
         quad(-R, 0, -R, 0, hexA(RED, 0.05)),
-        // the ±0.5% flat band the table's tint also uses — inside it, RS is noise
+        // the ±0.5% flat band the table's tint also uses — inside it, RS is noise.
+        // NB a point flat on ONE axis is tagged by the other axis's sign (_quadrant),
+        // so its marker color can differ from the quadrant tint it sits in — inherent
+        // to overlaying a hard tag on a continuous scatter; these stripes are the cue
         { type: 'rect', x0: -0.005, x1: 0.005, y0: -R, y1: R, line: { width: 0 }, fillcolor: 'rgba(154,164,178,0.06)', layer: 'below' },
         { type: 'rect', x0: -R, x1: R, y0: -0.005, y1: 0.005, line: { width: 0 }, fillcolor: 'rgba(154,164,178,0.06)', layer: 'below' },
         { type: 'line', x0: 0, x1: 0, y0: -R, y1: R, line: { width: 0.8, color: '#4a5160' } },
@@ -191,9 +197,10 @@ export function SecEvents({ p }: { p: Payload }) {
 
   const events: TimelineEvent[] = []
   let beyond = 0
+  let beyondCats = 0
   for (const [d, days, typ, desc] of cats) {
     if (days == null) continue
-    if (days > EVENTS_HORIZON) { beyond += 1; continue }
+    if (days > EVENTS_HORIZON) { beyond += 1; beyondCats += 1; continue }
     events.push({ label: typ, days, date: d, color: RED, title: desc })
   }
   for (const [name, [d, days]] of Object.entries(macro)) {
@@ -216,7 +223,8 @@ export function SecEvents({ p }: { p: Payload }) {
   }
 
   const macroSoon = Object.entries(macro)
-    .filter(([, [d, days]]) => d != null && days != null && days <= 10)
+    // days >= 0: the timeline drops already-released dates, the table must match
+    .filter(([, [d, days]]) => d != null && days != null && days >= 0 && days <= 10)
     .map(([name, [d, days]]) => ({ name, date: String(d).slice(0, 10), days: days! }))
     .sort((a, b) => a.days - b.days)
 
@@ -225,7 +233,13 @@ export function SecEvents({ p }: { p: Payload }) {
     <>
       <Sec title={`UPCOMING EVENTS (next ${EVENTS_HORIZON}d)`} />
       <TimelineStrip events={events} horizon={EVENTS_HORIZON} />
-      {beyond > 0 && <Caption>+{beyond} further out (see tables)</Caption>}
+      {/* only the catalysts table lists beyond-horizon dates — don't promise tables for
+          a far-out earnings/FOMC that no table here shows */}
+      {beyond > 0 && (
+        <Caption>
+          +{beyond} further out{beyondCats > 0 ? ' (catalysts table shows all dates)' : ''}
+        </Caption>
+      )}
       {!!cats.length && (
         <Collapsible title="catalysts table (catalysts.csv)">
           <DataTable

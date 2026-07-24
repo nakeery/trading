@@ -1540,10 +1540,13 @@ def gather_report(ticker, args, interactive, backdrop_base):
         sqz = gather_squeeze(ticker, daily=frames.get("1D"), rvol=rvol_1d, pc=pc,
                              profile=profile, data_dir=args.data_dir)
         if sqz is None:
+            # leave sqz None — an all-n/a squeeze shell would also suppress the standalone
+            # RETAIL ATTENTION section (its guard is `buzz and not squeeze`); with sqz None
+            # a ranked buzz falls through to that section instead
             notes.append("short-positioning data unavailable (NASDAQ/FINRA fetch failed).")
-        # ranked retail buzz rides the squeeze block as before (S56) — attention beside fuel
-        if buzz and not buzz.get("unranked"):
-            sqz = dict(sqz) if sqz else {}
+        elif buzz and not buzz.get("unranked"):
+            # ranked retail buzz rides the squeeze block as before (S56) — attention beside fuel
+            sqz = dict(sqz)
             sqz["buzz"] = buzz
 
     # INSIDER ACTIVITY (--insider; S42) — SEC EDGAR Form 4 open-market flow, cached.
@@ -1661,8 +1664,10 @@ if __name__ == "__main__":
     ap.add_argument("--data-dir", default="data")
     ap.add_argument("--as-of", dest="as_of", metavar="YYYY-MM-DD",
                     help="Historical/backtest mode (S57): compute the report as of this past date "
-                         "— every frame truncated (no lookahead). Live-chain/current-only blocks "
-                         "(pc-oi, gex, vol quote, call, squeeze, insider, geo, live) are disabled.")
+                         "— every frame truncated (no lookahead). Live-chain/current-only blocks are "
+                         "disabled: pc-oi, gex, vol quote, call, squeeze, insider, geo, live, sector "
+                         "rotation/movers, retail buzz, street, ex-div, liquidity line, and the "
+                         "breadth/F&G/COT/sent backdrop segments (SPY tide is rebuilt as-of).")
     ap.add_argument("--no-refresh", action="store_true",
                     help="Skip the auto-refresh of stale indicators CSVs (render whatever is on disk).")
     ap.add_argument("--refresh", action="store_true",
@@ -1721,7 +1726,9 @@ if __name__ == "__main__":
             print("  No ticker entered."); sys.exit(1)
         tickers = [t]
 
-    backdrop_base = build_backdrop(args.data_dir)
+    # as-of mode rebuilds a historical backdrop inside gather_report and discards this one —
+    # skip the current-day F&G/COT/marketsent fetches entirely
+    backdrop_base = None if args.as_of else build_backdrop(args.data_dir)
     interactive = sys.stdin.isatty()
     for ticker in tickers:
         render_ticker(ticker, args, use_color, interactive, backdrop_base)

@@ -67,8 +67,11 @@ def generate(ticker, flags):
     on failure, exactly like the Streamlit path."""
     buf = io.StringIO()
     with contextlib.redirect_stdout(buf):
+        # as-of mode rebuilds a historical backdrop inside gather_report and discards
+        # backdrop_base — skip the current-day F&G/COT/marketsent fetches entirely
+        base = None if flags.get("as_of") else lens.build_backdrop(DATA_DIR)
         payload = lens.gather_report(ticker, make_args(flags), interactive=False,
-                                     backdrop_base=lens.build_backdrop(DATA_DIR))
+                                     backdrop_base=base)
     preamble = buf.getvalue()
     ansi = ""
     if payload is not None:

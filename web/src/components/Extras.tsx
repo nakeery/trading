@@ -2,7 +2,7 @@
 // earnings-reaction table, monthly-seasonality grid — ports of the same blocks in
 // lens_web.py's display path. All zero-network on the server (CSV reads, cached).
 import { useQuery } from '@tanstack/react-query'
-import { fetchIvHistory } from '../api/client'
+import { fetchIvHistory, getJson } from '../api/client'
 import type { Payload } from '../api/types'
 import { GREEN, RED, rampHex } from '../utils/colors'
 import { Caption, Collapsible, DataTable, Sec } from './shared'
@@ -48,10 +48,8 @@ export function EarningsReactions({ ticker, asOf, payload }: {
 }) {
   const q = useQuery({
     queryKey: ['reactions', ticker, asOf],
-    queryFn: async () => {
-      const res = await fetch(`/api/earnings_reactions/${ticker}${asOf ? `?asof=${asOf}` : ''}`)
-      return res.json() as Promise<Reactions>
-    },
+    queryFn: () =>
+      getJson<Reactions>(`/api/earnings_reactions/${ticker}${asOf ? `?asof=${asOf}` : ''}`),
   })
   const rx = q.data
   if (!rx?.rows?.length) return null
@@ -105,10 +103,8 @@ const MONTH_FULL = ['January', 'February', 'March', 'April', 'May', 'June', 'Jul
 export function SeasonalityGrid({ ticker, asOf }: { ticker: string; asOf?: string | null }) {
   const q = useQuery({
     queryKey: ['seasonality', ticker, asOf],
-    queryFn: async () => {
-      const res = await fetch(`/api/seasonality/${ticker}${asOf ? `?asof=${asOf}` : ''}`)
-      return res.json() as Promise<Seasonality>
-    },
+    queryFn: () =>
+      getJson<Seasonality>(`/api/seasonality/${ticker}${asOf ? `?asof=${asOf}` : ''}`),
   })
   const seas = q.data
   if (!seas) return null

@@ -31,6 +31,19 @@ def health():
     return {"status": "ok"}
 
 
+def _check_date(name: str, val: str | None, allow_future: bool = True) -> None:
+    """422 on an unparseable date query param, and (for as_of) on a future date — a
+    future as-of would produce a current report wearing a historical banner."""
+    if not val:
+        return
+    try:
+        ts = pd.Timestamp(val)
+    except Exception:
+        raise HTTPException(422, f"invalid {name} date: {val!r}")
+    if not allow_future and ts.normalize() > pd.Timestamp.today().normalize():
+        raise HTTPException(422, f"{name} is in the future: {val!r}")
+
+
 @app.get("/api/tickers")
 def tickers():
     """Every ticker with an indicators CSV on disk (ports lens_web.known_tickers)."""
@@ -61,6 +74,7 @@ async def report(ticker: str,
     a day-over-day snapshot is saved + diffed (skipped in as-of mode: a backtest rerun must
     not overwrite that date's real end-of-day snapshot)."""
     t = ticker.strip().upper()
+    _check_date("as_of", as_of, allow_future=False)
     flags = {"vol": vol, "call": call, "gex": gex, "squeeze": squeeze, "insider": insider,
              "street": street, "movers": movers, "geo": geo,
              "live": live and not as_of, "pc_oi": pc_oi,
@@ -99,12 +113,8 @@ def chart(ticker: str, as_of: str | None = None, start: str | None = None,
     fig is rebuilt server-side per combination; the daily frame underneath is cached.
     Profile/events/GEX levels come from the ticker's LATEST generated payload (S54)."""
     t = ticker.strip().upper()
-    for name, val in (("as_of", as_of), ("start", start)):
-        if val:
-            try:
-                pd.Timestamp(val)
-            except Exception:
-                raise HTTPException(422, f"invalid {name} date: {val!r}")
+    _check_date("as_of", as_of, allow_future=False)
+    _check_date("start", start)  # a future start just yields an empty window — parse-only
     ov = tuple(x for x in (s.strip() for s in overlays.split(","))
                if x in charts.OVERLAY_TOKENS)
     asp = tuple(x for x in (s.strip() for s in aspects.split(",")) if x in charts.VP_ASPECTS)

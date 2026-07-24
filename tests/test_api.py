@@ -221,6 +221,10 @@ def test_sanitize_nat():
     out = sanitize({"d": pd.NaT, "ok": pd.Timestamp("2026-07-21")})
     assert out == {"d": None, "ok": "2026-07-21T00:00:00"}
     json.dumps(out, allow_nan=False)
+    # the numpy/pandas NaT variants must map to None too (each rides a different branch)
+    assert sanitize(np.datetime64("NaT")) is None
+    assert sanitize(np.timedelta64("NaT")) is None
+    assert sanitize(pd.Timedelta("NaT")) is None
 
 
 def test_latest_tracks_cache_hits(monkeypatch):
@@ -244,6 +248,20 @@ def test_chart_bad_asof_is_422_not_500():
     assert r.status_code == 422
     r = client.get("/api/chart/QQQ?start=not-a-date")
     assert r.status_code == 422
+
+
+def test_report_bad_asof_is_422_not_500(monkeypatch):
+    """The report endpoint must validate as_of exactly like the chart endpoint — a
+    garbage value previously reached pd.Timestamp inside gather_report → bare 500."""
+    monkeypatch.setattr(reportgen, "generate", fake_generate(fake_payload()))
+    assert client.get("/api/report/FAKE?as_of=banana").status_code == 422
+
+
+def test_future_asof_is_422_both_endpoints(monkeypatch):
+    """A future as-of would produce a CURRENT report wearing a historical banner."""
+    monkeypatch.setattr(reportgen, "generate", fake_generate(fake_payload()))
+    assert client.get("/api/report/FAKE?as_of=2999-01-01").status_code == 422
+    assert client.get("/api/chart/QQQ?as_of=2999-01-01").status_code == 422
 
 
 def test_chart_unknown_ticker_is_404_not_500(monkeypatch):

@@ -61,11 +61,15 @@ const NAV: [string, string, (p: Payload) => unknown][] = [
   ['Insider activity', 'insider-activity', (p) => p.insider],
   ['Street & news', 'street-news', (p) => p.street],
   ['Put/call OI', 'put-call-oi', (p) => p.pcoi],
-  ['Gamma exposure', 'gamma-exposure', (p) => p.gex],
+  // gex/sectors: length-check the array the renderer null-guards on — a truthy object
+  // with an empty by_strike/rows would otherwise emit a dead anchor
+  ['Gamma exposure', 'gamma-exposure',
+    (p) => (p.gex as { by_strike?: unknown[] } | null)?.by_strike?.length],
   ['Volatility setup', 'volatility-setup', (p) => p.vol],
   ['Long call viability', 'long-call-viability', (p) => p.callq],
   ['Geo backdrop', 'geopolitical-cross-asset-backdrop', (p) => p.geo],
-  ['Sector rotation', 'sector-rotation', (p) => p.sectors],
+  ['Sector rotation', 'sector-rotation',
+    (p) => (p.sectors as { rows?: unknown[] } | null)?.rows?.length],
   // shared predicate: SecEvents can render null even when earn/exd/macro keys exist (all
   // beyond horizon) — the old inline check emitted a dead anchor for that case
   ['Upcoming events', 'upcoming-events', hasUpcomingEvents],

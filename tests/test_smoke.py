@@ -2114,3 +2114,50 @@ def test_s61_street_nan_price_targets():
                      "high": 150.0, "low": float("nan")}, [], {})
     assert r["pt"]["median"] is None and r["pt"]["low"] is None
     assert r["pt"]["high"] == 150.0 and abs(r["pt"]["upside_mean"] - 0.20) < 1e-9
+
+
+# ─── S62: squeeze-shell fix + Massive auth-aware failure message ─────────────────
+def test_s62_failed_squeeze_leaves_buzz_standalone(monkeypatch):
+    """gather_squeeze returning None (both SI sources down) with a RANKED buzz must leave
+    payload['squeeze'] None — the old code built {'buzz': ...}, rendering an all-n/a
+    SHORT POSITIONING shell that also suppressed the RETAIL ATTENTION section."""
+    from types import SimpleNamespace
+
+    import lens
+
+    for name in ("next_earnings", "next_ex_dividend", "fetch_rs", "fetch_beta",
+                 "fetch_sectors", "own_sector", "fetch_street"):
+        monkeypatch.setattr(lens, name, None, raising=False)
+    ranked = {"rank": 42, "mentions": 100, "rank_prev": 50, "chg": 0.1}
+    monkeypatch.setattr(lens, "fetch_buzz", lambda ticker, data_dir="data": dict(ranked))
+    monkeypatch.setattr(lens, "gather_squeeze", lambda *a, **k: None)
+
+    args = SimpleNamespace(ticker=None, thesis=None, level=None, no_intraday=True, no_vix=True,
+                           geo=False, no_color=True, candle="none", candle_px=128, prev=10,
+                           data_dir="data", no_refresh=True, refresh=False, pc_oi=None,
+                           insider=False, squeeze=True, live=False, vol=False, call=False,
+                           street=False)
+    payload = lens.gather_report("QQQ", args, interactive=False, backdrop_base=None)
+    assert payload is not None
+    assert payload["squeeze"] is None                      # no empty shell
+    assert payload["buzz"] and payload["buzz"]["rank"] == 42   # buzz survives standalone
+    assert any("short-positioning data unavailable" in n for n in payload["notes"])
+
+    # and when the squeeze fetch SUCCEEDS, ranked buzz still rides the block
+    monkeypatch.setattr(lens, "gather_squeeze", lambda *a, **k: {"si": None, "read": {}})
+    payload2 = lens.gather_report("QQQ", args, interactive=False, backdrop_base=None)
+    assert payload2["squeeze"] and payload2["squeeze"]["buzz"]["rank"] == 42
+
+
+def test_s62_massive_auth_failure_message():
+    """A paused/inactive Massive subscription surfaces as HTTP 401/403 — the failure line
+    must say so (re-running the harvest cannot help until the subscription is restored)."""
+    from types import SimpleNamespace
+
+    from modules.massive import _fetch_fail_msg
+
+    auth = SimpleNamespace(response=SimpleNamespace(status_code=403))
+    msg = _fetch_fail_msg(auth)
+    assert "403" in msg and "subscription" in msg and "price pipeline unaffected" in msg
+    assert "subscription" not in _fetch_fail_msg(RuntimeError("boom"))
+    assert "boom" in _fetch_fail_msg(RuntimeError("boom"))

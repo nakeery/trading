@@ -353,9 +353,11 @@ export function SecSqueeze({ p }: { p: Payload }) {
               </div>
             )}
           </div>
-          {(read.caveats ?? []).map((c, i) => <Caption key={i}>· {c}</Caption>)}
         </Collapsible>
       )}
+      {/* caveats OUTSIDE the fold: squeeze_read always returns them even with zero
+          fuel/counter factors — the CLI/Streamlit print them unconditionally */}
+      {(read.caveats ?? []).map((c, i) => <Caption key={i}>· {c}</Caption>)}
       {bz && <Caption>· buzz = attention, not direction — crowded names gap on headlines both ways</Caption>}
     </>
   )

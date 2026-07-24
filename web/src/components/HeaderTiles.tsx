@@ -31,14 +31,17 @@ export default function HeaderTiles({ payload, range52, live: liveTick }: {
 }) {
   let lb = (payload.last_bar ?? {}) as LastBar
   const live = payload.live as Payload['live']
-  let when = live?.applied ? `LIVE ${live.hhmm ?? ''} ET` : `close · ${payload.as_of}`
+  // "LIVE" requires an in-progress session (Streamlit parity) — an applied after-hours
+  // quote is still the day's close, not a live print
+  let when = live?.applied && live.in_progress
+    ? `LIVE ${live.hhmm ?? ''} ET` : `close · ${payload.as_of}`
   // a fresh chart-poll tick (live mode) overrides the report's bar — the tiles ride it
   if (liveTick?.found && liveTick.close != null) {
     lb = {
       close: liveTick.close, prev_close: liveTick.prev_close ?? lb.prev_close,
       open: liveTick.open ?? lb.open, high: liveTick.high ?? lb.high, low: liveTick.low ?? lb.low,
     }
-    when = `LIVE ${liveTick.hhmm ?? ''} ET`
+    when = liveTick.in_progress ? `LIVE ${liveTick.hhmm ?? ''} ET` : `close · ${payload.as_of}`
   }
   const chg = lb.close != null && lb.prev_close ? lb.close / lb.prev_close - 1 : null
   return (

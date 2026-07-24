@@ -69,8 +69,8 @@ export function BalanceBar({ left, right, leftLabel, rightLabel,
       <div style={{ display: 'flex', gap: 2, height: 12 }}>
         {l > 0 && (
           <div style={{
-            flexGrow: lFrac, background: leftColor, borderRadius: '3px 0 0 3px',
-            minWidth: 4,
+            flexGrow: lFrac, background: leftColor,
+            borderRadius: r > 0 ? '3px 0 0 3px' : 3, minWidth: 4,
           }} />
         )}
         {r > 0 && (
@@ -122,16 +122,24 @@ export function RangeStrip({ lo, hi, bands = [], markers = [], fmt = fmtDefault,
     .filter((m): m is StripMarker & { value: number } => m.value != null && isFinite(m.value))
     .sort((a, b) => a.value - b.value)
 
-  // label collision: walk left→right, drop a labeled marker below the track when its
-  // label would overlap the previous one's
-  let prevEnd = -Infinity
+  // label collision: walk left→right with SEPARATE extents per lane — a label that
+  // collides above tries below; one that collides in both lanes is skipped entirely
+  // (the marker stays; the end labels give the scale)
+  let endAbove = -Infinity
+  let endBelow = -Infinity
   const placed = ms.map((m) => {
-    if (!m.label) return { ...m, below: false }
+    if (!m.label) return { ...m, below: false, hideLabel: false }
     const w = m.label.length * 6.2
     const start = x(m.value) - w / 2
-    const below = start < prevEnd + 4
-    if (!below) prevEnd = start + w
-    return { ...m, below }
+    if (start >= endAbove + 4) {
+      endAbove = start + w
+      return { ...m, below: false, hideLabel: false }
+    }
+    if (start >= endBelow + 4) {
+      endBelow = start + w
+      return { ...m, below: true, hideLabel: false }
+    }
+    return { ...m, below: false, hideLabel: true }
   })
 
   const glyph: ReactNode[] = placed.map((m, i) => {
@@ -150,12 +158,13 @@ export function RangeStrip({ lo, hi, bands = [], markers = [], fmt = fmtDefault,
       parts.push(<line key="p" x1={cx} x2={cx} y1={TRACK_Y - 4} y2={TRACK_Y + 4} stroke={color} strokeWidth={1} opacity={0.75} />)
     }
     if (clampedLeft || clampedRight) {
+      // inset toward the strip interior — at an edge, ±8 outward falls outside the viewBox
       parts.push(
-        <text key="c" x={cx + (clampedLeft ? -8 : 8)} y={TRACK_Y + 4} fontSize={11}
+        <text key="c" x={cx + (clampedLeft ? 8 : -8)} y={TRACK_Y + 4} fontSize={11}
           fill={color} textAnchor="middle">{clampedLeft ? '‹' : '›'}</text>,
       )
     }
-    if (m.label) {
+    if (m.label && !m.hideLabel) {
       parts.push(
         <text key="t" x={cx} y={m.below ? TRACK_Y + 19 : LABEL_H - 2} fontSize={10.5}
           fill={color} textAnchor="middle">{m.label}</text>,
@@ -246,7 +255,9 @@ export function TimelineStrip({ events, horizon = 30, width = 640 }: {
       {placed.map((e, i) => (
         <g key={i}>
           <title>{`${e.label}${e.date ? ` — ${e.date}` : ''} (${e.days}d)${e.title ? ` · ${e.title}` : ''}`}</title>
-          <line x1={x(e.days)} x2={x(e.days)} y1={laneY(e.lane) + 3} y2={axisY - 3}
+          {/* diagonal stem: the label can be clamp-shifted away from the dot's x (edge
+              events) — a vertical stem at x(days) would leave the label floating */}
+          <line x1={e.labelX} x2={x(e.days)} y1={laneY(e.lane) + 3} y2={axisY - 3}
             stroke={e.color} strokeWidth={0.8} opacity={0.45} />
           <circle cx={x(e.days)} cy={axisY} r={4.5} fill={e.color} />
           <text x={e.labelX} y={laneY(e.lane)} fontSize={10.5} fill={e.color} textAnchor="middle">

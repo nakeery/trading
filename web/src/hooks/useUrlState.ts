@@ -21,6 +21,12 @@ export function readUrl(): UrlState {
   for (const k of BOOLS) if (q.get(k) === '1') flags[k] = true
   const pc = q.get('pc_oi')
   if (pc && ['all', 'near', 'leaps', 'monthly'].includes(pc)) flags.pc_oi = pc as PcOiScope
+  // thesis/level round-trip: writeUrl emits both (via flagsToParams) — dropping them here
+  // silently reset the bias overlay on every reload/share of the app's own URLs
+  const thesis = q.get('thesis')
+  if (thesis === 'bullish' || thesis === 'bearish') flags.thesis = thesis
+  const level = Number(q.get('level'))
+  if (q.get('level') && isFinite(level) && level > 0) flags.level = level
   const asof = q.get('asof')
   if (asof) {
     // clamp to LOCAL today, mirroring the Streamlit guard (UTC "today" is already
