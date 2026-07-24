@@ -3,3 +3,5 @@ data/
 *pycache*
 .claude/
 *.bak
+CLEANUP_PLAN.md
+reorganize_repo.ps1

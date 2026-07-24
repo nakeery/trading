@@ -132,7 +132,8 @@ def test_vol_thresholds_range_qqq(df_qqq):
 # ─── Test 4: Signal logic unit test ───────────────────────────────────────────
 
 def test_signal_logic():
-    import entry
+    import pytest
+    entry = pytest.importorskip("entry")  # archived to archive/ml_pipeline/ — skips when moved
     cases = [
         # (dir_win, dir_win_63, expansion, expected_label)
         (True,  True,  True,  "STRONG ENTRY"),
@@ -161,7 +162,8 @@ def test_entry_train_threshold_sensitivity(df_qqq):
     Guard: precision must differ when threshold changes from 0.50 → 0.55.
     Uses local features only (no VIX/benchmarks) to avoid network calls.
     """
-    import entry
+    import pytest
+    entry = pytest.importorskip("entry")  # archived to archive/ml_pipeline/ — skips when moved
     from modules.features import (
         compute_hv_features,
         add_trend_break_features,
@@ -1697,8 +1699,9 @@ def test_web_snapshot_diff_and_slugs():
     """Day-over-day snapshot extraction + diff (pure) and the stable section-anchor slugs the
     sidebar quick-nav links against. Importing lens_web executes the page script in bare mode
     — doubles as a does-the-module-even-run smoke."""
-    import lens_web
-    from lens_web_sections import _slug
+    import pytest
+    lens_web = pytest.importorskip("lens_web")  # archived to archive/streamlit/ — skips when moved
+    _slug = pytest.importorskip("lens_web_sections")._slug
 
     pay = {"as_of": "2026-07-10", "last_bar": {"close": 100.0, "prev_close": 99.0},
            "setup": {"rows": [("HTF alignment", "✓", ""), ("Momentum room", "✗", "")]},
