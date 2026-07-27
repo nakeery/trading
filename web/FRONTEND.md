@@ -111,6 +111,7 @@ you retire it. Feature parity checklist against it:
 | Report generation (all flags, pc-oi scopes, thesis/level) | ✅ same engine, same payload |
 | Candlestick chart (two-axis hollow candles, MA/EMA/BB/RSI/MACD/volume overlays, price line, vol-profile aspects, GEX levels, event markers, rangebreaks) | ✅ fig built by the SAME Python code, ported into `api/charts.py` |
 | Header tiles + 52-week range | ✅ |
+| Entry-timing rows (`ltf`: 30m/15m/5m below a divider in the multi-TF table, live session only) | ✅ same divider + per-block heat scale as the CLI |
 | All 20 native sections (multi-TF heat table, risk/setup panels, gauges w/ sparklines + ordinal percentiles, PC/OI bars + strike walls, GEX bars, straddle/strangle + long-call tables, IV curve, sectors, street, insider, squeeze/buzz, catalysts, macro, thesis) | ✅ verified vs the ANSI report (QQQ + AMD, all flags) |
 | Full ANSI text report expander | ✅ server-side ansi2html |
 | IV-vs-HV history (+25Δ skew pane, pre-earnings shading) | ✅ |

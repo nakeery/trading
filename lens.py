@@ -12,7 +12,8 @@ weekly).
 Usage:
     python -X utf8 lens.py                         # prompts for ticker
     python -X utf8 lens.py --thesis bullish --level 150
-    python -X utf8 lens.py --no-intraday           # skip 1h/4h (offline / fast)
+    python -X utf8 lens.py --no-intraday           # skip 1h/4h/2h (offline / fast)
+    python -X utf8 lens.py --ltf                   # + 30m/15m/5m entry timing (live session only)
 Piped (Windows):
     cmd /c "(echo QQQ) | python -X utf8 lens.py"
 """
@@ -24,7 +25,9 @@ import sys
 
 import pandas as pd
 
-from modules.timeframes import build_timeframes, last_bar_partial, fetch_live_bar, apply_live_bar
+from modules.timeframes import (
+    build_timeframes, last_bar_partial, fetch_live_bar, apply_live_bar, INTRADAY_TFS, TF_MINUTES,
+)
 from modules.structure import (
     read_timeframe, read_volume, detect_divergence,
     multi_timeframe_summary, rally_drawdown_risk, read_squeeze,
@@ -474,14 +477,17 @@ def sixel_candles(bars, color=True, cell_w=14, gap=8, height_px=128):
     return _to_sixel(grid, palette)
 
 
-def analyze(ticker, include_intraday=True, data_dir="data", live=False, as_of=None):
+def analyze(ticker, include_intraday=True, data_dir="data", live=False, as_of=None, ltf=False):
     """`as_of` (S57 — historical/backtest mode): every frame is truncated to that date before the
     reads run, so trend/RSI/volume/profile/divergences are exactly what the lens would have said
-    then. Live mode is meaningless historically and is forced off."""
+    then. Live mode is meaningless historically and is forced off.
+    `ltf` (S63): add the sub-hourly entry-timing frames when the session is live (see
+    build_timeframes) — display-only, isolated from every synthesis downstream."""
     if as_of is not None:
         live = False
     frames, notes = build_timeframes(ticker, data_dir=data_dir, include_intraday=include_intraday,
-                                     intraday_ttl_hours=0 if live else 3, live=live, as_of=as_of)
+                                     intraday_ttl_hours=0 if live else 3, live=live, as_of=as_of,
+                                     ltf=ltf)
     live_bar = None
     if live:
         live_bar = fetch_live_bar(ticker)
@@ -504,10 +510,12 @@ def analyze(ticker, include_intraday=True, data_dir="data", live=False, as_of=No
             continue
         partial = (last_bar_partial(frames.get("1D"), tf, now_session=asof_sess)
                    or (live_partial and tf == "1D"))
-        if live and tf in ("1h", "4h") and len(df):
-            # in live mode the last intraday bar can be the forming hour — treat it as partial so
-            # RVOL/ΔVol% use the last completed bar (same convention as the W/M/1D partial bars).
-            bar_min = 60 if tf == "1h" else 240
+        if len(df) and (tf in INTRADAY_TFS or (live and tf in ("1h", "4h", "2h"))):
+            # the last intraday bar can be the forming one — treat it as partial so RVOL/ΔVol% use
+            # the last completed bar (same convention as the W/M/1D partial bars). Always checked
+            # for the entry-timing frames (they only exist mid-session, so the tail bar is forming
+            # by definition); for 1h/4h/2h only under --live, where the frame is topped up live.
+            bar_min = TF_MINUTES.get(tf, 60)
             partial = partial or (now_naive < df.index[-1] + pd.Timedelta(minutes=bar_min))
         r["_vol"] = read_volume(df, exclude_last=partial)
         r["_partial"] = partial
@@ -533,6 +541,12 @@ def analyze(ticker, include_intraday=True, data_dir="data", live=False, as_of=No
 # "not supplied" sentinel for print_report's macro_events kwarg (S49) — distinguishes an
 # unsupplied value (compute inside, the pre-S49 behavior) from a computed-but-None/empty one.
 _UNSET = object()
+
+
+def _trend_divs(divs):
+    """(S63) Divergences from the TREND frames only. A 5m/15m divergence is real and worth
+    printing, but it fires constantly and must never land in the risk scorecard's factor tally."""
+    return {tf: v for tf, v in (divs or {}).items() if tf not in INTRADAY_TFS}
 
 
 def _section(title, color=True, w=78):
@@ -615,24 +629,37 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
     if has_partial:
         print(f"  {dim}* in-progress bar — RVOL/ΔVol%/VolTrend use the last completed bar "
               f"(price/RSI/ΔPrc% stay live){rst}")
-    print(f"  {'TF':<4}{'Trend':<7}{'RSI':<8}{'Stoch':<6}{'MACD':<8}"
+    print(f"  {'TF':<6}{'Trend':<7}{'RSI':<8}{'Stoch':<6}{'MACD':<8}"
           f"{'RVOL':<6}{'ΔPrc%':>7}{'ΔVol%':>8}   {'VolTrend':<13}")
     # per-column half-scales for the heatmap, anchored at a fixed neutral (0 for the signed Δ%
     # columns → +green/−red; 1.0 for RVOL since it is a ratio that is never negative). Measured from
     # the dead-zone edge (HEAT_DEAD) so the largest beyond-band mover still reaches full saturation.
-    def _half_scale(key, neutral, dead):
-        vals = [x for x in ((reads[tf].get("_vol") or {}).get(key) for tf in reads) if x is not None]
+    # Computed PER BLOCK (S63): a 5m bar's RVOL/ΔVol% swings dwarf a monthly's, so one shared scale
+    # would wash every trend row toward neutral the moment --ltf is on.
+    def _half_scale(key, neutral, dead, tfs):
+        vals = [x for x in ((reads[tf].get("_vol") or {}).get(key) for tf in tfs) if x is not None]
         m = max((abs(x - neutral) - dead for x in vals), default=None)
         return m if (m is not None and m > 1e-12) else None
-    dp_hs = _half_scale("price_chg_10", 0.0, HEAT_DEAD["price_chg_10"])
-    dv_hs = _half_scale("vol_trend_10", 0.0, HEAT_DEAD["vol_trend_10"])
-    rv_hs = _half_scale("rvol", 1.0, HEAT_DEAD["rvol"])
+
+    def _scales(tfs):
+        return {"price_chg_10": _half_scale("price_chg_10", 0.0, HEAT_DEAD["price_chg_10"], tfs),
+                "vol_trend_10": _half_scale("vol_trend_10", 0.0, HEAT_DEAD["vol_trend_10"], tfs),
+                "rvol": _half_scale("rvol", 1.0, HEAT_DEAD["rvol"], tfs)}
+    trend_tfs = [tf for tf in reads if tf not in INTRADAY_TFS]
+    entry_tfs = [tf for tf in reads if tf in INTRADAY_TFS]
+    hs = {"trend": _scales(trend_tfs), "entry": _scales(entry_tfs)}
 
     def _wrap(cell, esc):
         return f"{esc}{cell}{_RESET}" if (color and esc) else cell
 
+    split_done = False
     for tf in reads:
         r = reads[tf]
+        if tf in INTRADAY_TFS and not split_done:
+            split_done = True
+            print(f"  {dim}{'┄' * 4} entry timing · intraday only — excluded from alignment, "
+                  f"risk & setup check {'┄' * 4}{rst}")
+        s = hs["entry" if tf in INTRADAY_TFS else "trend"]
         v = r.get("_vol") or {}
         rsi = f"{r['rsi']:.0f} {_ob(r['rsi_state'])}" if r.get("rsi") is not None else "—"
         rvol = f"{v['rvol']:.1f}x" if v.get("rvol") else "—"
@@ -640,11 +667,11 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         dv = f"{v['vol_trend_10']:+.1%}" if v.get("vol_trend_10") is not None else "—"
         vt = (v.get("tag") or "—") if v.get("ok") else "—"
         rsi_c = _wrap(f"{rsi:<8}", _rsi_tint(r.get("rsi")))
-        rvol_c = _wrap(f"{rvol:<6}", _heat(v.get("rvol"), 1.0, rv_hs, HEAT_DEAD["rvol"]))
-        dp_c = _wrap(f"{dp:>7}", _heat(v.get("price_chg_10"), 0.0, dp_hs, HEAT_DEAD["price_chg_10"]))
-        dv_c = _wrap(f"{dv:>8}", _heat(v.get("vol_trend_10"), 0.0, dv_hs, HEAT_DEAD["vol_trend_10"]))
+        rvol_c = _wrap(f"{rvol:<6}", _heat(v.get("rvol"), 1.0, s["rvol"], HEAT_DEAD["rvol"]))
+        dp_c = _wrap(f"{dp:>7}", _heat(v.get("price_chg_10"), 0.0, s["price_chg_10"], HEAT_DEAD["price_chg_10"]))
+        dv_c = _wrap(f"{dv:>8}", _heat(v.get("vol_trend_10"), 0.0, s["vol_trend_10"], HEAT_DEAD["vol_trend_10"]))
         tf_lbl = f"{tf}*" if r.get("_partial") else tf
-        print(f"  {tf_lbl:<4}{_ARROW.get(r['trend'], '?'):<7}{rsi_c}{_ob(r['stoch_state']):<6}"
+        print(f"  {tf_lbl:<6}{_ARROW.get(r['trend'], '?'):<7}{rsi_c}{_ob(r['stoch_state']):<6}"
               f"{(r['macd_state'] or '—'):<8}{rvol_c}{dp_c}{dv_c}   {vt:<13}")
     print(f"  → {summary['synthesis']}")
     if summary.get("rsi_conflict"):
@@ -654,7 +681,10 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
     if divs:
         _section("DIVERGENCES", color)
         for tf, (kind, why) in divs.items():
-            print(f"    {tf}: {kind} — {why}")
+            # entry-timing divergences are shown but tagged — they fire constantly and are
+            # deliberately kept out of the risk scorecard (see _trend_divs)
+            suffix = f"   {dim}(intraday — not a risk factor){rst}" if tf in INTRADAY_TFS else ""
+            print(f"    {tf}: {kind} — {why}{suffix}")
 
     # 4. VOLUME PROFILE — full set of volume shelves (HVN = S/R) and gaps (LVN = fast-move zones).
     if profile:
@@ -682,7 +712,7 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
     # 5. RALLY vs DRAWDOWN RISK  (S49: precomputed when supplied — gather_report lifts this so
     # the web app can render it natively; unsupplied = compute here, the pre-S49 behavior)
     if risk is None:
-        risk = rally_drawdown_risk(reads, profile=profile, ctx=ctx, divergences=divs)
+        risk = rally_drawdown_risk(reads, profile=profile, ctx=ctx, divergences=_trend_divs(divs))
     _section("RALLY vs DRAWDOWN RISK  (current conditions, not a forecast)", color)
     print(f"    NET: {risk['net']}")
     reg = risk.get("regime")
@@ -896,7 +926,7 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
     if vol and vol.get("setup"):
         s = vol["setup"]; em = vol.get("em"); eg = vol.get("earnings"); sq = vol.get("squeeze") or {}
         _section("VOLATILITY SETUP — straddle/strangle context  (not a prediction)", color)
-        on = [tf for tf in ("1M", "1W", "1D", "4h", "1h") if sq.get(tf, {}).get("squeeze_on")]
+        on = [tf for tf in ("1M", "1W", "1D", "4h", "2h", "1h") if sq.get(tf, {}).get("squeeze_on")]
         print(f"    compression: squeeze ON on {', '.join(on)}" if on
               else "    compression: no active squeeze")
         if em:
@@ -1130,6 +1160,8 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         if summary.get("conflict"):
             blind.append(summary["conflict"])
         for tf in reads:
+            if tf in INTRADAY_TFS:               # entry-timing frames are display-only (S63)
+                continue
             v = reads[tf].get("_vol")
             if v and v.get("unconfirmed"):
                 blind.append(f"{tf} move is on falling volume (unconfirmed)")
@@ -1294,7 +1326,8 @@ def gather_report(ticker, args, interactive, backdrop_base):
     try:
         frames, reads, divs, summary, profile, notes, live_bar = analyze(
             ticker, include_intraday=not args.no_intraday, data_dir=args.data_dir,
-            live=args.live, as_of=asof_ts)
+            live=args.live, as_of=asof_ts,
+            ltf=getattr(args, "ltf", False) and not args.no_intraday)
     except FileNotFoundError as e:
         print(f"  Could not load data for {ticker}: {e}")
         return
@@ -1305,7 +1338,8 @@ def gather_report(ticker, args, interactive, backdrop_base):
             ("vol quote/history", args.vol), ("call", args.call), ("squeeze", args.squeeze),
             ("insider", args.insider), ("geo", args.geo), ("live", args.live),
             ("street", getattr(args, "street", False)),
-            ("movers", getattr(args, "movers", False))) if on]
+            ("movers", getattr(args, "movers", False)),
+            ("ltf entry-timing frames", getattr(args, "ltf", False))) if on]
         notes.insert(0, f"AS-OF {asof_ts.date()}: historical mode — report reflects data through "
                         f"that session; current-only blocks disabled"
                         + (f" ({', '.join(on_flags)})" if on_flags else "")
@@ -1451,7 +1485,9 @@ def gather_report(ticker, args, interactive, backdrop_base):
     if args.vol and vol_setup is not None:
         try:
             spot = float(frames["1D"]["Close"].iloc[-1]) if "1D" in frames else None
-            squeeze = {tf: read_squeeze(frames[tf]) for tf in frames}
+            # trend frames only — read_squeeze's 126-bar width percentile is ~1.6 sessions on a
+            # 5m frame, which is not a volatility regime read (S63)
+            squeeze = {tf: read_squeeze(frames[tf]) for tf in frames if tf not in INTRADAY_TFS}
             # --live: prefer the real-time Tradier IV for the expected move (spot is already
             # live via the provisional today-bar); the scorecard percentile stays harvest-based.
             # The live IV carries its own tenor — scale the move by that DTE, not a fixed 30.
@@ -1601,7 +1637,7 @@ def gather_report(ticker, args, interactive, backdrop_base):
     # lifted from print_report (S49): rally/drawdown risk + macro events, so the payload is
     # complete and print_report does zero compute/IO when rendering it. The macro fetch keeps
     # print_report's hardcoded data_dir="data" (pre-existing quirk) for byte-identical output.
-    risk = rally_drawdown_risk(reads, profile=profile, ctx=ctx, divergences=divs)
+    risk = rally_drawdown_risk(reads, profile=profile, ctx=ctx, divergences=_trend_divs(divs))
     macro_events = None
     if next_event_per_series is not None:
         try:
@@ -1655,7 +1691,13 @@ if __name__ == "__main__":
     ap.add_argument("--ticker", nargs="+", help="One or more tickers (skips the prompt; e.g. --ticker QQQ JPM F).")
     ap.add_argument("--thesis", choices=["bullish", "bearish"], help="Your bias → confirm/contradict overlay.")
     ap.add_argument("--level", type=float, help="A key level you're watching (annotates the thesis check).")
-    ap.add_argument("--no-intraday", action="store_true", help="Skip 1h/4h (offline / fast).")
+    ap.add_argument("--no-intraday", action="store_true", help="Skip 1h/4h/2h (offline / fast).")
+    ap.add_argument("--ltf", action="store_true",
+                    help="Add the sub-hourly entry-timing rows (30m/15m/5m) to the multi-timeframe "
+                         "table — LIVE SESSION ONLY (outside 09:30–16:00 ET they are skipped with "
+                         "a note). Display-only: excluded from the alignment synthesis, the risk "
+                         "scorecard, the setup check and the squeeze line. Network (Tradier "
+                         "timesales, yfinance 5m fallback); cached ~2min.")
     ap.add_argument("--no-vix", action="store_true", help="Skip the options/vol + VIX context block.")
     ap.add_argument("--geo", action="store_true", help="Add a cross-asset / geopolitical stress backdrop (oil/OVX/gold/DXY, credit & rates, geo-sensitive sectors, EPU/GPR). Network; cached ~6h.")
     ap.add_argument("--no-color", action="store_true", help="Disable ANSI colour on the candle (auto-off when piped/redirected).")
@@ -1667,7 +1709,8 @@ if __name__ == "__main__":
                     help="Historical/backtest mode (S57): compute the report as of this past date "
                          "— every frame truncated (no lookahead). Live-chain/current-only blocks are "
                          "disabled: pc-oi, gex, vol quote, call, squeeze, insider, geo, live, sector "
-                         "rotation/movers, retail buzz, street, ex-div, liquidity line, and the "
+                         "rotation/movers, retail buzz, street, ex-div, liquidity line, the "
+                         "sub-hourly entry-timing frames (--ltf), and the "
                          "breadth/F&G/COT/sent backdrop segments (SPY tide is rebuilt as-of).")
     ap.add_argument("--no-refresh", action="store_true",
                     help="Skip the auto-refresh of stale indicators CSVs (render whatever is on disk).")

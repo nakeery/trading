@@ -4,7 +4,7 @@
 import type { Flags, PcOiScope } from '../api/types'
 import { localToday } from '../utils/dates'
 
-const BOOL_FLAGS = ['vol', 'call', 'gex', 'squeeze', 'insider', 'street', 'movers', 'geo', 'live'] as const
+const BOOL_FLAGS = ['vol', 'call', 'gex', 'squeeze', 'insider', 'street', 'movers', 'geo', 'live', 'ltf'] as const
 
 export default function TopBar({ ticker, flags, chartFrom, known, onTicker, onFlags, onChartFrom, onRun, onPill }: {
   ticker: string
@@ -142,7 +142,7 @@ export default function TopBar({ ticker, flags, chartFrom, known, onTicker, onFl
         {flags.as_of && (
           <span style={{ color: 'var(--amber)', fontSize: 13.5 }}>
             historical mode — live-chain blocks (pc-oi, gex, vol quote, call, squeeze,
-            insider, street, geo, live) are disabled
+            insider, street, geo, live, ltf) are disabled
           </span>
         )}
       </div>

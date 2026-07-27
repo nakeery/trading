@@ -2,8 +2,11 @@
 Transparent market-structure reads (S34 — multi-timeframe Lens).
 
 Every function here describes CURRENT STATE on a given timeframe's OHLCV — no prediction, no ML, no
-claimed edge. Functions are timeframe-agnostic (run them on 1h/4h/1D/1W/1M frames) so the cockpit can
-surface cross-timeframe confluence vs conflict (the oversold-daily / overbought-weekly blind spot).
+claimed edge. The single-frame functions are timeframe-agnostic (run them on any frame) so the
+cockpit can surface cross-timeframe confluence vs conflict (the oversold-daily / overbought-weekly
+blind spot). The dict-consuming ones (`multi_timeframe_summary`, `trend_regime`,
+`rally_drawdown_risk`) deliberately whitelist the TREND timeframes — the sub-hourly entry-timing
+frames (S63) are display-only and must never move a synthesis or a scorecard tally.
 
 Uses the `ta` library (already a project dependency) for indicators, mirroring indicators.py.
 """
@@ -11,6 +14,8 @@ Uses the `ta` library (already a project dependency) for indicators, mirroring i
 import numpy as np
 import pandas as pd
 import ta
+
+from modules.timeframes import INTRADAY_TFS
 
 
 def _safe(series, i=-1):
@@ -186,13 +191,18 @@ def detect_divergence(ohlcv, lookback=40, recent=10):
 
 def multi_timeframe_summary(reads):
     """Confluence vs conflict across timeframes. `reads` = {tf: read_timeframe(...)}, in display order.
-    Returns {trend_row, rsi_row, conflict, synthesis}."""
-    tfs = [tf for tf, r in reads.items() if r.get("ok")]
+    Returns {trend_row, rsi_row, conflict, synthesis}.
+
+    The sub-hourly entry-timing frames (S63 `INTRADAY_TFS`) are dropped up front: they are
+    display-only. The `higher`/`lower` tuples below already ignore unknown keys, but the OB/OS
+    lists that build `rsi_conflict` iterate every read — so without this filter a 5m RSI spike
+    would raise an "RSI split" warning about a timeframe the synthesis never considered."""
+    tfs = [tf for tf, r in reads.items() if r.get("ok") and tf not in INTRADAY_TFS]
     trend = {tf: reads[tf]["trend"] for tf in tfs}
     rsi = {tf: reads[tf]["rsi_state"] for tf in tfs}
 
     higher = [tf for tf in ("1M", "1W") if tf in tfs]
-    lower = [tf for tf in ("1D", "4h", "1h") if tf in tfs]
+    lower = [tf for tf in ("1D", "4h", "2h", "1h") if tf in tfs]
     hi_up = all(trend[tf] == "up" for tf in higher) if higher else False
     hi_dn = all(trend[tf] == "down" for tf in higher) if higher else False
     lo_up = all(trend[tf] == "up" for tf in lower) if lower else False

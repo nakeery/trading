@@ -31,7 +31,7 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 LATEST = {}
 
 # flag → default; mirrors lens_web.py's flags dict / make_args (the argparse surface)
-BOOL_FLAGS = ("vol", "call", "gex", "squeeze", "insider", "street", "movers", "geo", "live")
+BOOL_FLAGS = ("vol", "call", "gex", "squeeze", "insider", "street", "movers", "geo", "live", "ltf")
 PC_OI_SCOPES = ("off", "all", "near", "leaps", "monthly")
 
 
@@ -49,6 +49,7 @@ def make_args(flags):
         live=flags["live"] and not flags.get("as_of"),
         vol=flags["vol"], call=flags["call"], gex=flags["gex"],
         street=flags.get("street", False), movers=flags.get("movers", False),
+        ltf=flags.get("ltf", False),
     )
 
 

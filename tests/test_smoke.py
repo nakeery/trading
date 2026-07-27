@@ -2085,9 +2085,11 @@ def test_s61_buzz_percentile_uses_full_history(tmp_path):
     from modules.buzz import CACHE_FILE, HISTORY_FILE, fetch_buzz
 
     days = pd.bdate_range(end=pd.Timestamp.today() - pd.Timedelta(days=1), periods=100)
+    n = len(days)   # pandas 3.x returns periods-1 when `end` lands on a non-business day
+                    # (e.g. run on a Monday → end is a Sunday); size the values off the index
     hist = pd.DataFrame({"date": [d.date().isoformat() for d in days],
                          "ticker": "TST", "rank": 10,
-                         "mentions": list(range(1, 101))})      # 1..100, oldest→newest
+                         "mentions": list(range(1, n + 1))})     # 1..n, oldest→newest
     hist.to_csv(tmp_path / HISTORY_FILE, index=False)
     results = [{"ticker": "TST", "rank": 5, "mentions": 50, "upvotes": 1,
                 "rank_24h_ago": 6, "mentions_24h_ago": 40}]
@@ -2095,8 +2097,9 @@ def test_s61_buzz_percentile_uses_full_history(tmp_path):
 
     read = fetch_buzz("TST", data_dir=str(tmp_path))
     assert read is not None and read.get("rank") == 5
-    # 49 of the 100 prior days sit below 50 → 0.49; the old 60-row window read ~0.15
-    assert abs(read["pct"] - 0.49) < 1e-9
+    # 49 of the n prior days (mentions 1..49) sit below 50 → 49/n; the old 60-row window
+    # capped the denominator at ~59 prior days and read ~0.15
+    assert abs(read["pct"] - 49 / n) < 1e-9
     assert len(read["history"]) <= 60                    # sparkline rows stay capped
     _time.sleep(0)  # (no-op; keeps the import grouped)
 
@@ -2247,3 +2250,124 @@ def test_s62_massive_auth_failure_message():
     assert "403" in msg and "subscription" in msg and "price pipeline unaffected" in msg
     assert "subscription" not in _fetch_fail_msg(RuntimeError("boom"))
     assert "boom" in _fetch_fail_msg(RuntimeError("boom"))
+
+
+# ─── S63: day-trader timeframes (2h trend row + 5m/15m/30m entry timing) ─────────
+def test_s63_session_open_boundaries():
+    """The entry-timing frames exist only inside RTH — the gate must be exact at both ends
+    and shut on weekends (holidays are approximated as weekdays, same as
+    _last_completed_session)."""
+    import pandas as pd
+
+    from modules.timeframes import session_open
+
+    mon = "2026-07-27"                                  # a Monday
+    assert not session_open(pd.Timestamp(f"{mon} 09:29"))
+    assert session_open(pd.Timestamp(f"{mon} 09:30"))    # bell — inclusive
+    assert session_open(pd.Timestamp(f"{mon} 15:59"))
+    assert not session_open(pd.Timestamp(f"{mon} 16:00"))   # close — exclusive
+    assert not session_open(pd.Timestamp(f"{mon} 20:00"))
+    assert not session_open(pd.Timestamp("2026-07-25 12:00"))   # Saturday
+    # tz-aware input is converted, not rejected: 17:00 UTC = 13:00 ET → open
+    assert session_open(pd.Timestamp(f"{mon} 17:00", tz="UTC"))
+
+
+def test_s63_ltf_resampling():
+    """One 5m fetch feeds three rows: 15m/30m resample off it (the :30 session grid divides
+    evenly, so no offset), and 2h rides the cached 1h frame with a 90min offset so its bins
+    are session-anchored (09:30/11:30/13:30/15:30) rather than wall-clock. 90 and not 30:
+    pandas anchors bins at midnight+offset, and 09:30 sits 90min past a 2h boundary."""
+    import pandas as pd
+
+    from modules.timeframes import _resample
+
+    idx = pd.date_range("2026-07-27 09:30", periods=78, freq="5min")   # one RTH session
+    m5 = pd.DataFrame({"Open": range(78), "High": range(1, 79), "Low": range(-1, 77),
+                       "Close": range(78), "Volume": [10.0] * 78}, index=idx)
+    m15 = _resample(m5, "15min")
+    assert len(m15) == 26 and str(m15.index[0].time()) == "09:30:00"
+    assert m15["Volume"].iloc[0] == 30.0                 # 3 five-minute bars summed
+    assert m15["Open"].iloc[0] == 0 and m15["Close"].iloc[0] == 2
+    assert m15["High"].iloc[0] == 3 and m15["Low"].iloc[0] == -1
+    m30 = _resample(m5, "30min")
+    assert len(m30) == 13 and m30["Volume"].iloc[0] == 60.0
+
+    h1 = pd.DataFrame({"Open": range(7), "High": range(1, 8), "Low": range(-1, 6),
+                       "Close": range(7), "Volume": [100.0] * 7},
+                      index=pd.date_range("2026-07-27 09:30", periods=7, freq="60min"))
+    h2 = _resample(h1, "2h", offset="90min")
+    assert [str(t.time()) for t in h2.index] == ["09:30:00", "11:30:00", "13:30:00", "15:30:00"]
+    assert h2["Volume"].iloc[0] == 200.0                 # two hourly bars per 2h bin
+    # without the offset the bins land on the wall clock instead — the reason it is passed
+    assert str(_resample(h1, "2h").index[0].time()) == "08:00:00"
+
+
+def test_s63_entry_frames_excluded_from_analysis():
+    """The whole contract of the entry-timing block: it is DISPLAY-ONLY. A sub-hourly read
+    must not enter the confluence synthesis, must not raise an RSI-split warning, and its
+    divergences must not become risk-scorecard factors."""
+    from modules.structure import multi_timeframe_summary, rally_drawdown_risk
+
+    trend = {"1M": {"ok": True, "trend": "up", "rsi_state": "neutral"},
+             "1W": {"ok": True, "trend": "up", "rsi_state": "neutral"},
+             "1D": {"ok": True, "trend": "up", "rsi_state": "neutral"},
+             "1h": {"ok": True, "trend": "up", "rsi_state": "neutral"}}
+    base = multi_timeframe_summary(trend)
+    assert base["synthesis"] == "full bullish confluence across timeframes."
+    assert base["rsi_conflict"] is None
+
+    # a 5m gone oversold + a 15m gone down: the synthesis and the RSI-split line must not move
+    noisy = {**trend,
+             "30m": {"ok": True, "trend": "down", "rsi_state": "neutral"},
+             "15m": {"ok": True, "trend": "down", "rsi_state": "overbought"},
+             "5m": {"ok": True, "trend": "down", "rsi_state": "oversold"}}
+    out = multi_timeframe_summary(noisy)
+    assert out["synthesis"] == base["synthesis"]
+    assert out["rsi_conflict"] is None                   # would fire on OB+OS without the filter
+    assert set(out["trend_row"]) == set(trend)           # sub-hourly absent from the rows too
+
+    # 2h DOES count — it is an hourly-grade trend frame, only sub-hour is excluded
+    assert "2h" in multi_timeframe_summary(
+        {**trend, "2h": {"ok": True, "trend": "up", "rsi_state": "neutral"}})["trend_row"]
+
+    # divergences: lens._trend_divs strips the sub-hourly ones before the scorecard sees them
+    import lens
+
+    divs = {"1W": ("bearish", "why"), "5m": ("bullish", "why"), "30m": ("bullish", "why")}
+    assert set(lens._trend_divs(divs)) == {"1W"}
+    r_clean = rally_drawdown_risk(trend, divergences=lens._trend_divs(divs))
+    r_raw = rally_drawdown_risk(trend, divergences=divs)
+    assert len(r_clean["rally"]) == 0                    # …and 2 bogus rally factors without it
+    assert len(r_raw["rally"]) == 2
+
+
+def test_s63_tf_order_and_ltf_gate(monkeypatch):
+    """TF_ORDER is the single source of row order for the whole stack (CLI + React iterate
+    insertion order), and build_timeframes drops any key absent from it. The sub-hourly
+    frames are gated on the session, not just the flag."""
+    import modules.timeframes as tfm
+
+    assert tfm.TF_ORDER == ["1M", "1W", "1D", "4h", "2h", "1h", "30m", "15m", "5m"]
+    assert list(tfm.INTRADAY_TFS) == ["30m", "15m", "5m"]
+    assert all(tf in tfm.TF_ORDER for tf in tfm.INTRADAY_TFS)
+    # every intraday key that can be marked partial has a bar length
+    assert set(tfm.TF_MINUTES) >= set(tfm.INTRADAY_TFS) | {"1h", "2h", "4h"}
+
+    frames, notes = tfm.build_timeframes("QQQ", data_dir="data", include_intraday=False, ltf=False)
+    assert list(frames) == [tf for tf in tfm.TF_ORDER if tf in frames]     # ordered by TF_ORDER
+    assert not any(tf in frames for tf in tfm.INTRADAY_TFS)
+
+    # --ltf outside RTH: skipped with a note, and NOTHING is fetched
+    def boom(*a, **k):
+        raise AssertionError("_load_ltf must not run while the market is closed")
+    monkeypatch.setattr(tfm, "_load_ltf", boom)
+    monkeypatch.setattr(tfm, "session_open", lambda *a, **k: False)
+    _, notes = tfm.build_timeframes("QQQ", data_dir="data", include_intraday=False, ltf=True)
+    assert any("market closed" in n for n in notes)
+
+    # as-of mode never loads them either (no historical sub-hourly source)
+    monkeypatch.setattr(tfm, "session_open", lambda *a, **k: True)
+    f3, n3 = tfm.build_timeframes("QQQ", data_dir="data", include_intraday=False,
+                                  ltf=True, as_of="2026-06-10")
+    assert not any(tf in f3 for tf in tfm.INTRADAY_TFS)
+    assert not any("market closed" in n for n in n3)      # the as-of note covers it instead

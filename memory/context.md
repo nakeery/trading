@@ -168,10 +168,32 @@ lens_web.py specifics (S48, +S49 native visuals):
   winget-installed (was absent). web/FRONTEND.md = React orientation for the user +
   parity checklist.
 
+- **S63 day-trader timeframes** (user request: read entry timing, not just swing structure):
+  the multi-TF table splits into TREND (1M/1W/1D/4h/**2h**/1h) and, below a divider inside the
+  SAME table, ENTRY TIMING (30m/15m/5m — `timeframes.INTRADAY_TFS`). `2h` is default-on and
+  free (90min-offset resample of the cached 1h → session-anchored 09:30/11:30/13:30/15:30
+  bins; NB *90* not 30 — pandas anchors bins at midnight+offset) and joins the alignment
+  `lower` tuple. Sub-hourly is `--ltf` AND `session_open()`-gated (outside RTH: a "market
+  closed" note, no fetch; never in as-of mode) — ONE Tradier 5min timesales fetch (~20d,
+  real-time; yfinance 5m/60d fallback, 2min TTL cache) with 15m/30m as pure resamples.
+  **Display-only is the whole contract**: filtered out of `multi_timeframe_summary` (the
+  `higher`/`lower` tuples already ignored unknown keys, but `rsi_conflict`'s OB/OS lists swept
+  every read), out of the risk scorecard's divergence factors (`lens._trend_divs` — applied at
+  BOTH call sites; the S49-lifted one in `gather_report` is the live one, the `print_report`
+  fallback alone is not enough), out of thesis blind spots, the squeeze line and setup check.
+  Heat colouring uses a PER-BLOCK half-scale (one shared scale let 5m RVOL swings wash the
+  trend rows to neutral). Web: `ltf` flag + `?ltf=1`, one `DataTable` with a new `divider`
+  prop (colSpan separator row) — verified: single header, 9 columns, dashed border.
+  Latent test bug fixed in passing: `test_s61_buzz_percentile_uses_full_history` built a
+  100-element column against `pd.bdate_range(end=today-1d, periods=100)`, which returns 99 on
+  pandas 3.x when `end` lands on a non-business day — it failed every Monday.
+
 Modules the lens/web stack uses
 -------------------------------
 - `timeframes.py` — per-TF OHLCV (CSV else yfinance; 1h cached + Tradier timesales top-up in
-  --live), `last_bar_partial` (calendar-aware S43), `fetch_live_bar`/`append_live_bar`.
+  --live), `last_bar_partial` (calendar-aware S43), `fetch_live_bar`/`append_live_bar`;
+  S63 adds `TF_ORDER` 2h/30m/15m/5m, `INTRADAY_TFS`/`TF_MINUTES`/`session_open`, an
+  interval-parameterised `_load_intraday` and `_load_ltf` (Tradier 5min → yfinance fallback).
 - `structure.py` — transparent per-TF reads (trend/RSI/Stoch/MACD — None states print "—" on
   thin frames; +S57 `ma20_run` signed MA20-side close streak), `read_volume` (partial-bar
   aware), divergences, confluence summary, `rally_drawdown_risk` two-sided scorecard

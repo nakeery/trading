@@ -75,7 +75,7 @@ export function SecVol({ p }: { p: Payload }) {
   const s = vol.setup
   const { em, earnings: eg } = vol
   const sq = vol.squeeze ?? {}
-  const on = ['1M', '1W', '1D', '4h', '1h'].filter((tf) => sq[tf]?.squeeze_on)
+  const on = ['1M', '1W', '1D', '4h', '2h', '1h'].filter((tf) => sq[tf]?.squeeze_on)
   const hist = vol.history
   const q = vol.quote
   return (

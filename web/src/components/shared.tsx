@@ -1,6 +1,6 @@
 // Shared building blocks for the section renderers — the React analogues of
 // lens_web_sections.py's _sec/_pill/_net/_bullets/_df/st.metric helpers.
-import { Component, type CSSProperties, type ReactNode } from 'react'
+import { Component, Fragment, type CSSProperties, type ReactNode } from 'react'
 import { AMBER, GRAY, INK, hexToRgba, netColor } from '../utils/colors'
 
 /** Stable anchor slug from a section title — the part before any '—'/'(' qualifier,
@@ -140,10 +140,13 @@ export interface Column<Row> {
 }
 
 /** Plain styled table — the st.dataframe analogue (rows are pre-formatted strings/nodes). */
-export function DataTable<Row extends Record<string, unknown>>({ columns, rows, rowStyle }: {
+export function DataTable<Row extends Record<string, unknown>>({ columns, rows, rowStyle, divider }: {
   columns: Column<Row>[]
   rows: Row[]
   rowStyle?: (row: Row, i: number) => CSSProperties | undefined
+  /** returns a caption to render as a full-width separator row ABOVE this row (else null) —
+   *  keeps a visually split table (e.g. the multi-TF trend vs entry-timing blocks) as ONE table */
+  divider?: (row: Row, i: number) => string | null | undefined
 }) {
   return (
     <div style={{ overflowX: 'auto' }}>
@@ -163,8 +166,21 @@ export function DataTable<Row extends Record<string, unknown>>({ columns, rows, 
           </tr>
         </thead>
         <tbody>
-          {rows.map((r, i) => (
-            <tr key={i} style={rowStyle?.(r, i)}>
+          {rows.map((r, i) => {
+            const sep = divider?.(r, i)
+            return (
+            <Fragment key={i}>
+            {sep && (
+              <tr>
+                <td colSpan={columns.length} style={{
+                  padding: '9px 2px 3px', borderTop: '1px dashed var(--border)',
+                  color: 'var(--faint)', fontSize: 12, whiteSpace: 'nowrap',
+                }}>
+                  {sep}
+                </td>
+              </tr>
+            )}
+            <tr style={rowStyle?.(r, i)}>
               {columns.map((c) => (
                 <td key={c.key} style={{
                   padding: '4px 12px 4px 2px', borderBottom: '1px solid var(--track)',
@@ -174,7 +190,9 @@ export function DataTable<Row extends Record<string, unknown>>({ columns, rows, 
                 </td>
               ))}
             </tr>
-          ))}
+            </Fragment>
+            )
+          })}
         </tbody>
       </table>
     </div>

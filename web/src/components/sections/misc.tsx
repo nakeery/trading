@@ -3,7 +3,7 @@
 // since S61 (tables fold into expanders, nothing dropped).
 import type { CSSProperties } from 'react'
 import type { Payload, PlotlyFig } from '../../api/types'
-import { AMBER, BLUE, FAINT, GRAY, GREEN, GRID, MUTED, RED, hexToRgba } from '../../utils/colors'
+import { AMBER, BLUE, FAINT, GRAY, GREEN, GRID, INTRADAY_TFS, MUTED, RED, hexToRgba } from '../../utils/colors'
 import { DARK_LAYOUT, SPOT_GOLD } from '../../utils/plotly'
 import { Caption, Collapsible, DataTable, FactorColumns, Sec, Warning } from '../shared'
 import { BalanceBar, TimelineStrip, type TimelineEvent } from '../viz'
@@ -278,6 +278,7 @@ export function SecThesis({ p }: { p: Payload }) {
   const blind: string[] = []
   if (summary.conflict) blind.push(summary.conflict)
   for (const tf of Object.keys(reads)) {
+    if (INTRADAY_TFS.includes(tf)) continue      // entry-timing frames are display-only (S63)
     if (reads[tf]._vol?.unconfirmed) blind.push(`${tf} move is on falling volume (unconfirmed)`)
   }
   const nC = confirm?.length ?? 0

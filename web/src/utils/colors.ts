@@ -31,6 +31,10 @@ const RAMP_STOPS: [number, number, number][] = [[216, 60, 52], [214, 186, 46], [
 
 // dead zones for the multi-TF heat columns (lens.HEAT_DEAD)
 export const HEAT_DEAD = { rvol: 0.10, price_chg_10: 0.01, vol_trend_10: 0.05 }
+
+// sub-hourly entry-timing frames (modules.timeframes.INTRADAY_TFS) — display-only rows shown
+// below a divider, with their own heat scale and no part in any synthesis
+export const INTRADAY_TFS: string[] = ['30m', '15m', '5m']
 export const RSI_NEUTRAL = 50.0
 export const RSI_FULL = 20.0
 export const RSI_DEAD = 10.0

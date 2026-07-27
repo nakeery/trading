@@ -16,7 +16,7 @@ export function fetchTickers(): Promise<{ tickers: string[] }> {
 /** Query string for the report flags — omits defaults so URLs stay short/shareable. */
 export function flagsToParams(flags: Flags): URLSearchParams {
   const p = new URLSearchParams()
-  for (const k of ['vol', 'call', 'gex', 'squeeze', 'insider', 'street', 'movers', 'geo', 'live'] as const) {
+  for (const k of ['vol', 'call', 'gex', 'squeeze', 'insider', 'street', 'movers', 'geo', 'live', 'ltf'] as const) {
     if (flags[k]) p.set(k, '1')
   }
   if (flags.pc_oi !== 'off') p.set('pc_oi', flags.pc_oi)

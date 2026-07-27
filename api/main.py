@@ -60,6 +60,7 @@ async def report(ticker: str,
                  vol: bool = False, call: bool = False, gex: bool = False,
                  squeeze: bool = False, insider: bool = False, street: bool = False,
                  movers: bool = False, geo: bool = False, live: bool = False,
+                 ltf: bool = False,
                  pc_oi: str = Query("off", pattern="^(off|all|near|leaps|monthly)$"),
                  thesis: str | None = Query(None, pattern="^(bullish|bearish)$"),
                  level: float | None = None, as_of: str | None = None,
@@ -77,7 +78,7 @@ async def report(ticker: str,
     _check_date("as_of", as_of, allow_future=False)
     flags = {"vol": vol, "call": call, "gex": gex, "squeeze": squeeze, "insider": insider,
              "street": street, "movers": movers, "geo": geo,
-             "live": live and not as_of, "pc_oi": pc_oi,
+             "live": live and not as_of, "ltf": ltf and not as_of, "pc_oi": pc_oi,
              "thesis": thesis, "level": level or None, "as_of": as_of or None}
     key = (t, reportgen.flags_key(flags))
     async with reportgen.GENERATE_LOCK:

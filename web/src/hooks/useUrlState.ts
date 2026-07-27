@@ -6,7 +6,7 @@ import { DEFAULT_FLAGS } from '../api/types'
 import { flagsToParams } from '../api/client'
 import { localToday } from '../utils/dates'
 
-const BOOLS = ['vol', 'call', 'gex', 'squeeze', 'insider', 'street', 'movers', 'geo', 'live'] as const
+const BOOLS = ['vol', 'call', 'gex', 'squeeze', 'insider', 'street', 'movers', 'geo', 'live', 'ltf'] as const
 
 export interface UrlState {
   ticker: string

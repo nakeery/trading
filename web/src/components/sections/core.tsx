@@ -4,7 +4,7 @@
 import type { CSSProperties } from 'react'
 import type { Payload } from '../../api/types'
 import {
-  AMBER, ARROW, BLUE, BLUEGRAY, GRAY, GREEN, HEAT_DEAD, INK, OB, RED,
+  AMBER, ARROW, BLUE, BLUEGRAY, GRAY, GREEN, HEAT_DEAD, INK, INTRADAY_TFS, OB, RED,
   heatHex, hexToRgba, rsiHex,
 } from '../../utils/colors'
 import { Caption, Collapsible, DataTable, FactorColumns, Metric, MetricRow, Net, Pill, Sec, Warning } from '../shared'
@@ -66,22 +66,33 @@ export function SecMultiTf({ p }: { p: Payload }) {
   const tfs = Object.keys(reads)
   if (!tfs.length) return null
 
-  // shared half-scale per heat column: max |value − neutral| − dead across the frames
-  const halfScale = (key: keyof VolRead, neutral: number, dead: number) => {
-    const vals = tfs.map((tf) => reads[tf]._vol?.[key] as number | null | undefined)
+  // half-scale per heat column: max |value − neutral| − dead across the frames. Computed PER
+  // BLOCK (S63, mirrors lens.print_report): a 5m bar's RVOL/ΔVol% swings dwarf a monthly's, so
+  // one shared scale would wash every trend row toward neutral the moment ltf is on.
+  const halfScale = (block: string[], key: keyof VolRead, neutral: number, dead: number) => {
+    const vals = block.map((tf) => reads[tf]._vol?.[key] as number | null | undefined)
       .filter((x): x is number => x != null)
     const m = Math.max(...vals.map((x) => Math.abs(x - neutral) - dead), -Infinity)
     return m > 1e-12 ? m : null
   }
-  const dpHs = halfScale('price_chg_10', 0, HEAT_DEAD.price_chg_10)
-  const dvHs = halfScale('vol_trend_10', 0, HEAT_DEAD.vol_trend_10)
-  const rvHs = halfScale('rvol', 1, HEAT_DEAD.rvol)
+  const scales = (block: string[]) => ({
+    dp: halfScale(block, 'price_chg_10', 0, HEAT_DEAD.price_chg_10),
+    dv: halfScale(block, 'vol_trend_10', 0, HEAT_DEAD.vol_trend_10),
+    rv: halfScale(block, 'rvol', 1, HEAT_DEAD.rvol),
+  })
+  const hs = {
+    trend: scales(tfs.filter((tf) => !INTRADAY_TFS.includes(tf))),
+    entry: scales(tfs.filter((tf) => INTRADAY_TFS.includes(tf))),
+  }
+  const firstEntry = tfs.find((tf) => INTRADAY_TFS.includes(tf))
 
   const rows = tfs.map((tf) => {
     const r = reads[tf]
     const v = r._vol ?? {}
+    const { dp: dpHs, dv: dvHs, rv: rvHs } = hs[INTRADAY_TFS.includes(tf) ? 'entry' : 'trend']
     return {
       tf: r._partial ? `${tf}*` : tf,
+      _sep: tf === firstEntry,
       trend: ARROW[r.trend ?? ''] ?? '?',
       rsi: r.rsi != null ? `${r.rsi.toFixed(0)} ${OB[r.rsi_state ?? ''] ?? r.rsi_state ?? '—'}` : '—',
       stoch: OB[r.stoch_state ?? ''] ?? r.stoch_state ?? '—',
@@ -115,6 +126,9 @@ export function SecMultiTf({ p }: { p: Payload }) {
       <Sec title="MULTI-TIMEFRAME  (longest → shortest)" />
       <DataTable
         rows={rows}
+        divider={(r) => (r._sep
+          ? 'entry timing · intraday only — excluded from alignment, risk & setup check'
+          : null)}
         columns={[
           { key: 'tf', header: 'TF' },
           { key: 'trend', header: 'Trend', style: heat('trend') },
@@ -147,6 +161,9 @@ export function SecDivergences({ p }: { p: Payload }) {
           <div key={tf}>
             • <b>{tf}</b>: <span style={{ color: c, fontWeight: 600 }}>{String(kind)}</span>
             {' '}— {String(why)}
+            {INTRADAY_TFS.includes(tf) && (
+              <span style={{ color: 'var(--faint)' }}>   (intraday — not a risk factor)</span>
+            )}
           </div>
         )
       })}

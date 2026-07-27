@@ -1,13 +1,21 @@
 """
-Per-timeframe OHLCV builder (S34 — multi-timeframe Lens).
+Per-timeframe OHLCV builder (S34 — multi-timeframe Lens; S63 — day-trader frames).
 
-Returns aligned OHLCV frames for {1h, 4h, 1D, 1W, 1M} so the structure/momentum/volume reads can run
-natively on each timeframe (a name can be oversold on the daily yet overbought on the weekly).
+Returns aligned OHLCV frames so the structure/momentum/volume reads can run natively on each
+timeframe (a name can be oversold on the daily yet overbought on the weekly). Two groups:
+
+  TREND         1M / 1W / 1D / 4h / 2h / 1h — what the swing structure is doing.
+  ENTRY TIMING  30m / 15m / 5m (`INTRADAY_TFS`) — S63, LIVE SESSION ONLY. Display-only: every
+                consumer whitelists the trend group, so these never touch the alignment
+                synthesis, the risk scorecard or the setup check.
 
 Sourcing:
   - 1D/1W/1M: resample the daily OHLCV already in data/{ticker}_indicators.csv (decades of history).
   - 1h:       yfinance interval=60m (~3y lookback); cached to data/intraday/ with a short TTL.
-  - 4h:       resampled from the 1h series (more reliable than yfinance's native 4h).
+  - 4h/2h:    resampled from the 1h series (more reliable than yfinance's native 4h).
+  - 5m:       Tradier timesales (real-time — the point of a session-only block), yfinance 5m/60d
+              fallback; cached with a 2-minute TTL. 15m/30m resample off it, so one fetch feeds
+              all three rows.
 
 Intraday is best-effort: on any failure the intraday frames are omitted and a note is returned, so the
 daily/weekly/monthly read always works.
@@ -25,13 +33,41 @@ INTRADAY_DIR = os.path.join(DATA_DIR, "intraday")
 _OHLCV = ["Open", "High", "Low", "Close", "Volume"]
 _AGG = {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"}
 
-# Display order, longest → shortest for the multi-TF table.
-TF_ORDER = ["1M", "1W", "1D", "4h", "1h"]
+# Display order, longest → shortest for the multi-TF table. build_timeframes DROPS any frame whose
+# key is absent here, and every renderer (CLI, React) iterates the dict in insertion order — so this
+# list is the single source of truth for row order across the whole stack.
+TF_ORDER = ["1M", "1W", "1D", "4h", "2h", "1h", "30m", "15m", "5m"]
+
+# Sub-hourly entry-timing frames (S63). Display-only: the alignment summary, the risk scorecard, the
+# setup check, the squeeze line and the thesis blind spots all exclude these keys.
+INTRADAY_TFS = ("30m", "15m", "5m")
+
+# Bar length per timeframe — used to spot a still-forming intraday bar (the `*` mark).
+TF_MINUTES = {"5m": 5, "15m": 15, "30m": 30, "1h": 60, "2h": 120, "4h": 240}
+
+RTH_OPEN = (9, 30)          # regular trading hours, ET — the window in which the entry-timing
+RTH_CLOSE = (16, 0)         # frames are meaningful (outside it they are stale by definition)
 
 
-def _resample(df, rule):
-    out = df[_OHLCV].resample(rule).agg(_AGG)
+def _resample(df, rule, offset=None):
+    kw = {"offset": offset} if offset else {}
+    out = df[_OHLCV].resample(rule, **kw).agg(_AGG)
     return out.dropna(subset=["Close"])
+
+
+def session_open(now=None):
+    """True during regular US trading hours (weekday, 09:30 ≤ ET < 16:00). Holidays are approximated
+    as weekdays — the same convention `_last_completed_session` already uses. `now` (tz-aware or ET-
+    naive) is injectable for testing."""
+    if now is None:
+        now = pd.Timestamp.now(tz="America/New_York")
+    now = pd.Timestamp(now)
+    if now.tz is not None:
+        now = now.tz_convert("America/New_York")
+    if now.weekday() >= 5:
+        return False
+    hm = (now.hour, now.minute)
+    return RTH_OPEN <= hm < RTH_CLOSE
 
 
 def _load_daily(ticker, data_dir):
@@ -52,33 +88,84 @@ def _load_daily(ticker, data_dir):
     return raw[_OHLCV].dropna(subset=["Close"]).sort_index()
 
 
-def _load_intraday(ticker, ttl_hours=3, notes=None):
-    """1h bars from yfinance (~3y), cached with a TTL. Returns a tz-naive (US/Eastern) OHLCV frame.
+def _cache_path(ticker, label):
+    return os.path.join(INTRADAY_DIR, f"{ticker.lower()}_{label}.csv")
+
+
+def _to_et_naive(raw):
+    """yfinance intraday frame → tz-naive (US/Eastern) OHLCV, columns flattened."""
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = raw.columns.get_level_values(0)
+    raw = raw[_OHLCV].copy()
+    if raw.index.tz is not None:
+        raw.index = raw.index.tz_convert("America/New_York").tz_localize(None)
+    return raw
+
+
+def _load_intraday(ticker, ttl_hours=3, notes=None, interval="60m", label="1h", period="730d"):
+    """Intraday bars from yfinance, cached with a TTL. Returns a tz-naive (US/Eastern) OHLCV frame.
     When the download fails (Yahoo throttles intraday requests intermittently) but a cache exists,
-    falls back to the stale cache with a note rather than dropping the 1h/4h rows entirely."""
+    falls back to the stale cache with a note rather than dropping the rows entirely.
+    `interval`/`label`/`period` are parameterised (S63) so the same path serves the 60m trend frame
+    and the 5m entry-timing frame — each gets its own cache file."""
     os.makedirs(INTRADAY_DIR, exist_ok=True)
-    cache = os.path.join(INTRADAY_DIR, f"{ticker.lower()}_1h.csv")
+    cache = _cache_path(ticker, label)
     if os.path.exists(cache) and (time.time() - os.path.getmtime(cache)) < ttl_hours * 3600:
         return pd.read_csv(cache, index_col=0, parse_dates=True)
     try:
-        raw = yf.download(ticker, period="730d", interval="60m", progress=False, auto_adjust=True)
+        raw = yf.download(ticker, period=period, interval=interval, progress=False, auto_adjust=True)
         if raw is None or len(raw) == 0:
             raise RuntimeError("empty intraday download")
-        if isinstance(raw.columns, pd.MultiIndex):
-            raw.columns = raw.columns.get_level_values(0)
-        raw = raw[_OHLCV].copy()
-        # tz-aware UTC → US/Eastern, then drop tz for clean resampling/printing.
-        if raw.index.tz is not None:
-            raw.index = raw.index.tz_convert("America/New_York").tz_localize(None)
+        raw = _to_et_naive(raw)
         raw.to_csv(cache)
         return raw
     except Exception:
         if os.path.exists(cache):
             if notes is not None:
                 age_h = (time.time() - os.path.getmtime(cache)) / 3600
-                notes.append(f"intraday refresh failed — using cached 1h bars ({age_h:.1f}h old).")
+                notes.append(f"intraday refresh failed — using cached {label} bars ({age_h:.1f}h old).")
             return pd.read_csv(cache, index_col=0, parse_dates=True)
         raise
+
+
+def _tradier_5m(ticker, days=20):
+    """5-minute RTH bars from Tradier timesales (real-time with a brokerage token). Returns a
+    tz-naive ET OHLCV frame or None. Same conversion recipe as `_topup_intraday`."""
+    from modules.tradier import get_timesales
+    now = pd.Timestamp.now(tz="America/New_York").tz_localize(None)
+    bars = get_timesales(ticker, interval="5min",
+                         start=(now - pd.Timedelta(days=days)).strftime("%Y-%m-%d %H:%M"),
+                         end=now.strftime("%Y-%m-%d %H:%M"))
+    if not bars:
+        return None
+    ts = pd.DataFrame(bars)
+    ts.index = pd.to_datetime(ts["timestamp"], unit="s", utc=True).dt.tz_convert(
+        "America/New_York").dt.tz_localize(None)
+    return ts.rename(columns={"open": "Open", "high": "High", "low": "Low",
+                              "close": "Close", "volume": "Volume"})[_OHLCV].astype(float)
+
+
+def _load_ltf(ticker, ttl_min=2, notes=None):
+    """(S63) 5-minute bars for the entry-timing block. Tradier FIRST — a block that only exists
+    while the session is live wants the real-time source (~4s; yfinance intraday is delayed and
+    throttled) — with yfinance 5m/60d as the fallback. Cached with a short TTL since a 5m bar goes
+    stale in minutes; `ttl_min=0` under --live forces a refetch every run."""
+    os.makedirs(INTRADAY_DIR, exist_ok=True)
+    cache = _cache_path(ticker, "5m")
+    if os.path.exists(cache) and (time.time() - os.path.getmtime(cache)) < ttl_min * 60:
+        return pd.read_csv(cache, index_col=0, parse_dates=True)
+    try:
+        m5 = _tradier_5m(ticker)
+        if m5 is not None and len(m5):
+            m5.to_csv(cache)
+            return m5
+    except Exception:
+        pass
+    # Tradier unavailable (no token / failure) → yfinance, which caps 5m at ~60 days.
+    if notes is not None:
+        notes.append("entry-timing 5m bars from yfinance (Tradier unavailable) — delayed, not real-time.")
+    return _load_intraday(ticker, ttl_hours=ttl_min / 60, notes=notes,
+                          interval="5m", label="5m", period="60d")
 
 
 def merge_intraday_topup(h1, topup):
@@ -127,10 +214,13 @@ def _topup_intraday(h1, ticker, notes):
 
 
 def build_timeframes(ticker, data_dir=DATA_DIR, include_intraday=True, intraday_ttl_hours=3,
-                     live=False, as_of=None):
+                     live=False, as_of=None, ltf=False):
     """{tf: ohlcv_df} for the available timeframes, plus a list of notes about anything omitted.
     `live=True` (lens --live) tops the 1h frame up to the current session via Tradier timesales,
     so the 1h/4h rows stay current even when the yfinance intraday download is stale or refused.
+    `ltf=True` (S63, lens --ltf) adds the sub-hourly entry-timing frames — but ONLY while the
+    session is live: outside RTH they describe a market that stopped moving hours ago, so they are
+    skipped with a note instead. Never in as-of mode (no historical sub-hourly source).
     `as_of` (S57 — historical/backtest mode): truncate the SOURCE frames to that date BEFORE
     resampling, so the forming week/month as of that date is exactly what a viewer saw then —
     truncating the resampled frames by label would instead drop the forming period (a W-FRI
@@ -159,8 +249,27 @@ def build_timeframes(ticker, data_dir=DATA_DIR, include_intraday=True, intraday_
                     raise RuntimeError("intraday history does not reach the as-of date")
             frames["1h"] = h1
             frames["4h"] = _resample(h1, "4h")
+            # 2h rides the same cached 1h frame — free, so it is default-on. Session-anchored
+            # (09:30/11:30/13:30/15:30) rather than the wall-clock bins 4h uses. pandas anchors
+            # bins at midnight+offset, and 09:30 sits 90min past a 2h boundary — NOT 30min.
+            frames["2h"] = _resample(h1, "2h", offset="90min")
         except Exception as e:
-            notes.append(f"intraday (1h/4h) unavailable ({type(e).__name__}) — showing 1D/1W/1M only.")
+            notes.append(f"intraday (1h/4h/2h) unavailable ({type(e).__name__}) — showing 1D/1W/1M only.")
+    if ltf:
+        if as_of is not None:
+            pass                                        # caller already notes the as-of suppressions
+        elif not session_open():
+            notes.append("entry-timing frames (5m/15m/30m) hidden — market closed.")
+        else:
+            try:
+                m5 = _load_ltf(ticker, ttl_min=0 if live else 2, notes=notes)
+                # 5m bars sit on the :30 session grid, and both 15 and 30 divide it evenly, so the
+                # default midnight-anchored bins already land on 09:30/09:45/… — no offset needed.
+                frames["5m"] = m5
+                frames["15m"] = _resample(m5, "15min")
+                frames["30m"] = _resample(m5, "30min")
+            except Exception as e:
+                notes.append(f"entry-timing frames (5m/15m/30m) unavailable ({type(e).__name__}).")
     present = [tf for tf in TF_ORDER if tf in frames]
     return {tf: frames[tf] for tf in present}, notes
 
