@@ -188,6 +188,54 @@ lens_web.py specifics (S48, +S49 native visuals):
   100-element column against `pd.bdate_range(end=today-1d, periods=100)`, which returns 99 on
   pandas 3.x when `end` lands on a non-business day — it failed every Monday.
 
+- **S64 overnight & futures context** (user request: incorporate overnight/futures markets;
+  scoped display-only after the S20/S21 macro-feature rejections): `modules/overnight.py` +
+  `sentiment.gap_gauges`. Three default-on surfaces, first two rendered ONLY off-hours
+  (`not session_open()` — RTH runs make zero extra calls): (1) `fut ES … · NQ … (o/n vs prior
+  settle, HH:MM ET)` MARKET BACKDROP segment — one batched yfinance ES=F/NQ=F daily download;
+  the in-progress Globex row's Close IS the live print, and `fast_info.previous_close` matches
+  NO settle (probed 2026-07-27) so prior settle comes from the history itself; cache TTL
+  **20 min** (deliberate 6h-convention deviation — overnight tape decays in minutes, timestamp
+  shown); (2) AH/pre-mkt line under the O/H/L/C — see the S64-FIX entry below, the price comes
+  from the timesales tape, NOT the quote; (3) Gap at open +
+  Gap vol (5d) VOL gauges off the indicators CSV's `gap_pct`/`gap_ma_5d`/`gap_vol_5d`
+  (harvested since S1, previously orphaned — zero network); percentile of |gap|, rides
+  `gather_context` AFTER the as-of truncation so it's historically valid for free. Futures/AH
+  as-of-suppressed. NOT risk-scorecard factors (S43); never model features.
+- **S64 FIX — the AH price could never move** (user-reported on SOFI the evening it shipped).
+  Three separate defects, all now closed:
+  · **Wrong source.** The module shipped asserting "`last` keeps updating on AH prints while
+    `close` latches at the bell". **False.** Probed live 2026-07-27 16:34 ET, 34 min post-close
+    with ~130k SOFI AH shares in: `last` 16.88 == `close` 16.88 and `trade_date` FROZEN at
+    16:00:00.153 — while `bid_date`/`ask_date` were 8s old (quotes DO stay live) and
+    `/markets/timesales?session_filter=all` showed 16.92. `last` latches exactly like `close`,
+    so a quote-derived read is pinned to +0.00% forever. Now: `get_timesales(session_filter=)`
+    (new param, default "open" so the S63 LTF/1h-topup grids are untouched) + `fetch_ext_print`
+    → last **1min** bar outside RTH and strictly AFTER `_ext_window_start(now)` (= last completed
+    session's 16:00 — ONE rule spanning tonight's post-market and tomorrow's pre-market). Two
+    details that matter: `EXT_INTERVAL="1min"` not 5min (a 5min bar froze the tile's stamp for up
+    to five minutes — on a "has it moved since the bell" surface that reads as broken); and the
+    STRICT `>` drops the 16:00 closing-auction bar Tradier stamps at the bell, so a name with no
+    real AH trade (VRTX tonight — one 16:00 bar, 437k shares) shows nothing instead of its own
+    close. Verified a genuine 0.00% is still possible and correct (QQQ's 16:50 bar traded 38.6k
+    shares and happened to close exactly at the official close). The quote is still used,
+    but only for the reference `close`/`prevclose`, which was never wrong. `hhmm` is now the
+    PRINT's time, not the wall clock, so a stale tape is visible. **No print → None → the tile
+    is absent**, never a 0.00% placeholder.
+  · **Never refreshed.** `payload["ah"]` is a generate-time snapshot and the report query has no
+    refetchInterval → frozen at whenever Run was pressed. Now `GET /api/afterhours/{ticker}`
+    (RTH short-circuit before any Tradier call, 10s `afterhours_cache`) polled every 30s by
+    HeaderTiles, independent of the **live** checkbox.
+  · **Live backoff killed it.** AH rode `LiveInfo.ah`, so it inherited CandleChart's
+    `LIVE_MISS_LIMIT` counter — which counts `fetch_live_bar` misses, and that ALWAYS misses
+    overnight/pre-market (`trade_date` isn't today). Polling stopped after ~30s. `ah` is off the
+    live tick entirely now.
+  · **Lesson (durable):** the S64 test passed throughout, because its fixture hand-built a quote
+    with `last` 514.32 vs `close` 512.53 — a shape the API never returns. It validated the
+    assumption, not the data source. Vendor-behavior assumptions must be probed against a live
+    response and the fixture must be REAL-SHAPED; the regression guard is now "real quote +
+    no ext print → None".
+
 Modules the lens/web stack uses
 -------------------------------
 - `timeframes.py` — per-TF OHLCV (CSV else yfinance; 1h cached + Tradier timesales top-up in

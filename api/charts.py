@@ -422,9 +422,14 @@ def build_chart(ticker, payload=None, as_of=None, start=None, live=False,
     live_info = None
     live_last = None
     if live:
+        # One Tradier quote per tick for the provisional session bar. The after-hours read used
+        # to ride this tick too, which coupled it to `found` — and `fetch_live_bar` returns None
+        # overnight/pre-market (trade_date isn't today), so the client's miss-counter killed the
+        # poll after ~30s and froze the AH tile. AH now has its own endpoint (S64 fix).
         bar = None
         try:
-            bar = fetch_live_bar(ticker)
+            from modules.tradier import get_daily_quote
+            bar = fetch_live_bar(ticker, quote=get_daily_quote(ticker))
         except Exception:
             pass
         if bar:

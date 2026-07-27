@@ -63,13 +63,20 @@ def get_daily_history(ticker, start, end):
         return []
 
 
-def get_timesales(ticker, interval="15min", start=None, end=None):
+def get_timesales(ticker, interval="15min", start=None, end=None, session_filter="open"):
     """Intraday bars from Tradier (real-time with a brokerage token). `interval` ∈ tick/1min/5min/
-    15min; start/end are 'YYYY-MM-DD HH:MM' (ET). session_filter=open → regular-hours bars only
-    (matches yfinance's 60m series). Availability: ~20 days back for 1min, ~40 days for 15min.
+    15min; start/end are 'YYYY-MM-DD HH:MM' (ET). Availability: ~20 days back for 1min, ~40 days
+    for 15min.
+
+    `session_filter` (probed live 2026-07-27):
+      "open" (default) → regular-hours bars only, matching yfinance's 60m series — what the 1h
+             top-up and the 5m entry-timing frames want, so their grids stay RTH-aligned.
+      "all"  → INCLUDES pre/post-market bars. This is the ONLY way to see extended-hours trades:
+             /markets/quotes latches `last` to the official close at the bell (S64 fix) and the
+             quote therefore cannot report an after-hours move.
     Returns a list of {time, timestamp, open, high, low, close, volume, ...} dicts; [] on failure."""
     try:
-        params = {"symbol": ticker, "interval": interval, "session_filter": "open"}
+        params = {"symbol": ticker, "interval": interval, "session_filter": session_filter}
         if start:
             params["start"] = start
         if end:

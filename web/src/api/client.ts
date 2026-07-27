@@ -1,7 +1,7 @@
 // Typed fetchers for the LENS API. Always relative "/api/..." URLs — the Vite dev proxy
 // (vite.config.ts) forwards them to FastAPI on :8000; in prod both share one origin.
 
-import type { ChartResponse, Flags, IvHistoryResponse, ReportBundle } from './types'
+import type { AhRead, ChartResponse, Flags, IvHistoryResponse, ReportBundle } from './types'
 
 export async function getJson<T>(url: string): Promise<T> {
   const res = await fetch(url)
@@ -11,6 +11,12 @@ export async function getJson<T>(url: string): Promise<T> {
 
 export function fetchTickers(): Promise<{ tickers: string[] }> {
   return getJson('/api/tickers')
+}
+
+/** Extended-hours print (S64 fix). Safe to poll unconditionally — the server short-circuits to
+ *  null during regular hours, so the client never needs its own session clock. */
+export function fetchAfterhours(ticker: string): Promise<{ ah: AhRead | null }> {
+  return getJson(`/api/afterhours/${encodeURIComponent(ticker)}`)
 }
 
 /** Query string for the report flags — omits defaults so URLs stay short/shareable. */

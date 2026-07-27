@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 
 from api import charts, loaders, reportgen
-from api.cache import evict_ticker, report_cache
+from api.cache import afterhours_cache, cached, evict_ticker, report_cache
 from api.sanitize import sanitize
 
 DATA_DIR = "data"
@@ -53,6 +53,29 @@ def tickers():
     except Exception:
         names = []
     return sanitize({"tickers": names})
+
+
+@app.get("/api/afterhours/{ticker}")
+def afterhours(ticker: str):
+    """The ticker's extended-hours print: {"ah": {...}} or {"ah": null} (S64 fix).
+
+    Its own endpoint so the AH tile can refresh on a short poll WITHOUT regenerating the report
+    and WITHOUT requiring the live checkbox — payload["ah"] is only a snapshot taken at generate
+    time, which left the tile frozen at whenever Run was pressed.
+
+    During regular hours this short-circuits to null before any Tradier call (the server is the
+    authority on session state, so the client may poll unconditionally). Never raises: any
+    failure is null, and the tile simply doesn't render."""
+    from modules.timeframes import session_open
+    if session_open():
+        return {"ah": None}
+    t = ticker.strip().upper()
+    try:
+        from modules.overnight import fetch_afterhours
+        ah = cached(afterhours_cache, t, lambda: fetch_afterhours(t))
+    except Exception:
+        ah = None
+    return sanitize({"ah": ah})
 
 
 @app.get("/api/report/{ticker}")

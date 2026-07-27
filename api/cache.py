@@ -18,6 +18,9 @@ tile_cache = TTLCache(maxsize=256, ttl=600)        # ticker → watchlist tile
 ledger_cache = TTLCache(maxsize=64, ttl=600)       # ticker → merged ledger rows
 season_cache = TTLCache(maxsize=64, ttl=3600)      # (ticker, asof) → seasonality
 reactions_cache = TTLCache(maxsize=64, ttl=3600)   # (ticker, asof) → earnings reactions
+# S64 fix: the AH tile polls every ~30s off-hours. A short TTL keeps N open tabs from
+# multiplying Tradier calls without letting the print visibly lag its own poll interval.
+afterhours_cache = TTLCache(maxsize=64, ttl=10)    # ticker → after-hours read
 
 _PER_TICKER = (frame_cache, iv_cache, tile_cache, ledger_cache, season_cache, reactions_cache)
 

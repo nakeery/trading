@@ -1368,7 +1368,8 @@ def test_gather_payload_keys(monkeypatch):
     import lens
 
     for name in ("next_earnings", "next_ex_dividend", "fetch_rs", "fetch_beta",
-                 "fetch_sectors", "own_sector", "fetch_buzz", "fetch_street"):   # S58 fetchers off
+                 "fetch_sectors", "own_sector", "fetch_buzz", "fetch_street",   # S58 fetchers off
+                 "fetch_afterhours"):                                           # S64 off too
         monkeypatch.setattr(lens, name, None, raising=False)
 
     args = SimpleNamespace(ticker=None, thesis=None, level=None, no_intraday=True, no_vix=True,
@@ -1383,7 +1384,8 @@ def test_gather_payload_keys(monkeypatch):
                 "panel_bars", "ctx", "backdrop", "geo", "pcoi", "gex", "vol", "live", "setup",
                 "squeeze", "insider", "callq", "liq", "cats", "risk", "macro_events",
                 "thesis", "level", "live_iv", "earn", "exd", "as_of_mode",
-                "sectors", "buzz", "street"}                                     # S58 keys
+                "sectors", "buzz", "street",                                     # S58 keys
+                "ah"}                                                            # S64 key
     assert set(payload.keys()) == expected
     assert not any(isinstance(v, (pd.DataFrame, pd.Series)) for v in payload.values())
     assert payload["reads"] and payload["risk"] is not None      # frames were read + risk lifted
@@ -2371,3 +2373,133 @@ def test_s63_tf_order_and_ltf_gate(monkeypatch):
                                   ltf=True, as_of="2026-06-10")
     assert not any(tf in f3 for tf in tfm.INTRADAY_TFS)
     assert not any("market closed" in n for n in n3)      # the as-of note covers it instead
+
+
+# ─── Test 55 (S64): overnight futures + after-hours reads (offline) ────────────
+def test_s64_overnight_reads():
+    """modules/overnight (S64): read_futures on synthetic settle series ("vs prior settle" =
+    last daily row vs the one before it); afterhours_read on REAL-SHAPED Tradier quotes (`last`
+    == `close` post-bell) with an injectable clock — no extended-hours print → None, a tape
+    print → tape price/pct + print-time stamp, pre-open pre-mkt via prevclose, out-of-window
+    drop, malformed never raises; and the print_report AH line renders. All offline."""
+    import contextlib
+    import io
+
+    import pandas as pd
+    from lens import print_report
+    from modules.overnight import afterhours_read, read_futures
+
+    idx = pd.date_range("2026-07-20", periods=5, freq="D")
+    es = pd.Series([100.0, 101.0, 102.0, 103.0, 104.06], index=idx)
+    out = read_futures({"ES": es, "NQ": pd.Series([50.0], index=idx[:1])})
+    assert set(out) == {"ES"}                                  # 1-row NQ omitted
+    assert abs(out["ES"]["chg"] - (104.06 / 103.0 - 1.0)) < 1e-12
+    assert out["ES"]["settle"] == 103.0 and out["ES"]["bar_date"] == "2026-07-24"
+    assert read_futures({}) is None and read_futures(None) is None
+
+    from modules.overnight import _ext_window_start
+
+    def ts(s):                                                 # ET wall time → ms epoch
+        return int(pd.Timestamp(s, tz="America/New_York").tz_convert("UTC").value // 10**6)
+
+    def et(s):
+        return pd.Timestamp(s, tz="America/New_York")
+
+    # THE REGRESSION GUARD. A REAL post-bell Tradier quote: `last` latches to the official close
+    # at the bell and trade_date freezes at 16:00 (probed live 2026-07-27 on SOFI — last 16.88 ==
+    # close 16.88, trade_date 16:00:00.153, 34 minutes after the close with AH volume trading).
+    # The original S64 read derived the AH price from `last`, so it could only ever say +0.00%;
+    # its test passed only because the fixture invented a quote with last != close. With no
+    # extended-hours print the read MUST be None so nothing renders.
+    now_ah = et("2026-07-24 18:00")
+    q = {"last": 512.53, "close": 512.53, "prevclose": 510.0,
+         "trade_date": ts("2026-07-24 16:00")}
+    assert afterhours_read(q, ext=None, now=now_ah) is None
+    assert afterhours_read(q, now=now_ah) is None                 # ext omitted entirely
+
+    # with a real print off the timesales tape: price + % come from the TAPE, ref from the quote,
+    # and hhmm is the PRINT's time (17:59), never the wall clock (18:00)
+    r = afterhours_read(q, ext={"price": 514.32, "ts": et("2026-07-24 17:59")}, now=now_ah)
+    assert r["label"] == "AH" and r["ref"] == 512.53 and r["last"] == 514.32
+    assert abs(r["chg_pct"] - (514.32 / 512.53 - 1.0) * 100.0) < 1e-9
+    assert r["hhmm"] == "17:59"
+
+    # pre-open Friday: close null → prevclose reference, pre-mkt label. The window opened at
+    # THURSDAY's close, so Friday 07:55 is inside it.
+    now_pm = et("2026-07-24 08:00")
+    q2 = {"last": 510.0, "close": None, "prevclose": 510.0}
+    r2 = afterhours_read(q2, ext={"price": 511.0, "ts": et("2026-07-24 07:55")}, now=now_pm)
+    assert r2["label"] == "pre-mkt" and r2["ref"] == 510.0 and r2["hhmm"] == "07:55"
+
+    # window guard: one rule spans the evening AND the next pre-market
+    assert _ext_window_start(et("2026-07-24 18:00")) == et("2026-07-24 16:00")   # Fri evening
+    assert _ext_window_start(et("2026-07-24 08:00")) == et("2026-07-23 16:00")   # Fri pre-mkt
+    assert _ext_window_start(et("2026-07-27 06:00")) == et("2026-07-24 16:00")   # Mon pre-mkt
+
+    # a print from BEFORE the window (prior session's AH, read the next evening) → dropped
+    assert afterhours_read(q, ext={"price": 514.32, "ts": et("2026-07-23 17:00")},
+                           now=now_ah) is None
+    # malformed → None, never raises
+    good_ext = {"price": 514.32, "ts": et("2026-07-24 17:59")}
+    assert afterhours_read({"close": 1.0}, ext={"price": None, "ts": et("2026-07-24 17:59")},
+                           now=now_ah) is None
+    assert afterhours_read({"close": 0.0}, ext=good_ext, now=now_ah) is None
+    assert afterhours_read(None, ext=good_ext, now=now_ah) is None
+    assert afterhours_read({"close": "y"}, ext={"price": "x", "ts": "nope"}, now=now_ah) is None
+
+    # fetch_live_bar accepts a pre-fetched quote (S64); fully offline with the quote injected
+    from modules.timeframes import fetch_live_bar
+    now_ms = int(pd.Timestamp.now(tz="UTC").value // 10**6)
+    bar = fetch_live_bar("QQQ", quote={"open": 100.0, "high": 103.0, "low": 99.0,
+                                       "last": 102.0, "close": 101.5, "volume": 1000,
+                                       "trade_date": now_ms})
+    assert bar and bar["Close"] == 101.5 and bar["in_progress"] is False
+    assert fetch_live_bar("QQQ", quote={"trade_date": None}) is None
+
+    # render path: the AH line prints under the OHLC line
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        print_report("TEST", reads={}, divs={}, summary={"synthesis": "mixed — fixture"},
+                     profile=None, notes=[],
+                     last_bar={"open": 100.0, "high": 103.0, "low": 99.0,
+                               "close": 102.0, "prev_close": 100.5},
+                     as_of="2026-07-24", color=False, candle_style="none",
+                     ah={"last": 514.32, "ref": 512.53, "chg_pct": 0.35,
+                         "label": "AH", "hhmm": "18:00"})
+    out_txt = buf.getvalue()
+    assert "AH: $514.32" in out_txt and "+0.35% vs close" in out_txt
+
+
+# ─── Test 56 (S64): overnight-gap gauges (offline) ─────────────────────────────
+def test_s64_gap_gauges():
+    """sentiment.gap_gauges (S64): two VOL gauges off the previously-orphaned gap columns.
+    The displayed value is SIGNED but the percentile is of |gap| — a large negative gap must
+    read high-percentile (unusual magnitude), which the signed series would call ~0th.
+    Missing columns → []."""
+    import numpy as np
+    import pandas as pd
+    from modules.sentiment import gap_gauges
+
+    n = 120
+    idx = pd.date_range("2026-01-02", periods=n, freq="B")
+    gp = np.full(n, -0.002)
+    gp[-1] = -0.004                       # large NEGATIVE gap: signed pct ~0, |gap| pct ~1
+    df = pd.DataFrame({"gap_pct": gp,
+                       "gap_ma_5d": np.full(n, -0.001),
+                       "gap_vol_5d": np.full(n, 0.002)}, index=idx)
+    g = gap_gauges(df)
+    assert [x["name"] for x in g] == ["Gap at open", "Gap vol (5d)"]
+    assert all(x["group"] == "VOL" for x in g)
+    gap = g[0]
+    assert abs(gap["value"] - (-0.004)) < 1e-12               # signed value displayed
+    assert gap["pct"] is not None and gap["pct"] > 0.9        # |gap| percentile, not signed
+    assert "open" in gap["label"] and "5d avg" in gap["label"]
+    assert g[1]["value"] == 0.002 and g[1]["spark"]
+
+    # NaN tail (the indicators today-row) lands on the last REAL session
+    df2 = df.copy()
+    df2.loc[df2.index[-1], ["gap_pct", "gap_ma_5d", "gap_vol_5d"]] = np.nan
+    g2 = gap_gauges(df2)
+    assert abs(g2[0]["value"] - (-0.002)) < 1e-12
+
+    assert gap_gauges(pd.DataFrame({"Close": [1.0]})) == []

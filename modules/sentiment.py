@@ -154,6 +154,39 @@ def _net_read(atm_iv, hv_20, skew, term, pc_oi, regime):
             "size up, don't fade; see S21.)")
 
 
+def gap_gauges(df):
+    """PURE (S64): overnight-gap context off the indicators CSV's gap columns (gap_pct /
+    gap_ma_5d / gap_vol_5d — written by indicators.py since S1, previously unconsumed).
+    Display-only, never a model feature. The percentile is of |gap_pct| — a −2% and a +2% gap
+    are equally unusual; the SIGNED gap is still what's displayed. The label carries the gap
+    bar's date so a pre-market run showing yesterday's open gap is unambiguous. The indicators
+    today-row (NaN OHLCV, appended for the IV stamp) has a NaN gap, so dropna naturally lands
+    on the last real session. Missing columns / all-NaN → []. Offline-testable."""
+    out = []
+    if "gap_pct" not in df.columns:
+        return out
+    s = df["gap_pct"].dropna()
+    if not len(s):
+        return out
+    gap, gap_d = float(s.iloc[-1]), s.index[-1]
+    abs_s = s.abs()
+    lbl = f"{pd.Timestamp(gap_d):%b %d} open"
+    if "gap_ma_5d" in df.columns:
+        m = df["gap_ma_5d"].dropna()
+        if len(m):
+            lbl += f" · 5d avg {float(m.iloc[-1]):+.2%}"
+    out.append({"group": "VOL", "name": "Gap at open", "value": gap, "fmt": "{:+.2%}",
+                "label": lbl, "pct": percentile_of(abs_s, abs(gap)), "spark": spark_of(abs_s)})
+    if "gap_vol_5d" in df.columns:
+        gv_s = df["gap_vol_5d"].dropna()
+        if len(gv_s):
+            gv = float(gv_s.iloc[-1])
+            out.append({"group": "VOL", "name": "Gap vol (5d)", "value": gv, "fmt": "{:.2%}",
+                        "label": "avg |overnight gap|", "pct": percentile_of(gv_s, gv),
+                        "spark": spark_of(gv_s)})
+    return out
+
+
 def gather_context(ticker, data_dir="data", with_vix=True, as_of=None):
     """
     Assemble the consolidated market-context gauges for `ticker`.
@@ -273,6 +306,11 @@ def gather_context(ticker, data_dir="data", with_vix=True, as_of=None):
     if iv_pct is not None:
         gauges.append({"group": "VOL", "name": "IV Pctile (HV-proxy)", "value": iv_pct, "fmt": "{:.0%}",
                        "label": "", "pct": None})
+
+    # ── overnight gap (S64) — indicators.py's gap columns (harvested since S1, previously
+    # unconsumed). Display-only context; sits after the as-of truncation so it is historically
+    # valid in --as-of mode for free.
+    gauges.extend(gap_gauges(df))
 
     # ── MARKET (VIX complex, live) ──
     regime = "n/a"

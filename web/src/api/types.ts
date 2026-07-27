@@ -43,6 +43,9 @@ export interface Payload {
   as_of_mode: string | null
   last_bar: LastBar
   live: { applied?: boolean; in_progress?: boolean; hhmm?: string } | null
+  // declared explicitly (not left to the index signature) so a rename on either side is a
+  // TS error rather than a silently-absent tile
+  ah?: AhRead | null
   [section: string]: unknown
 }
 
@@ -82,6 +85,18 @@ export interface Range52 {
   lo: number
   pos: number
   off_hi: number
+}
+
+// S64 extended-hours read — a snapshot on the payload (generate time) plus /api/afterhours,
+// which HeaderTiles polls every 30s off-hours. Deliberately NOT on LiveInfo any more: riding
+// the live tick coupled it to a miss-counter driven by fetch_live_bar, which always misses
+// overnight, so the poll died after ~30s and froze the tile.
+export interface AhRead {
+  label?: string
+  last?: number
+  ref?: number
+  chg_pct?: number
+  hhmm?: string
 }
 
 export interface LiveInfo {

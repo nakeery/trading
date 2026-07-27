@@ -1,7 +1,12 @@
 // Header metric tiles — close + Δ vs prior close, OHL, 52-week range position, as-of date.
 // M1 version renders the essentials from the payload's last_bar + the chart's range52;
 // the faithful sec_header port (live labeling nuances) lands with the M2 section pass.
-import type { LastBar, LiveInfo, Payload, Range52 } from '../api/types'
+import { useQuery } from '@tanstack/react-query'
+
+import { fetchAfterhours } from '../api/client'
+import type { AhRead, LastBar, LiveInfo, Payload, Range52 } from '../api/types'
+
+const AH_POLL_MS = 30_000       // extended-hours tape is thin; 30s is plenty and cheap
 
 function Tile({ label, value, sub, color }: {
   label: string
@@ -44,6 +49,19 @@ export default function HeaderTiles({ payload, range52, live: liveTick }: {
     when = liveTick.in_progress ? `LIVE ${liveTick.hhmm ?? ''} ET` : `close · ${payload.as_of}`
   }
   const chg = lb.close != null && lb.prev_close ? lb.close / lb.prev_close - 1 : null
+  // S64 extended-hours print — its OWN 30s poll, independent of the live checkbox and of the
+  // report. payload.ah is only a snapshot from generate time, so on its own the tile froze at
+  // whenever Run was pressed; the poll supersedes it as soon as the first response lands.
+  // Polls unconditionally: the server returns null during regular hours (no Tradier call).
+  const ahPoll = useQuery({
+    queryKey: ['afterhours', payload.ticker],
+    queryFn: () => fetchAfterhours(String(payload.ticker)),
+    enabled: !!payload.ticker && !payload.as_of_mode,   // historical report → no live AH
+    refetchInterval: AH_POLL_MS,
+    refetchOnWindowFocus: true,
+  })
+  const ahLive = ahPoll.data?.ah ?? null
+  const ah = ahLive ?? (payload.ah as AhRead | null)
   return (
     <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', margin: '10px 0' }}>
       <Tile
@@ -59,6 +77,16 @@ export default function HeaderTiles({ payload, range52, live: liveTick }: {
           label="52-week range"
           value={`${(range52.pos * 100).toFixed(0)}%`}
           sub={`${fmt(range52.lo)} – ${fmt(range52.hi)} · ${(range52.off_hi * 100).toFixed(1)}% off high`}
+        />
+      )}
+      {ah && ah.last != null && (
+        <Tile
+          label={`${ahLive ? '🔴 ' : ''}${ah.label ?? 'AH'} · ${ah.hhmm ?? ''} ET`}
+          value={fmt(ah.last)}
+          sub={ah.chg_pct != null
+            ? `${ah.chg_pct >= 0 ? '+' : ''}${ah.chg_pct.toFixed(2)}% vs close`
+            : undefined}
+          color={ah.chg_pct == null ? undefined : ah.chg_pct >= 0 ? 'var(--green)' : 'var(--red)'}
         />
       )}
       {payload.as_of_mode && (

@@ -275,16 +275,20 @@ def build_timeframes(ticker, data_dir=DATA_DIR, include_intraday=True, intraday_
 
 
 # ── Live provisional session bar (S40 --live) ────────────────────────────────
-def fetch_live_bar(ticker):
+def fetch_live_bar(ticker, quote=None):
     """Today's session bar, live from the Tradier quote (real-time with a brokerage token; measured
     ~4s delay). Returns {"ts", "Open","High","Low","Close","Volume", "in_progress", "hhmm"} or None
     when the market hasn't traded today / Tradier is unavailable. Close = live last while the
     session is open (quote `close` is null until the bell → in_progress). DISPLAY-ONLY: never
     written to the CSV — the next indicators.py run replaces it with the adjusted yfinance bar.
-    NB Tradier prices are unadjusted (same convention as the S30 post-close stamp)."""
+    NB Tradier prices are unadjusted (same convention as the S30 post-close stamp).
+    `quote` (S64): a pre-fetched Tradier quote dict — lets a caller that also needs the raw quote
+    (api/charts.py live tick: bar + after-hours read) make ONE Tradier call per tick."""
     try:
-        from modules.tradier import get_daily_quote
-        q = get_daily_quote(ticker)
+        if quote is None:
+            from modules.tradier import get_daily_quote
+            quote = get_daily_quote(ticker)
+        q = quote
         if not q or not q.get("trade_date"):
             return None
         now_et = pd.Timestamp.now(tz="America/New_York")

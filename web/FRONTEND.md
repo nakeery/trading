@@ -124,6 +124,7 @@ you retire it. Feature parity checklist against it:
 | As-of backtest mode (banner, truncation, block/diff/ledger suppression, live off) | ✅ |
 | Live mode (10s tick, provisional today-bar, tiles ride the tick, 3-miss backoff) | ✅ |
 | 2s debounce on flag changes; Run = force-fresh; pills bypass debounce | ✅ |
+| Overnight context (S64: `fut` backdrop chip — automatic via the chip split; gap gauges — automatic via the VOL gauge table; AH/pre-mkt header tile — its OWN `GET /api/afterhours/{ticker}` poll every 30s, 🔴-prefixed once the poll answers, `payload.ah` only as the first paint. Independent of the **live** checkbox; the server returns null during RTH so the client polls unconditionally. It used to ride `LiveInfo.ah` on the live tick, which coupled it to the miss-counter and froze it overnight — do not put it back there. Polling still pauses when the tab is unfocused, TanStack default) | ✅ React-only tile in HeaderTiles.tsx; Streamlit (archived) intentionally skipped |
 
 **Parity is one-way (S61):** nothing from Streamlit is missing, but React now EXCEEDS it
 visually — the S61 readability pass made sections visual-first (gauge percentile bars,

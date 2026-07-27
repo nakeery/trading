@@ -27,6 +27,7 @@ import pandas as pd
 
 from modules.timeframes import (
     build_timeframes, last_bar_partial, fetch_live_bar, apply_live_bar, INTRADAY_TFS, TF_MINUTES,
+    session_open,
 )
 from modules.structure import (
     read_timeframe, read_volume, detect_divergence,
@@ -138,6 +139,10 @@ try:
     from modules.marketsent import fetch_marketsent
 except Exception:
     fetch_marketsent = None
+try:
+    from modules.overnight import fetch_futures, fetch_afterhours   # S64: off-hours context
+except Exception:
+    fetch_futures = fetch_afterhours = None
 
 _ARROW = {"up": "↑ up", "down": "↓ dn", "mixed": "~ mix"}
 _OB = {"overbought": "OB", "oversold": "OS", "neutral": "neut"}
@@ -561,7 +566,7 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
                  ctx=None, backdrop=None, thesis=None, level=None, color=True, candle_style="box",
                  panel_bars=None, candle_px=128, geo=None, pcoi=None, gex=None, vol=None,
                  live=None, setup=None, squeeze=None, insider=None, callq=None, liq=None,
-                 cats=None, sectors=None, buzz=None, street=None, risk=None,
+                 cats=None, sectors=None, buzz=None, street=None, ah=None, risk=None,
                  macro_events=_UNSET):
     w = 78
     print(f"\n{'═'*w}")
@@ -586,6 +591,12 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         rng_pct = (rng / pc * 100) if pc else 0.0
         print(f"  O ${o:,.2f}   H ${h:,.2f}   L ${l:,.2f}   C ${c:,.2f}    "
               f"range ${rng:,.2f} ({rng_pct:.2f}%)")
+
+    # extended-hours quote (S64) — what's happened since that completed session. Display-only.
+    if ah:
+        dm, rs = (_DIM, _RESET) if color else ("", "")
+        print(f"  {ah['label']}: ${ah['last']:,.2f}  {ah['chg_pct']:+.2f}% vs close   "
+              f"{dm}(last extended-hours print {ah['hhmm']} ET — display-only){rs}")
 
     # candle: sixel pixel image, or text panel (today + N previous), or one detailed candle (--prev 0)
     eff_style = "braille" if candle_style == "sixel" else candle_style   # text fallback when sixel off
@@ -1250,6 +1261,13 @@ def build_backdrop(data_dir="data"):
     """Assemble the MARKET BACKDROP line — SPY tide + equal-weight breadth (S45) + CNN F&G
     (S41). Market-level, cached fetchers; computed once per run (or per render in app mode)."""
     backdrop_base = market_backdrop(data_dir)   # SPY tide — same for all tickers, computed once
+    if fetch_futures is not None and not session_open():   # overnight futures (S64) — off-hours only;
+        fut = fetch_futures(data_dir=data_dir)             # during RTH the tide/live bar cover direction
+        segs = [f"{lbl} {d['chg']:+.1%}" for lbl, d in ((fut or {}).get("fut") or {}).items()
+                if d.get("chg") is not None]
+        if segs:
+            seg = f"fut {' · '.join(segs)} (o/n vs prior settle, {fut.get('as_of_str', '?')} ET)"
+            backdrop_base = f"{backdrop_base}  |  {seg}" if backdrop_base else seg
     if fetch_breadth is not None:                    # equal-weight breadth (S45) — market-level, cached ~6h
         br = fetch_breadth(data_dir=data_dir)
         segs = []
@@ -1343,7 +1361,8 @@ def gather_report(ticker, args, interactive, backdrop_base):
         notes.insert(0, f"AS-OF {asof_ts.date()}: historical mode — report reflects data through "
                         f"that session; current-only blocks disabled"
                         + (f" ({', '.join(on_flags)})" if on_flags else "")
-                        + "; ex-div, options liquidity, sector rotation, retail buzz, and "
+                        + "; ex-div, options liquidity, sector rotation, retail buzz, the "
+                          "futures/after-hours overnight reads, and "
                           "breadth/F&G/COT/sentiment omitted. Prices are on TODAY'S dividend-"
                           "adjusted basis — absolute levels can differ slightly from what a "
                           "viewer saw then; ratios/trends/percentiles are unaffected.")
@@ -1618,6 +1637,15 @@ def gather_report(ticker, args, interactive, backdrop_base):
         except Exception as e:
             notes.append(f"setup check unavailable ({type(e).__name__}).")
 
+    # extended-hours quote (S64) — the ticker's own AH/pre-market move off one real-time Tradier
+    # quote; only when the market is CLOSED (during RTH the live bar covers it). Display-only.
+    ah = None
+    if asof_ts is None and fetch_afterhours is not None and not session_open():
+        try:
+            ah = fetch_afterhours(ticker)
+        except Exception:
+            ah = None
+
     last_bar, as_of, panel_bars = None, None, None
     if "1D" in frames:
         d = frames["1D"]
@@ -1651,7 +1679,7 @@ def gather_report(ticker, args, interactive, backdrop_base):
             "panel_bars": panel_bars, "ctx": ctx, "backdrop": backdrop, "geo": geo,
             "pcoi": pc, "gex": gex, "vol": vol, "live": live_bar, "setup": setup, "squeeze": sqz,
             "insider": ins, "callq": callq, "liq": liq, "cats": cats, "sectors": sectors,
-            "buzz": buzz, "street": street, "risk": risk,
+            "buzz": buzz, "street": street, "ah": ah, "risk": risk,
             "macro_events": macro_events, "thesis": args.thesis, "level": args.level,
             "live_iv": live_iv,
             # S57: iso date when the report was computed AS OF a historical date (backtest mode);
@@ -1671,7 +1699,8 @@ def render_payload(p, use_color=True, candle_style="box", candle_px=128):
                  geo=p["geo"], pcoi=p["pcoi"], gex=p.get("gex"), vol=p["vol"], live=p["live"],
                  setup=p["setup"], squeeze=p["squeeze"], insider=p["insider"], callq=p["callq"],
                  liq=p["liq"], cats=p["cats"], sectors=p.get("sectors"), buzz=p.get("buzz"),
-                 street=p.get("street"), risk=p["risk"], macro_events=p["macro_events"])
+                 street=p.get("street"), ah=p.get("ah"), risk=p["risk"],
+                 macro_events=p["macro_events"])
 
 
 def render_ticker(ticker, args, use_color, interactive, backdrop_base):
@@ -1710,8 +1739,9 @@ if __name__ == "__main__":
                          "— every frame truncated (no lookahead). Live-chain/current-only blocks are "
                          "disabled: pc-oi, gex, vol quote, call, squeeze, insider, geo, live, sector "
                          "rotation/movers, retail buzz, street, ex-div, liquidity line, the "
-                         "sub-hourly entry-timing frames (--ltf), and the "
-                         "breadth/F&G/COT/sent backdrop segments (SPY tide is rebuilt as-of).")
+                         "sub-hourly entry-timing frames (--ltf), the extended-hours quote, and "
+                         "the breadth/F&G/COT/sent/futures backdrop segments (SPY tide is "
+                         "rebuilt as-of).")
     ap.add_argument("--no-refresh", action="store_true",
                     help="Skip the auto-refresh of stale indicators CSVs (render whatever is on disk).")
     ap.add_argument("--refresh", action="store_true",
