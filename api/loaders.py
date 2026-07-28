@@ -12,7 +12,9 @@ import time
 
 import pandas as pd
 
-from api.cache import cached, ledger_cache, reactions_cache, season_cache, tile_cache
+from api.cache import (
+    cached, ledger_cache, lens_score_cache, reactions_cache, season_cache, tile_cache,
+)
 
 DATA_DIR = "data"
 HISTORY_DIR = os.path.join(DATA_DIR, "payload_history")
@@ -107,21 +109,39 @@ def load_tile(ticker):
             last, prev = float(c.iloc[-1]), float(c.iloc[-2])
             ma20 = float(c.rolling(20).mean().iloc[-1])
             ma50 = float(c.rolling(50).mean().iloc[-1]) if len(c) >= 50 else None
+            # 52w position off the full close series (S65); staleness vs the expected session
+            tail252 = c.tail(252)
+            lo252, hi252 = float(tail252.min()), float(tail252.max())
+            pos52 = (last - lo252) / (hi252 - lo252) if hi252 > lo252 else 0.5
+            stale_days = None
+            try:
+                from lens import _expected_last_session
+                gap = (_expected_last_session() - pd.Timestamp(c.index[-1]).normalize()).days
+                stale_days = int(gap) if gap > 0 else None
+            except Exception:
+                pass
             out = {"ticker": ticker.upper(),
                    "closes": [float(v) for v in c.tail(60)], "last": last,
                    "chg": last / prev - 1 if prev else 0.0,
                    "ma20_up": bool(last >= ma20),
                    "ma50_up": bool(last >= ma50) if ma50 is not None else None,
-                   "as_of": c.index[-1].date().isoformat(), "setup": None}
+                   "as_of": c.index[-1].date().isoformat(), "setup": None,
+                   "pos52": pos52, "stale_days": stale_days,
+                   "risk": None, "regime": None}
             try:
                 d = os.path.join(HISTORY_DIR, ticker.lower())
                 snaps = sorted(f for f in os.listdir(d) if f.endswith(".json"))
                 if snaps:
                     with open(os.path.join(d, snaps[-1]), encoding="utf-8") as f:
-                        marks = list((json.load(f).get("setup") or {}).values())
+                        snap = json.load(f)
+                    marks = list((snap.get("setup") or {}).values())
                     if marks:
                         out["setup"] = {"ok": sum(1 for m in marks if m == "✓"),
                                         "total": len(marks)}
+                    # S65 — risk lean + regime from the same snapshot (as-of its own date)
+                    out["risk"] = {"dd": len(snap.get("dd") or []),
+                                   "rally": len(snap.get("rally") or [])}
+                    out["regime"] = snap.get("regime")
             except Exception:
                 pass
             return out
@@ -187,6 +207,18 @@ def refresh_econ_calendar():
 
 
 # ── signal ledger (ports lens_web.py load_ledger + load_ledger_score, merged) ──
+def load_lens_score(ticker):
+    """Lens self-score (S65) — payload_history snapshots vs realized forward returns
+    (lens_score.score, zero network). Status dict; cached ~10min."""
+    def _load():
+        try:
+            from lens_score import score
+            return score(ticker, DATA_DIR)
+        except Exception as e:
+            return {"status": f"error:{type(e).__name__}", "ticker": ticker}
+    return cached(lens_score_cache, ticker.upper(), _load)
+
+
 def load_ledger(ticker, rows=30):
     """Tail of entry.py's forward signal ledger with realized-return scoring merged in
     (score_ledger.score — zero network). None when the ticker has no ledger yet."""

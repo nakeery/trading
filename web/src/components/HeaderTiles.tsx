@@ -1,6 +1,6 @@
-// Header metric tiles — close + Δ vs prior close, OHL, 52-week range position, as-of date.
-// M1 version renders the essentials from the payload's last_bar + the chart's range52;
-// the faithful sec_header port (live labeling nuances) lands with the M2 section pass.
+// Header metric tiles — close + Δ vs prior close, OHL, 52-week range position, AH print,
+// as-of date. Renders ABOVE the chart fig (S65); in live mode the tiles ride each fresh
+// Tradier tick, and the AH tile additionally polls its own /api/afterhours endpoint.
 import { useQuery } from '@tanstack/react-query'
 
 import { fetchAfterhours } from '../api/client'

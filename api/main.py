@@ -83,7 +83,7 @@ async def report(ticker: str,
                  vol: bool = False, call: bool = False, gex: bool = False,
                  squeeze: bool = False, insider: bool = False, street: bool = False,
                  movers: bool = False, geo: bool = False, live: bool = False,
-                 ltf: bool = False,
+                 ltf: bool = False, short: bool = False,
                  pc_oi: str = Query("off", pattern="^(off|all|near|leaps|monthly)$"),
                  thesis: str | None = Query(None, pattern="^(bullish|bearish)$"),
                  level: float | None = None, as_of: str | None = None,
@@ -101,7 +101,8 @@ async def report(ticker: str,
     _check_date("as_of", as_of, allow_future=False)
     flags = {"vol": vol, "call": call, "gex": gex, "squeeze": squeeze, "insider": insider,
              "street": street, "movers": movers, "geo": geo,
-             "live": live and not as_of, "ltf": ltf and not as_of, "pc_oi": pc_oi,
+             "live": live and not as_of, "ltf": ltf and not as_of, "short": short,
+             "pc_oi": pc_oi,
              "thesis": thesis, "level": level or None, "as_of": as_of or None}
     key = (t, reportgen.flags_key(flags))
     async with reportgen.GENERATE_LOCK:
@@ -129,27 +130,30 @@ async def report(ticker: str,
 
 @app.get("/api/chart/{ticker}")
 def chart(ticker: str, as_of: str | None = None, start: str | None = None,
-          live: bool = False,
+          live: bool = False, tf: str = "1D",
           overlays: str = ",".join(charts.DEFAULT_OVERLAYS),
           aspects: str = ",".join(charts.VP_ASPECTS)):
     """Candlestick figure for the ticker: {fig, range52, live, as_of}. `overlays` /
     `aspects` are comma-separated tokens (see charts.OVERLAY_TOKENS / VP_ASPECTS) — the
-    fig is rebuilt server-side per combination; the daily frame underneath is cached.
+    fig is rebuilt server-side per combination; the frame underneath is cached.
+    `tf` (S66) ∈ charts.CHART_TFS selects the bar timeframe (default 1D).
     Profile/events/GEX levels come from the ticker's LATEST generated payload (S54)."""
     t = ticker.strip().upper()
     _check_date("as_of", as_of, allow_future=False)
     _check_date("start", start)  # a future start just yields an empty window — parse-only
+    if tf not in charts.CHART_TFS:
+        raise HTTPException(422, f"tf must be one of {', '.join(charts.CHART_TFS)}")
     ov = tuple(x for x in (s.strip() for s in overlays.split(","))
                if x in charts.OVERLAY_TOKENS)
     asp = tuple(x for x in (s.strip() for s in aspects.split(",")) if x in charts.VP_ASPECTS)
     try:
         out = charts.build_chart(t, payload=reportgen.LATEST.get(t),
                                  as_of=as_of or None, start=start or None,
-                                 live=live, overlays=ov, aspects=asp)
+                                 live=live, overlays=ov, aspects=asp, tf=tf)
     except Exception as e:
-        # no CSV and no yfinance data for the name — the sibling loaders swallow this
-        # internally; here it must not surface as a 500 traceback
-        raise HTTPException(404, f"no daily data for {t}: {type(e).__name__}")
+        # no CSV and no yfinance data for the name (or a TF whose history can't reach the
+        # requested window) — must not surface as a 500 traceback
+        raise HTTPException(404, f"no {tf} chart data for {t}: {type(e).__name__}")
     return sanitize(out)
 
 
@@ -198,6 +202,14 @@ def ledger(ticker: str):
     """entry.py's forward signal ledger tail + realized-return scoring (S30/S56).
     {ledger: null} when the ticker has no ledger yet."""
     return sanitize({"ledger": loaders.load_ledger(ticker.strip().upper())})
+
+
+@app.get("/api/lens_score/{ticker}")
+def lens_score(ticker: str):
+    """Lens self-score (S65): payload_history snapshots joined to realized 15d/63d returns,
+    aggregated by setup band / regime / risk lean. {status: 'no_snapshots'} until history
+    accumulates. Descriptive only — the honesty note rides the payload."""
+    return sanitize({"score": loaders.load_lens_score(ticker.strip().upper())})
 
 
 @app.get("/api/seasonality/{ticker}")

@@ -80,6 +80,9 @@ def read_timeframe(ohlcv):
         "price": price,
         "trend": trend,
         "above_ma20": above20, "above_ma50": above50,
+        # numeric MA levels (S65 price ladder) — additive keys, previously only booleans escaped
+        "ma20": m20, "ma50": m50,
+        "ma200": _safe(c.rolling(200).mean()) if len(c) >= 200 else None,
         "dist_ma20_pct": (price / m20 - 1) if (price and m20) else None,
         "rsi": r,
         "rsi_state": None if r is None else

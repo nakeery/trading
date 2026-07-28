@@ -8,7 +8,7 @@ import {
   heatHex, hexToRgba, rsiHex,
 } from '../../utils/colors'
 import { Caption, Collapsible, DataTable, FactorColumns, Metric, MetricRow, Net, Pill, Sec, Warning } from '../shared'
-import { BalanceBar, RangeStrip, type StripMarker } from '../viz'
+import { BalanceBar, RangeStrip, TallyBar, type StripMarker } from '../viz'
 import { SPOT_GOLD } from '../../utils/plotly'
 
 // ── payload slices (typed just enough for rendering) ─────────────────────────
@@ -38,6 +38,11 @@ interface Summary {
 const fmt2 = (v: number) => v.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
 const pct1 = (v: number, sign = true) => `${sign && v >= 0 ? '+' : ''}${(v * 100).toFixed(1)}%`
 
+// S65 — known segment prefixes get a faint bold group label inside the chip so the eye can
+// find "fut" or "COT" in the wrapped row; unknown prefixes render unchanged (robust to new
+// segments). Order mirrors build_backdrop.
+const BACKDROP_GROUPS = ['SPY', 'fut', 'breadth(20d)', 'F&G', 'COT lev-funds', 'sent', 'VIX regime']
+
 export function SecBackdrop({ p }: { p: Payload }) {
   const b = p.backdrop as string | null
   if (!b) return null
@@ -46,15 +51,27 @@ export function SecBackdrop({ p }: { p: Payload }) {
     <>
       <Sec title="MARKET BACKDROP" />
       <div style={{ lineHeight: 2.1 }}>
-        {segs.map((s, i) => (
-          <span key={i} style={{
-            border: '1px solid var(--border)', borderRadius: 8, padding: '2px 9px',
-            marginRight: 6, color: INK, fontSize: '0.9em', whiteSpace: 'nowrap',
-            display: 'inline-block',
-          }}>
-            {s}
-          </span>
-        ))}
+        {segs.map((s, i) => {
+          const g = BACKDROP_GROUPS.find((pre) => s.startsWith(pre))
+          const rest = g ? s.slice(g.length).replace(/^[:\s]+/, '') : s
+          return (
+            <span key={i} style={{
+              border: '1px solid var(--border)', borderRadius: 8, padding: '2px 9px',
+              marginRight: 6, color: INK, fontSize: '0.9em', whiteSpace: 'nowrap',
+              display: 'inline-block',
+            }}>
+              {g && (
+                <span style={{
+                  color: 'var(--muted)', fontWeight: 700, fontSize: '0.85em',
+                  textTransform: 'uppercase', letterSpacing: 0.4, marginRight: 5,
+                }}>
+                  {g.replace('(20d)', '')}
+                </span>
+              )}
+              {rest}
+            </span>
+          )
+        })}
       </div>
     </>
   )
@@ -121,9 +138,23 @@ export function SecMultiTf({ p }: { p: Payload }) {
       + '(price/RSI/ΔPrc% stay live)'
   }
 
+  // S65 — the 2-second alignment read before the 9-column table (trend frames only)
+  const alignRow = tfs.filter((tf) => !INTRADAY_TFS.includes(tf)).map((tf) => ({
+    tf, trend: reads[tf].trend ?? '',
+  }))
   return (
     <>
       <Sec title="MULTI-TIMEFRAME  (longest → shortest)" />
+      <div style={{ display: 'flex', gap: 14, flexWrap: 'wrap', margin: '2px 0 8px', fontSize: 15 }}>
+        {alignRow.map(({ tf, trend }) => (
+          <span key={tf} style={{
+            color: { up: GREEN, down: RED, mixed: AMBER }[trend] ?? 'var(--muted)',
+            fontWeight: 600,
+          }}>
+            {tf} {trend === 'up' ? '↑' : trend === 'down' ? '↓' : '~'}
+          </span>
+        ))}
+      </div>
       <DataTable
         rows={rows}
         divider={(r) => (r._sep
@@ -242,6 +273,87 @@ export function SecVolumeProfile({ p }: { p: Payload }) {
   )
 }
 
+// ── PRICE LADDER (S65) — every known level, one distance-sorted view ─────────
+interface LadderRow {
+  price: number
+  dist_pct: number
+  tags: string[]
+  side: 'above' | 'below'
+  zone: number | null
+}
+interface Ladder {
+  spot: number
+  levels: LadderRow[]
+  nearest_support?: LadderRow | null
+  nearest_resistance?: LadderRow | null
+  user_level?: {
+    price: number; dist_pct: number; side: string
+    zone: number | null; confluence?: string[]
+  } | null
+}
+const LADDER_MAX_SIDE = 6   // mirrors modules/levels.py MAX_SIDE
+
+export function SecLadder({ p }: { p: Payload }) {
+  const lad = p.ladder as Ladder | null
+  if (!lad?.levels?.length) return null
+  // levels arrive sorted by |dist| — take the nearest per side, then display top-down by price
+  const above = lad.levels.filter((r) => r.side === 'above').slice(0, LADDER_MAX_SIDE)
+    .sort((a, b) => b.price - a.price)
+  const below = lad.levels.filter((r) => r.side === 'below').slice(0, LADDER_MAX_SIDE)
+    .sort((a, b) => b.price - a.price)
+  const maxDist = Math.max(...[...above, ...below].map((r) => Math.abs(r.dist_pct)), 1e-4)
+  const row = (r: LadderRow) => (
+    <div key={`${r.price}-${r.tags.join()}`}
+      style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '2px 0', fontSize: 13.5 }}>
+      <span className="num" style={{ width: 52, textAlign: 'right', color: r.side === 'above' ? RED : GREEN }}>
+        {pct1(r.dist_pct)}
+      </span>
+      <span className="num" style={{ width: 78, textAlign: 'right', fontWeight: 600 }}>{fmt2(r.price)}</span>
+      <div style={{ flex: '0 0 140px', height: 7, background: 'var(--bg)', borderRadius: 4 }}>
+        <div style={{
+          width: `${(Math.abs(r.dist_pct) / maxDist) * 100}%`, height: '100%', borderRadius: 4,
+          background: hexToRgba(r.side === 'above' ? RED : GREEN, r.zone != null ? 0.7 : 0.3),
+        }} />
+      </div>
+      <span style={{ color: 'var(--muted)' }}>
+        {r.tags.join(' · ')}
+        {r.zone != null && <span style={{ color: AMBER }}> ◆ confluence</span>}
+      </span>
+    </div>
+  )
+  const ul = lad.user_level
+  return (
+    <>
+      <Sec title="PRICE LADDER" />
+      {above.map(row)}
+      <div className="num" style={{
+        borderTop: `1px dashed ${SPOT_GOLD}`, color: SPOT_GOLD, fontSize: 13,
+        margin: '3px 0', paddingTop: 1,
+      }}>
+        spot {fmt2(lad.spot)}
+      </div>
+      {below.map(row)}
+      <Caption>
+        {lad.nearest_resistance && `nearest resistance ${fmt2(lad.nearest_resistance.price)} (${pct1(lad.nearest_resistance.dist_pct)})`}
+        {lad.nearest_resistance && lad.nearest_support && ' · '}
+        {lad.nearest_support && `nearest support ${fmt2(lad.nearest_support.price)} (${pct1(lad.nearest_support.dist_pct)})`}
+        {' · ◆ = ≥2 sources within ±0.5%'}
+      </Caption>
+      {ul && (
+        <Caption>
+          your level {fmt2(ul.price)}: {pct1(ul.dist_pct)} {ul.side} spot —{' '}
+          {ul.confluence?.length ? `confluence with ${ul.confluence.join(' · ')}` : 'no other known level nearby'}
+        </Caption>
+      )}
+      {lad.levels.length > above.length + below.length && (
+        <Collapsible title={`all ${lad.levels.length} levels`}>
+          {lad.levels.map(row)}
+        </Collapsible>
+      )}
+    </>
+  )
+}
+
 interface Risk {
   net?: string
   regime?: { state?: string; label?: string; why?: string[]; note?: string } | null
@@ -288,10 +400,17 @@ export function SecSetup({ p }: { p: Payload }) {
   const setup = p.setup as Setup | null
   if (!setup?.rows?.length) return null
   const rows = setup.rows.map(([label, mark, detail]) => ({ mark, label, detail }))
+  const marks = rows.map((r) => r.mark)
   return (
     <>
       <Sec title="SETUP CHECK" />
       <Net label="NET" text={setup.net ?? 'n/a'} />
+      {/* S65 — the setup score as a segmented tally, not just table rows */}
+      <TallyBar segments={[
+        { n: marks.filter((m) => m === '✓').length, color: GREEN, label: '✓ pass' },
+        { n: marks.filter((m) => m === '–').length, color: GRAY, label: '– flagged' },
+        { n: marks.filter((m) => m === '✗').length, color: RED, label: '✗ fail' },
+      ]} />
       <DataTable
         rows={rows}
         columns={[

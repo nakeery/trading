@@ -143,6 +143,14 @@ try:
     from modules.overnight import fetch_futures, fetch_afterhours   # S64: off-hours context
 except Exception:
     fetch_futures = fetch_afterhours = None
+try:
+    from modules.levels import collect_levels, build_ladder, nearest_lvn_below   # S65: price ladder
+except Exception:
+    collect_levels = build_ladder = nearest_lvn_below = None
+try:
+    from modules.shortside import short_setup, is_s21_contrarian   # S65: short lens
+except Exception:
+    short_setup = is_s21_contrarian = None
 
 _ARROW = {"up": "↑ up", "down": "↓ dn", "mixed": "~ mix"}
 _OB = {"overbought": "OB", "oversold": "OS", "neutral": "neut"}
@@ -566,8 +574,8 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
                  ctx=None, backdrop=None, thesis=None, level=None, color=True, candle_style="box",
                  panel_bars=None, candle_px=128, geo=None, pcoi=None, gex=None, vol=None,
                  live=None, setup=None, squeeze=None, insider=None, callq=None, liq=None,
-                 cats=None, sectors=None, buzz=None, street=None, ah=None, risk=None,
-                 macro_events=_UNSET):
+                 cats=None, sectors=None, buzz=None, street=None, ah=None, ladder=None,
+                 short=None, risk=None, macro_events=_UNSET):
     w = 78
     print(f"\n{'═'*w}")
     hdr = f"  LENS — {ticker}"
@@ -720,6 +728,36 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         print(f"                 below price: {_levels(below)}")
         print(f"    LVN gaps:    {_levels(lvns)}")
 
+    # 4b. PRICE LADDER (S65) — every level the report knows, sorted by distance from spot.
+    # Confluence zones (≥2 sources within ±0.5%) merge into one row carrying every tag.
+    if ladder and ladder.get("levels"):
+        from modules.levels import MAX_SIDE
+        _section(f"PRICE LADDER  (all known levels · confluence = sources within ±0.5%)", color)
+        above = [r for r in ladder["levels"] if r["side"] == "above"][:MAX_SIDE]
+        below = [r for r in ladder["levels"] if r["side"] == "below"][:MAX_SIDE]
+        for r in sorted(above, key=lambda x: -x["dist_pct"]):
+            zone = "  ◆ confluence" if r["zone"] is not None else ""
+            print(f"    {r['dist_pct']:+6.1%}  {r['price']:>10.2f}  {' · '.join(r['tags'])}{zone}")
+        print(f"    ─── spot {ladder['spot']:.2f} ───")
+        for r in sorted(below, key=lambda x: -x["dist_pct"]):
+            zone = "  ◆ confluence" if r["zone"] is not None else ""
+            print(f"    {r['dist_pct']:+6.1%}  {r['price']:>10.2f}  {' · '.join(r['tags'])}{zone}")
+        near = []
+        if ladder.get("nearest_resistance"):
+            nr = ladder["nearest_resistance"]
+            near.append(f"nearest resistance {nr['price']:.2f} ({nr['dist_pct']:+.1%})")
+        if ladder.get("nearest_support"):
+            ns = ladder["nearest_support"]
+            near.append(f"nearest support {ns['price']:.2f} ({ns['dist_pct']:+.1%})")
+        if near:
+            print(f"    {' · '.join(near)}")
+        ul = ladder.get("user_level")
+        if ul:
+            conf = (f" — inside confluence zone ({' · '.join(ul['confluence'])})"
+                    if ul.get("confluence") else " — no other level nearby")
+            print(f"    your level {ul['price']:g}: {ul['dist_pct']:+.1%} "
+                  f"{'above' if ul['side'] == 'above' else 'below'} spot{conf}")
+
     # 5. RALLY vs DRAWDOWN RISK  (S49: precomputed when supplied — gather_report lifts this so
     # the web app can render it natively; unsupplied = compute here, the pre-S49 behavior)
     if risk is None:
@@ -747,6 +785,42 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         for label, mark, detail in setup["rows"]:
             print(f"    {mark} {label:<18}{detail}")
         print(f"    · {setup['footer']}")
+
+    # 5c. SHORT SETUP (S65; --short or --thesis bearish) — CONTEXT only, S28/S21 guardrails.
+    if short:
+        _section("SHORT SETUP — the tape through a short lens  (CONTEXT, not a signal)", color)
+        print(f"    NET: {short['net']}")
+        if short.get("for"):
+            print(f"    short-favorable:")
+            for f in short["for"]:
+                print(f"      • {f}")
+        if short.get("against"):
+            print(f"    counter-evidence:")
+            for f in short["against"]:
+                print(f"      • {f}")
+        cr = short.get("crowding") or {}
+        if cr:
+            print(f"    crowding: {cr.get('state', 'unknown').upper()}")
+            for ln in cr.get("lines", []):
+                print(f"      · {ln}")
+        if short.get("laggards"):
+            print(f"    lagging sectors (short-candidate pool, RS vs SPY):")
+            for lg in short["laggards"]:
+                line = f"      • {lg['sym']} {lg.get('name') or ''} — rank {lg.get('rank', '?')}"
+                if lg.get("rel_63d") is not None:
+                    line += f", 63d RS {lg['rel_63d']:+.1%}"
+                print(line)
+                if lg.get("bottom"):
+                    worst = " · ".join(
+                        f"{b['sym']} {(b['r63'] if b.get('r63') is not None else b['r20']):+.0%}"
+                        for b in lg["bottom"])
+                    print(f"          weakest names: {worst}")
+        if short.get("checklist"):
+            print(f"    short checklist (setup rows re-read for the short side):")
+            for label, mark, detail in short["checklist"]:
+                print(f"      {mark} {label:<18}{detail}")
+        for c in short.get("caveats", []):
+            print(f"    · {c}")
 
     # 6. OPTIONS & VOL CONTEXT
     if ctx and ctx.get("gauges"):
@@ -1159,11 +1233,29 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
     if thesis:
         _section(f"THESIS CHECK — you are {thesis.upper()}" + (f" (level {level})" if level else ""),
                  color)
+        # S65: --level is finally computed — distance, side, and ladder-confluence membership
+        ul = (ladder or {}).get("user_level")
+        if ul:
+            conf = (f"confluence with {' · '.join(ul['confluence'])}"
+                    if ul.get("confluence") else "no other known level nearby")
+            print(f"    your level {ul['price']:g}: {ul['dist_pct']:+.1%} "
+                  f"{'above' if ul['side'] == 'above' else 'below'} spot — {conf}")
         confirm = risk["rally"] if thesis == "bullish" else risk["drawdown"]
         contra  = risk["drawdown"] if thesis == "bullish" else risk["rally"]
         print(f"    CONFIRMATIONS ({len(confirm)}):")
+        # S65: a bearish thesis must not read S21 contrarian-BUY conditions (VIX stress,
+        # backwardation) as clean short confirmations — annotate, don't rewire the counts (S43)
+        n_s21 = 0
         for f in confirm or ["— none"]:
-            print(f"      ✓ {f}")
+            warn = ""
+            if (thesis == "bearish" and is_s21_contrarian is not None
+                    and is_s21_contrarian(f)):
+                warn = "  ⚠ S21: historically contrarian-BUY — weak short evidence"
+                n_s21 += 1
+            print(f"      ✓ {f}{warn}")
+        if n_s21:
+            print(f"      ⚠ {n_s21} of {len(confirm)} confirmations are S21 contrarian-buy "
+                  f"conditions — treat as bounce fuel, not short confirmation")
         print(f"    CONTRADICTIONS ({len(contra)}):")
         for f in contra or ["— none"]:
             print(f"      ✗ {f}")
@@ -1577,6 +1669,8 @@ def gather_report(ticker, args, interactive, backdrop_base):
             top = fetch_top_performers(data_dir=args.data_dir) if fetch_top_performers else None
             if top and top.get("sectors"):
                 sectors["top"] = top["sectors"]
+                if top.get("bottoms"):                 # S65 — laggard names for the short lens
+                    sectors["bottom"] = top["bottoms"]
         except Exception:
             pass
         if "top" not in sectors:
@@ -1624,7 +1718,8 @@ def gather_report(ticker, args, interactive, backdrop_base):
                 notes.append("street/news unavailable (yfinance fetch failed).")
 
     # SETUP CHECK (S41; default-on, best-effort) — pure synthesis + one RS benchmark fetch.
-    setup = None
+    # `rs` hoisted out of the try (S65 — the short lens reuses it).
+    setup, rs = None, None
     if setup_check is not None and reads:
         try:
             # macro_t1 hoisted above the vol block (shared with the --vol scorecard)
@@ -1666,6 +1761,54 @@ def gather_report(ticker, args, interactive, backdrop_base):
     # complete and print_report does zero compute/IO when rendering it. The macro fetch keeps
     # print_report's hardcoded data_dir="data" (pre-existing quirk) for byte-identical output.
     risk = rally_drawdown_risk(reads, profile=profile, ctx=ctx, divergences=_trend_divs(divs))
+
+    # PRICE LADDER (S65) — every level the report knows, one distance-sorted view. Zero network:
+    # inputs are whatever this run already computed (gex/em absent unless --gex/--vol ran), so
+    # it is historically valid in as-of mode for free.
+    ladder = None
+    if build_ladder is not None and last_bar is not None:
+        try:
+            d1 = frames.get("1D")
+            prior_day = None
+            if d1 is not None and len(d1) > 1:
+                pr = d1.iloc[-2]
+                prior_day = {"high": float(pr["High"]), "low": float(pr["Low"]),
+                             "close": float(pr["Close"])}
+            r52 = None
+            if d1 is not None and len(d1) >= 20:
+                r52 = {"hi": float(d1["High"].tail(252).max()),
+                       "lo": float(d1["Low"].tail(252).min())}
+            ladder = build_ladder(last_bar["close"], collect_levels(
+                last_bar["close"], profile=profile, gex=gex, em=(vol or {}).get("em"),
+                reads=reads, range52=r52, prior_day=prior_day, user_level=args.level))
+        except Exception:
+            ladder = None
+
+    # SHORT SETUP (S65; --short, auto-on under --thesis bearish) — the tape through a short
+    # lens, S28/S21 guardrails baked in. Pure synthesis of reads this run already computed
+    # (never fetches; crowding degrades to "unknown" without --squeeze). Context, not a signal.
+    short = None
+    short_on = getattr(args, "short", False) or getattr(args, "thesis", None) == "bearish"
+    if short_on and short_setup is not None and reads:
+        try:
+            lvn_b = None
+            if nearest_lvn_below is not None and profile and last_bar:
+                lvn_b = nearest_lvn_below(profile, last_bar["close"])
+            short = short_setup(reads, profile=profile, ctx=ctx,
+                                divergences=_trend_divs(divs), rs=rs, sectors=sectors,
+                                sqz_read=(sqz or {}).get("read"), gex=gex, street=street,
+                                lvn_below_pct=lvn_b, regime=risk.get("regime"))
+            if sectors and sectors.get("rows"):        # lagging sectors = short-candidate pool
+                lag = [r for r in sectors["rows"] if r.get("tag") == "lagging"]
+                if lag:
+                    short["laggards"] = [
+                        {"sym": r["sym"], "name": r.get("name"), "rank": r.get("rank"),
+                         "rel_63d": r.get("rel_63d"),
+                         "bottom": (sectors.get("bottom") or {}).get(r["sym"])}
+                        for r in lag]
+        except Exception as e:
+            notes.append(f"short setup unavailable ({type(e).__name__}).")
+
     macro_events = None
     if next_event_per_series is not None:
         try:
@@ -1679,7 +1822,8 @@ def gather_report(ticker, args, interactive, backdrop_base):
             "panel_bars": panel_bars, "ctx": ctx, "backdrop": backdrop, "geo": geo,
             "pcoi": pc, "gex": gex, "vol": vol, "live": live_bar, "setup": setup, "squeeze": sqz,
             "insider": ins, "callq": callq, "liq": liq, "cats": cats, "sectors": sectors,
-            "buzz": buzz, "street": street, "ah": ah, "risk": risk,
+            "buzz": buzz, "street": street, "ah": ah, "ladder": ladder, "short": short,
+            "risk": risk,
             "macro_events": macro_events, "thesis": args.thesis, "level": args.level,
             "live_iv": live_iv,
             # S57: iso date when the report was computed AS OF a historical date (backtest mode);
@@ -1699,8 +1843,8 @@ def render_payload(p, use_color=True, candle_style="box", candle_px=128):
                  geo=p["geo"], pcoi=p["pcoi"], gex=p.get("gex"), vol=p["vol"], live=p["live"],
                  setup=p["setup"], squeeze=p["squeeze"], insider=p["insider"], callq=p["callq"],
                  liq=p["liq"], cats=p["cats"], sectors=p.get("sectors"), buzz=p.get("buzz"),
-                 street=p.get("street"), ah=p.get("ah"), risk=p["risk"],
-                 macro_events=p["macro_events"])
+                 street=p.get("street"), ah=p.get("ah"), ladder=p.get("ladder"),
+                 short=p.get("short"), risk=p["risk"], macro_events=p["macro_events"])
 
 
 def render_ticker(ticker, args, use_color, interactive, backdrop_base):
@@ -1750,6 +1894,11 @@ if __name__ == "__main__":
                     help="Add a live Tradier put/call OI block by expiry. Bare = all expiries; combine any of "
                          "near (≤45 DTE) / leaps (180–365 DTE) / monthly (3rd-Friday only), e.g. `--pc-oi leaps monthly`. "
                          "Network; needs TRADIER_TOKEN.")
+    ap.add_argument("--short", action="store_true",
+                    help="Add a SHORT SETUP section — the tape read through a short lens "
+                         "(downtrend regime, distribution, laggard RS/sector, LVN air below, "
+                         "crowding via --squeeze data when present). Auto-enabled by --thesis "
+                         "bearish. CONTEXT ONLY — S28: no backtested short edge; zero network.")
     ap.add_argument("--insider", action="store_true",
                     help="Add an INSIDER ACTIVITY block: trailing-90d open-market Form 4 flow from "
                          "SEC EDGAR (official API) with cluster-buy detection. Network; cached; "

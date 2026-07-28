@@ -13,6 +13,10 @@ interface Tile {
   ma50_up: boolean | null
   as_of: string
   setup: { ok: number; total: number } | null
+  pos52?: number | null              // S65 — 52-week range position (0–1)
+  stale_days?: number | null         // S65 — sessions behind the expected last session
+  risk?: { dd: number; rally: number } | null   // S65 — latest snapshot's factor lean
+  regime?: string | null             // S65 — latest snapshot's trend-regime label
 }
 
 function TileSpark({ closes }: { closes: number[] }) {
@@ -75,7 +79,27 @@ function WatchTile({ ticker, onPick }: { ticker: string; onPick: (t: string) => 
             MA20 {t.ma20_up ? '▲' : '▼'}
             {t.ma50_up != null && <> · MA50 {t.ma50_up ? '▲' : '▼'}</>}
             {t.setup && <> · setup {t.setup.ok}/{t.setup.total}</>}
+            {t.risk != null && (t.risk.dd + t.risk.rally) > 0 && (
+              <> · <span style={{
+                color: t.risk.dd > t.risk.rally ? 'var(--red)'
+                  : t.risk.rally > t.risk.dd ? 'var(--green)' : undefined,
+              }}>dd {t.risk.dd}v{t.risk.rally}</span></>
+            )}
             {' · '}{t.as_of}
+          </Caption>
+          <Caption>
+            {t.regime && (
+              <span style={{
+                color: t.regime.includes('UP') ? 'var(--green)' : 'var(--red)',
+                fontWeight: 600,
+              }}>
+                {t.regime.includes('UP') ? '↑ uptrend' : '↓ downtrend'} ·{' '}
+              </span>
+            )}
+            {t.pos52 != null && <>52w {`${Math.round(t.pos52 * 100)}%`}</>}
+            {t.stale_days != null && (
+              <span style={{ color: 'var(--amber)' }}> · stale {t.stale_days}d</span>
+            )}
           </Caption>
         </>
       ) : (

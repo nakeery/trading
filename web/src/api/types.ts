@@ -15,6 +15,7 @@ export interface Flags {
   geo: boolean
   live: boolean
   ltf: boolean
+  short: boolean
   pc_oi: PcOiScope
   thesis: 'bullish' | 'bearish' | null
   level: number | null
@@ -23,7 +24,7 @@ export interface Flags {
 
 export const DEFAULT_FLAGS: Flags = {
   vol: false, call: false, gex: false, squeeze: false, insider: false,
-  street: false, movers: false, geo: false, live: false, ltf: false,
+  street: false, movers: false, geo: false, live: false, ltf: false, short: false,
   pc_oi: 'off', thesis: null, level: null, as_of: null,
 }
 

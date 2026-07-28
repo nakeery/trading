@@ -266,13 +266,26 @@ export function SecEvents({ p }: { p: Payload }) {
 }
 
 // ── THESIS CHECK ─────────────────────────────────────────────────────────────
+// mirrors modules/shortside.py S21_CONTRA_PREFIXES — a bearish thesis must not read S21
+// contrarian-BUY conditions (VIX stress, backwardation) as clean short confirmations (S65)
+const S21_PREFIXES = ['VIX stress regime', 'term backwardation']
+const isS21 = (f: string) => S21_PREFIXES.some((pre) => f.startsWith(pre))
+
 export function SecThesis({ p }: { p: Payload }) {
   const thesis = p.thesis as string | null
   if (!thesis) return null
   const risk = (p.risk ?? {}) as { rally?: string[]; drawdown?: string[] }
   const level = p.level as number | null
-  const confirm = thesis === 'bullish' ? risk.rally : risk.drawdown
+  const rawConfirm = thesis === 'bullish' ? risk.rally : risk.drawdown
+  const nS21 = thesis === 'bearish' ? (rawConfirm ?? []).filter(isS21).length : 0
+  const confirm = thesis === 'bearish'
+    ? (rawConfirm ?? []).map((f) => isS21(f)
+      ? `${f}  ⚠ S21: historically contrarian-BUY — weak short evidence` : f)
+    : rawConfirm
   const contra = thesis === 'bullish' ? risk.drawdown : risk.rally
+  const userLevel = (p.ladder as {
+    user_level?: { price: number; dist_pct: number; side: string; confluence?: string[] } | null
+  } | null)?.user_level
   const summary = (p.summary ?? {}) as { conflict?: string }
   const reads = (p.reads ?? {}) as Record<string, { _vol?: { unconfirmed?: boolean } | null }>
   const blind: string[] = []
@@ -286,8 +299,23 @@ export function SecThesis({ p }: { p: Payload }) {
   return (
     <>
       <Sec title={`THESIS CHECK — you are ${thesis.toUpperCase()}${level ? ` (level ${level})` : ''}`} />
+      {userLevel && (
+        <Caption>
+          your level {userLevel.price}: {userLevel.dist_pct >= 0 ? '+' : ''}
+          {(userLevel.dist_pct * 100).toFixed(1)}% {userLevel.side} spot —{' '}
+          {userLevel.confluence?.length
+            ? `confluence with ${userLevel.confluence.join(' · ')}`
+            : 'no other known level nearby'}
+        </Caption>
+      )}
       <BalanceBar left={nC} right={nX} leftLabel="confirmations" rightLabel="contradictions"
         leftColor={GREEN} rightColor={RED} />
+      {nS21 > 0 && (
+        <Warning>
+          {nS21} of {nC} confirmations are S21 contrarian-buy conditions — treat as bounce
+          fuel, not short confirmation
+        </Warning>
+      )}
       <Collapsible title={`detail — ✓ ${nC} confirmations · ✗ ${nX} contradictions`}>
         <FactorColumns columns={[
           { title: `CONFIRMATIONS (${nC})`, items: confirm?.length ? confirm : ['— none'], color: GREEN, marker: '✓' },
@@ -302,5 +330,11 @@ export function SecThesis({ p }: { p: Payload }) {
 export function SecNotes({ p }: { p: Payload }) {
   const notes = p.notes as string[] | null
   if (!notes?.length) return null
-  return <>{notes.map((n, i) => <Caption key={i}>note: {n}</Caption>)}</>
+  return (
+    <>
+      {/* S65 — a real header so the sidebar nav can anchor here */}
+      <Sec title="NOTES" />
+      {notes.map((n, i) => <Caption key={i}>note: {n}</Caption>)}
+    </>
+  )
 }

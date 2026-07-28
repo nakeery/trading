@@ -19,7 +19,9 @@ from plotly.subplots import make_subplots
 
 from api.cache import cached, frame_cache, iv_cache
 from modules.features import compute_hv_features
-from modules.timeframes import _load_daily, append_live_bar, fetch_live_bar
+from modules.timeframes import (
+    _load_daily, _load_intraday, _load_ltf, _resample, append_live_bar, fetch_live_bar,
+)
 
 try:
     from modules.setupcheck import TIER1_MACRO
@@ -37,6 +39,22 @@ OVERLAY_TOKENS = ("ma20", "ma50", "ma200", "ema9", "bb", "volume", "rsi", "macd"
                   "pline", "vp", "gex")
 DEFAULT_OVERLAYS = ("ma20", "ma50", "volume", "pline", "gex")
 VP_ASPECTS = ("value area", "POC", "HVN", "LVN", "histogram")
+
+# chart timeframes (S66) — the same frames the report reads, on the price chart itself.
+# Sources: 1D/1W/1M off the daily CSV; 1h/2h/4h off the cached yfinance 60m frame (~2y);
+# 5m/15m/30m off the Tradier 5m loader (~20d real-time; yfinance 5m/60d fallback).
+CHART_TFS = ("5m", "15m", "30m", "1h", "2h", "4h", "1D", "1W", "1M")
+TF_VIEW = {"5m": 156,      # 2 sessions of 78 bars
+           "15m": 130,     # 5 sessions
+           "30m": 130,     # 10 sessions
+           "1h": 150, "2h": 150, "4h": 150,
+           "1D": CHART_BARS, "1W": 120, "1M": 120}
+# intraday hour-bounds rangebreak (hide the overnight gap 16:00 → next open). 4h bars sit on
+# MIDNIGHT-anchored bins (08:00/12:00 hold the session), so its break must reopen at 08:00 —
+# a 09:30 bound would swallow the 08:00 bar itself. 2h uses the 90min session offset
+# (09:30/11:30/13:30/15:30) and the sub-hourly grid divides :30 evenly, so 09:30 works there.
+TF_HOUR_BOUNDS = {"5m": [16, 9.5], "15m": [16, 9.5], "30m": [16, 9.5],
+                  "1h": [16, 9.5], "2h": [16, 9.5], "4h": [16, 8]}
 
 
 def load_daily_full(ticker, force=False):
@@ -56,6 +74,37 @@ def chart_frame(ticker, as_of=None, start=None):
     if start:
         n_view = max(int((full.index >= pd.Timestamp(start)).sum()), 20)
     return full.tail(max(n_view + CHART_WARMUP, 260)), n_view
+
+
+def tf_frame(ticker, tf, as_of=None, start=None):
+    """(df, n_view) for any chart timeframe (S66). '1D' delegates to chart_frame (the
+    byte-stable original path); 1W/1M resample the daily; 1h/2h/4h ride the cached yfinance
+    60m frame; 5m/15m/30m ride the Tradier 5m loader (real-time; yfinance fallback). Raises
+    when the TF has no bars (e.g. sub-hourly beyond its ~20-60d history in as-of mode)."""
+    if tf == "1D":
+        return chart_frame(ticker, as_of, start)
+    if tf in ("1W", "1M"):
+        full = load_daily_full(ticker)
+        if as_of:
+            full = full.loc[:pd.Timestamp(as_of)]
+        df = _resample(full, "W-FRI" if tf == "1W" else "ME")
+    else:
+        base = _load_intraday(ticker) if tf in ("1h", "2h", "4h") else _load_ltf(ticker)
+        if as_of:
+            # intraday timestamps run through the session — keep the whole as-of day
+            base = base[base.index < pd.Timestamp(as_of).normalize() + pd.Timedelta(days=1)]
+        df = {"1h": lambda: base,
+              "2h": lambda: _resample(base, "2h", offset="90min"),  # session-anchored bins
+              "4h": lambda: _resample(base, "4h"),
+              "15m": lambda: _resample(base, "15min"),
+              "30m": lambda: _resample(base, "30min"),
+              "5m": lambda: base}[tf]()
+    if df is None or len(df) == 0:
+        raise ValueError(f"no {tf} bars available")
+    n_view = TF_VIEW[tf]
+    if start:
+        n_view = max(int((df.index >= pd.Timestamp(start)).sum()), 20)
+    return df.tail(n_view + CHART_WARMUP), n_view
 
 
 def range52(df, window=252):
@@ -200,7 +249,8 @@ def gex_levels(payload):
 
 
 def candle_fig(df, overlays=(), show_volume=False, price_line=None, vprofile=None,
-               events=(), glevels=(), rsi=None, macd=None, prev_close=None):
+               events=(), glevels=(), rsi=None, macd=None, prev_close=None,
+               hour_bounds=None, date_breaks=True):
     """Plotly candlestick from a daily OHLCV frame — ports _candle_fig verbatim (two-axis
     hollow convention via four split style-group traces, subpanes, profile aspects, GEX
     levels, event vlines, rangebreaks). Returns None when it can't build."""
@@ -362,10 +412,16 @@ def candle_fig(df, overlays=(), show_volume=False, price_line=None, vprofile=Non
         # span (holidays). Only dates WITHIN the data span count as holidays — future weekdays
         # (the event-marker extension) must survive. Applied to every subplot row's date axis;
         # x9 (the numeric volume-profile overlay) is excluded: rangebreaks are a date-axis feature.
-        rb = [dict(bounds=["sat", "mon"])]
-        holidays = pd.bdate_range(df.index[0], df.index[-1]).difference(df.index.normalize())
-        if len(holidays):
-            rb.append(dict(values=[d.strftime("%Y-%m-%d") for d in holidays]))
+        # S66: weekly/monthly bars are naturally evenly spaced — the weekday-holiday diff
+        # below would misread every non-period-end weekday as a "holiday" (hundreds of break
+        # values on a 1M axis), so those TFs skip rangebreaks entirely (date_breaks=False)
+        rb = [dict(bounds=["sat", "mon"])] if date_breaks else []
+        if date_breaks:
+            holidays = pd.bdate_range(df.index[0], df.index[-1]).difference(df.index.normalize())
+            if len(holidays):
+                rb.append(dict(values=[d.strftime("%Y-%m-%d") for d in holidays]))
+            if hour_bounds:  # intraday TFs (S66): collapse the overnight 16:00 → open gap
+                rb.append(dict(bounds=hour_bounds, pattern="hour"))
         fig.update_layout(**{f"xaxis{i + 1 if i else ''}": dict(rangebreaks=rb)
                              for i in range(rows)})
         if price_line is not None:
@@ -394,11 +450,15 @@ def fig_dict(fig):
 
 
 def build_chart(ticker, payload=None, as_of=None, start=None, live=False,
-                overlays=DEFAULT_OVERLAYS, aspects=VP_ASPECTS):
+                overlays=DEFAULT_OVERLAYS, aspects=VP_ASPECTS, tf="1D"):
     """Ports draw_chart's compute: frame + optional live bar + overlays/RSI/MACD on the
     warm-up frame, sliced to the view, then candle_fig. Returns
     {fig, range52, live: {found, hhmm, in_progress, close, chg} | None}.
-    `payload` (the ticker's latest generated report) supplies profile/events/GEX levels."""
+    `payload` (the ticker's latest generated report) supplies profile/events/GEX levels.
+    `tf` (S66) selects the chart timeframe (CHART_TFS): overlays/RSI/MACD compute on that
+    frame's bars; profile/GEX levels are price-horizontal (TF-agnostic); event vlines render
+    on the daily-and-up axes only; range52 always reads the DAILY frame; the live provisional
+    bar appends only on 1D (it IS a daily bar — intraday frames carry their own last bars)."""
     on = set(overlays)
     # Normalize as_of to the payload's canonical YYYY-MM-DD (payload["as_of_mode"] is stamped
     # asof_ts.date().isoformat()). _check_date accepts non-canonical-but-valid dates ("2025-3-5",
@@ -417,7 +477,9 @@ def build_chart(ticker, payload=None, as_of=None, start=None, live=False,
         # profile/event markers on these candles would be silent lookahead/staleness. Degrade
         # to an undecorated chart instead.
         payload = None
-    df, n_view = chart_frame(ticker, as_of, start)
+    if tf not in CHART_TFS:
+        tf = "1D"
+    df, n_view = tf_frame(ticker, tf, as_of, start)
     df = df.copy()
     live_info = None
     live_last = None
@@ -433,9 +495,19 @@ def build_chart(ticker, payload=None, as_of=None, start=None, live=False,
         except Exception:
             pass
         if bar:
-            df, _ = append_live_bar(df, bar)
             live_last = float(bar["Close"])
-            prev = float(df["Close"].iloc[-2]) if len(df) > 1 else live_last
+            if tf == "1D":
+                df, _ = append_live_bar(df, bar)
+                prev = float(df["Close"].iloc[-2]) if len(df) > 1 else live_last
+            else:
+                # the tiles ride this tick regardless of chart TF — prev must be the prior
+                # SESSION close (an intraday frame's iloc[-2] is just the prior bar)
+                try:
+                    d_hist = load_daily_full(ticker)
+                    d_hist = d_hist[d_hist.index < bar["ts"]]
+                    prev = float(d_hist["Close"].iloc[-1]) if len(d_hist) else live_last
+                except Exception:
+                    prev = live_last
             live_info = {"found": True, "hhmm": bar.get("hhmm"),
                          "in_progress": bool(bar.get("in_progress")),
                          "close": live_last, "prev_close": prev,
@@ -485,13 +557,29 @@ def build_chart(ticker, payload=None, as_of=None, start=None, live=False,
     fig = candle_fig(view, overlays=[(n, s.tail(n_view), c, d) for n, s, c, d in ov],
                      show_volume="volume" in on,
                      price_line=price if "pline" in on else None,
-                     vprofile=vprofile, events=event_markers(payload),
+                     vprofile=vprofile,
+                     # daily-dated event vlines land at midnight on an intraday axis —
+                     # inside the overnight rangebreak — so they render on 1D/1W/1M only
+                     events=event_markers(payload) if tf in ("1D", "1W", "1M") else [],
                      glevels=gex_levels(payload) if "gex" in on else [],
                      rsi=rsi_s, macd=macd_t,
-                     prev_close=df["Close"].shift(1).tail(n_view))
+                     prev_close=df["Close"].shift(1).tail(n_view),
+                     hour_bounds=TF_HOUR_BOUNDS.get(tf),
+                     date_breaks=tf not in ("1W", "1M"))
     if fig is not None:
         # stable per-view uirevision: plotly preserves the user's zoom/pan across live ticks
-        # and overlay toggles, resetting only when the ticker or the date window changes
-        fig.update_layout(uirevision=f"{ticker}|{as_of or ''}|{start or ''}")
-    return {"fig": fig_dict(fig), "range52": range52(df), "live": live_info,
+        # and overlay toggles, resetting only when the ticker, TF, or date window changes
+        fig.update_layout(uirevision=f"{ticker}|{tf}|{as_of or ''}|{start or ''}")
+    if tf == "1D":
+        r52 = range52(df)
+    else:
+        # 52w range is a daily-bar concept — read it off the daily frame for every TF
+        try:
+            d_full = load_daily_full(ticker)
+            if as_of:
+                d_full = d_full.loc[:pd.Timestamp(as_of)]
+            r52 = range52(d_full)
+        except Exception:
+            r52 = None
+    return {"fig": fig_dict(fig), "range52": r52, "live": live_info,
             "as_of": str(df.index[-1].date())}

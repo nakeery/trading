@@ -45,6 +45,34 @@ export function PctBar({ pct, width = 90, height = 8, color = BLUE, showText = t
   )
 }
 
+// ── TallyBar — segmented mark tally (✓/–/✗) ──────────────────────────────────
+/** N labeled segments sized by count (S65 — the SETUP CHECK score + verdict strip).
+ *  Zero-count segments drop out; zero total → null. Counts always labeled. */
+export function TallyBar({ segments, width = 320 }: {
+  segments: { n: number; color: string; label: string }[]
+  width?: number
+}) {
+  const clean = segments.map((s) => ({ ...s, n: Math.max(0, s.n | 0) }))
+  const total = clean.reduce((sum, s) => sum + s.n, 0)
+  if (total === 0) return null
+  return (
+    <div style={{ maxWidth: width, margin: '6px 0' }}>
+      <div style={{ display: 'flex', gap: 2, height: 12 }}>
+        {clean.filter((s) => s.n > 0).map((s, i) => (
+          <div key={i} style={{
+            flexGrow: s.n / total, background: s.color, borderRadius: 3, minWidth: 4,
+          }} />
+        ))}
+      </div>
+      <div style={{ display: 'flex', gap: 12, fontSize: 12, marginTop: 2 }}>
+        {clean.map((s, i) => s.n > 0 && (
+          <span key={i} style={{ color: s.color, fontWeight: 600 }}>{s.n} {s.label}</span>
+        ))}
+      </div>
+    </div>
+  )
+}
+
 // ── BalanceBar — two-sided count tug-of-war ──────────────────────────────────
 /** Diverging factor tally: left vs right segments sized by count, with labeled counts
  *  (identity is never color-alone). Zero total → null. */

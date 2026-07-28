@@ -4,8 +4,12 @@
 import type { ReportDiff } from '../api/types'
 import { ordinalPercentile } from '../utils/colors'
 import { Caption, Collapsible } from './shared'
+import { diffCount } from './VerdictStrip'
 
-export default function DiffPanel({ diff }: { diff: ReportDiff | null }) {
+export default function DiffPanel({ diff, forceOpen = false }: {
+  diff: ReportDiff | null
+  forceOpen?: boolean
+}) {
   if (!diff) return null
   const chg = diff.close != null && diff.prev_close
     ? diff.close / diff.prev_close - 1 : null
@@ -18,8 +22,12 @@ export default function DiffPanel({ diff }: { diff: ReportDiff | null }) {
     )
   }
   const d = diff.changes
+  const n = diffCount(diff)
   return (
-    <Collapsible title={`Δ what changed since ${diff.prev_as_of}`}>
+    <div id="diff-panel">
+    {/* S65: badge count in the title; open by default when something actually changed */}
+    <Collapsible title={`Δ ${n} change${n === 1 ? '' : 's'} since ${diff.prev_as_of}`}
+      defaultOpen={forceOpen || n > 0}>
       {diff.close != null && diff.prev_close != null && (
         <Caption>
           close {diff.prev_close.toLocaleString('en-US', { minimumFractionDigits: 2 })} →{' '}
@@ -60,5 +68,6 @@ export default function DiffPanel({ diff }: { diff: ReportDiff | null }) {
         data/payload_history/
       </Caption>
     </Collapsible>
+    </div>
   )
 }

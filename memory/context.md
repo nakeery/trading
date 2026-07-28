@@ -236,6 +236,52 @@ lens_web.py specifics (S48, +S49 native visuals):
     response and the fixture must be REAL-SHAPED; the regression guard is now "real quote +
     no ext print → None".
 
+- **S65 four-track improvement pass** (user request: readability + entry timing + profitability
+  + short opportunity; all four scoped display-only after the S20/S21/S28 history):
+  (1) **PRICE LADDER** — `modules/levels.py` (pure): every level the report knows (profile
+  POC/VA/HVN/LVN, GEX walls/flip/max-pain, EM band, numeric 1D/1W MA20/50/200 — `read_timeframe`
+  now returns the VALUES, 52w hi/lo, prior-day H/L/C, `--level`) merged into one distance-sorted
+  ladder; ±0.5% clusters = confluence zones (◆); nearest S/R; `--level` finally COMPUTED
+  (distance/side/confluence, echoed in THESIS CHECK). Default-on, zero network, as-of-valid.
+  (2) **SHORT SETUP** — `modules/shortside.py` (pure), `--short` auto-on under `--thesis
+  bearish`: for/against factors, crowding verdict off --squeeze fuel/counter (unknown without —
+  never fetches), short-side checklist (setupcheck rows 2/3/4 inverted THERE, setupcheck.py
+  untouched → snapshot/diff/self-score meaning stable), lagging-sector pool (+ bottom-3 via new
+  `sectors.bottom_performers_read`; sector_top cache shape-gated on "bottoms"). S21 conditions
+  (VIX stress/backwardation — `S21_CONTRA_PREFIXES`, drift-guarded test) land on AGAINST and get
+  ⚠ annotations in the bearish thesis confirmations (counts untouched — S43); S28 no-short-edge
+  caveats print unconditionally. `levels.nearest_lvn_below` = the below-spot LVN-air mirror.
+  (3) **UI verdict + readability** — `VerdictStrip.tsx` (regime pill · setup TallyBar · dd/rally
+  balance · synthesis · Δ-badge that opens+scrolls the diff) above the chart; HeaderTiles moved
+  ABOVE the fig; `TallyBar` in viz.tsx (also in SecSetup); multi-TF alignment strip (1M ↑ · …);
+  grouped backdrop chips (known prefixes → bold labels, unknown unchanged); nav completed
+  (Divergences/Price ladder/Short setup/Thesis/Notes — SecNotes gained a Sec header); DiffPanel
+  "Δ N changes" title + defaultOpen when N>0; pc-oi expiry + GEX unusual tables folded
+  (long-call table deliberately left open — it IS that section's deliverable); watchlist tiles
+  gained pos52/staleness/risk-lean/regime (extended `load_tile`; no batch endpoint — per-ticker
+  GETs fine at this scale).
+  (4) **LENS SELF-SCORE** — `lens_score.py`: payload_history snapshots (unchanged format) joined
+  to realized 15d/63d returns, aggregated by setup band/regime/risk lean, avg+median only,
+  honesty note always printed (small N, non-independent, NO significance); `GET
+  /api/lens_score/{ticker}` + `LensScore.tsx` expander (as-of hidden). First real run: 6 QQQ
+  snapshots, all pending.
+  NB the `--thesis bearish` overlay previously counted S21 contrarian-buy conditions as clean
+  short confirmations — that was the motivating mislabel for track 2.
+
+- **S66 chart timeframes** (user request): the web candle chart gets a TF pill row
+  (5m/15m/30m/1h/2h/4h/1D/1W/1M) — `?tf=` on /api/chart, `charts.tf_frame` (1D = the original
+  chart_frame path untouched; W/M resample the daily; 1h/2h/4h off the cached yfinance 60m
+  frame — 2h keeps the 90min session offset; sub-hourly off `_load_ltf`, Tradier real-time).
+  Per-TF view lengths (`TF_VIEW`), overlays/RSI/MACD compute on the selected frame.
+  Gotchas encoded: intraday axes need an hour rangebreak to collapse the overnight gap and
+  **4h must reopen at 08:00** (midnight-anchored bins — a 09:30 bound swallows the 08:00 bar);
+  **W/M skip rangebreaks entirely** (the weekday-holiday diff would misread every non-period-end
+  weekday as a holiday — hundreds of break values); event vlines are daily-dated (midnight =
+  inside the overnight break) → 1D/1W/1M only; the live provisional bar appends on 1D only,
+  and the live tick's `prev_close` comes from the DAILY frame on other TFs (an intraday
+  iloc[-2] is just the prior bar); range52 always reads the daily frame; sub-hourly pills
+  disabled in as-of mode (no historical source). uirevision includes tf.
+
 Modules the lens/web stack uses
 -------------------------------
 - `timeframes.py` — per-TF OHLCV (CSV else yfinance; 1h cached + Tradier timesales top-up in

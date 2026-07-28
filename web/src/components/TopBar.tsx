@@ -4,7 +4,7 @@
 import type { Flags, PcOiScope } from '../api/types'
 import { localToday } from '../utils/dates'
 
-const BOOL_FLAGS = ['vol', 'call', 'gex', 'squeeze', 'insider', 'street', 'movers', 'geo', 'live', 'ltf'] as const
+const BOOL_FLAGS = ['vol', 'call', 'gex', 'squeeze', 'insider', 'street', 'movers', 'geo', 'live', 'ltf', 'short'] as const
 
 export default function TopBar({ ticker, flags, chartFrom, known, onTicker, onFlags, onChartFrom, onRun, onPill }: {
   ticker: string

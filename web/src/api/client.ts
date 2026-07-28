@@ -22,7 +22,7 @@ export function fetchAfterhours(ticker: string): Promise<{ ah: AhRead | null }> 
 /** Query string for the report flags — omits defaults so URLs stay short/shareable. */
 export function flagsToParams(flags: Flags): URLSearchParams {
   const p = new URLSearchParams()
-  for (const k of ['vol', 'call', 'gex', 'squeeze', 'insider', 'street', 'movers', 'geo', 'live', 'ltf'] as const) {
+  for (const k of ['vol', 'call', 'gex', 'squeeze', 'insider', 'street', 'movers', 'geo', 'live', 'ltf', 'short'] as const) {
     if (flags[k]) p.set(k, '1')
   }
   if (flags.pc_oi !== 'off') p.set('pc_oi', flags.pc_oi)
@@ -43,6 +43,7 @@ export interface ChartOpts {
   asOf?: string | null
   start?: string | null
   live?: boolean
+  tf?: string // chart timeframe (S66): 5m 15m 30m 1h 2h 4h 1D 1W 1M — default 1D
   overlays: string[] // tokens: ma20 ma50 ma200 ema9 bb volume rsi macd pline vp gex
   aspects: string[] // vol-profile aspects when "vp" is on
 }
@@ -53,6 +54,7 @@ export function fetchChart(ticker: string, opts: ChartOpts): Promise<ChartRespon
   if (opts.asOf) p.set('as_of', opts.asOf)
   if (opts.start) p.set('start', opts.start)
   if (opts.live) p.set('live', '1')
+  if (opts.tf && opts.tf !== '1D') p.set('tf', opts.tf)
   return getJson(`/api/chart/${encodeURIComponent(ticker)}?${p}`)
 }
 

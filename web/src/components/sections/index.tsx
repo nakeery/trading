@@ -6,10 +6,10 @@ import { useEffect, useState } from 'react'
 import type { Payload } from '../../api/types'
 import { SectionBoundary } from '../shared'
 import {
-  SecBackdrop, SecDivergences, SecMultiTf, SecRisk, SecSetup, SecVolumeProfile,
+  SecBackdrop, SecDivergences, SecLadder, SecMultiTf, SecRisk, SecSetup, SecVolumeProfile,
 } from './core'
 import { SecGeo, SecOptions } from './gauges'
-import { SecBuzz, SecGex, SecInsider, SecPcOi, SecSqueeze, SecStreet } from './positioning'
+import { SecBuzz, SecGex, SecInsider, SecPcOi, SecShort, SecSqueeze, SecStreet } from './positioning'
 import { SecCall, SecVol } from './volcall'
 import { SecEvents, SecNotes, SecSectors, SecThesis, hasUpcomingEvents } from './misc'
 
@@ -19,8 +19,10 @@ const SECTIONS: [string, ({ p }: { p: Payload }) => React.ReactElement | null][]
   ['multi-timeframe', SecMultiTf],
   ['divergences', SecDivergences],
   ['volume profile', SecVolumeProfile],
+  ['price ladder', SecLadder], // S65 — consolidated distance-sorted S/R view
   ['rally vs drawdown', SecRisk],
   ['setup check', SecSetup],
+  ['short setup', SecShort], // S65 — --short / --thesis bearish
   ['options & vol', SecOptions],
   ['short/squeeze', SecSqueeze],
   ['retail attention', SecBuzz],
@@ -56,9 +58,14 @@ export default function Sections({ p }: { p: Payload }) {
 const NAV: [string, string, (p: Payload) => unknown][] = [
   ['Market backdrop', 'market-backdrop', (p) => p.backdrop],
   ['Multi-timeframe', 'multi-timeframe', (p) => p.reads],
+  ['Divergences', 'divergences',
+    (p) => p.divs && Object.keys(p.divs as object).length],
   ['Volume profile', 'volume-profile', (p) => p.profile],
+  ['Price ladder', 'price-ladder',
+    (p) => (p.ladder as { levels?: unknown[] } | null)?.levels?.length],
   ['Rally vs drawdown', 'rally-vs-drawdown-risk', (p) => p.risk],
   ['Setup check', 'setup-check', (p) => p.setup],
+  ['Short setup', 'short-setup', (p) => p.short],
   ['Options & vol', 'options-vol-context', (p) => p.ctx],
   ['Short/squeeze', 'short-positioning-squeeze', (p) => p.squeeze],
   ['Retail attention', 'retail-attention', (p) => p.buzz && !p.squeeze],
@@ -77,6 +84,8 @@ const NAV: [string, string, (p: Payload) => unknown][] = [
   // shared predicate: SecEvents can render null even when earn/exd/macro keys exist (all
   // beyond horizon) — the old inline check emitted a dead anchor for that case
   ['Upcoming events', 'upcoming-events', hasUpcomingEvents],
+  ['Thesis check', 'thesis-check', (p) => p.thesis],
+  ['Notes', 'notes', (p) => (p.notes as unknown[] | null)?.length],
 ]
 
 export function SectionNav({ p }: { p: Payload }) {

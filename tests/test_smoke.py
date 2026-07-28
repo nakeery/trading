@@ -1385,7 +1385,8 @@ def test_gather_payload_keys(monkeypatch):
                 "squeeze", "insider", "callq", "liq", "cats", "risk", "macro_events",
                 "thesis", "level", "live_iv", "earn", "exd", "as_of_mode",
                 "sectors", "buzz", "street",                                     # S58 keys
-                "ah"}                                                            # S64 key
+                "ah",                                                            # S64 key
+                "ladder", "short"}                                               # S65 keys
     assert set(payload.keys()) == expected
     assert not any(isinstance(v, (pd.DataFrame, pd.Series)) for v in payload.values())
     assert payload["reads"] and payload["risk"] is not None      # frames were read + risk lifted
@@ -2503,3 +2504,284 @@ def test_s64_gap_gauges():
     assert abs(g2[0]["value"] - (-0.002)) < 1e-12
 
     assert gap_gauges(pd.DataFrame({"Close": [1.0]})) == []
+
+
+# ─── Test 57 (S65): price ladder (offline) ─────────────────────────────────────
+def test_build_ladder():
+    """modules/levels (S65): collect_levels merges every optional source; build_ladder sorts by
+    |distance|, clusters confluence (≥2 distinct tags within ±0.5%), picks nearest S/R, and
+    annotates the user level. All-None inputs degrade to None, never raise."""
+    from modules.levels import build_ladder, collect_levels
+
+    spot = 100.0
+    profile = {"poc": 98.0, "va_low": 95.0, "va_high": 102.0,
+               "hvns": [90.0, 98.0], "lvns": [93.0]}
+    gex = {"call_wall": 105.0, "put_wall": 95.02, "zero_gamma": 99.0,
+           "max_pain": {"strike": 100.0}}
+    reads = {"1D": {"ok": True, "ma20": 97.9, "ma50": 96.0, "ma200": None},
+             "1W": {"ok": False, "ma20": 50.0}}                 # not-ok frame skipped
+    levels = collect_levels(spot, profile=profile, gex=gex, reads=reads,
+                            range52={"hi": 110.0, "lo": 80.0},
+                            prior_day={"high": 101.0, "low": 99.5, "close": 100.4},
+                            user_level=95.1)
+    tags = {t for _, t in levels}
+    assert "MA20 1D" in tags and "MA20 1W" not in tags          # ok-gate on reads
+    assert "YOUR LEVEL" in tags and "52w high" in tags
+
+    lad = build_ladder(spot, levels)
+    assert lad["levels"] == sorted(lad["levels"], key=lambda r: abs(r["dist_pct"]))
+    # confluence: POC 98.0 + MA20 97.9 within 0.5% → one row, both tags, zone set
+    poc_row = next(r for r in lad["levels"] if "POC" in r["tags"])
+    assert "MA20 1D" in poc_row["tags"] and poc_row["zone"] is not None
+    # nearest S/R are strictly below/above spot
+    assert lad["nearest_support"]["price"] < spot < lad["nearest_resistance"]["price"]
+    # user level 95.1 clusters with va_low 95.0 + put wall 95.02 → confluence reported
+    ul = lad["user_level"]
+    assert ul and ul["side"] == "below" and "value-area low" in ul["confluence"]
+    assert "GEX put wall" in ul["confluence"]
+
+    # degradation: no inputs → no ladder; junk spot → None; never raises
+    assert build_ladder(spot, []) is None
+    assert build_ladder(None, levels) is None
+    assert build_ladder("x", levels) is None
+    assert collect_levels(spot) == []
+    assert collect_levels(spot, gex={"call_wall": "bad"}) == []
+
+
+def test_nearest_lvn_below():
+    """levels.nearest_lvn_below (S65): the below-spot mirror of shortint's LVN-air factor —
+    nearest LVN strictly below spot within −8%, as a signed pct."""
+    from modules.levels import nearest_lvn_below
+
+    prof = {"lvns": [80.0, 95.0, 97.0, 103.0]}
+    r = nearest_lvn_below(prof, 100.0)
+    assert abs(r - (97.0 / 100.0 - 1.0)) < 1e-12               # nearest below, signed negative
+    assert nearest_lvn_below({"lvns": [80.0]}, 100.0) is None  # outside −8%
+    assert nearest_lvn_below({"lvns": [103.0]}, 100.0) is None # above spot doesn't count
+    assert nearest_lvn_below(None, 100.0) is None
+    assert nearest_lvn_below(prof, None) is None
+    assert nearest_lvn_below(prof, "x") is None
+
+
+# ─── Test 58 (S65): short-opportunity lens (offline) ───────────────────────────
+def test_is_s21_contrarian():
+    """The S21 prefix matcher must track the EXACT factor strings rally_drawdown_risk builds
+    (structure.py) — if those strings drift, this test must fail so the thesis-bearish
+    annotation doesn't silently stop matching."""
+    from modules.shortside import is_s21_contrarian
+
+    # the two live factor formats from structure.rally_drawdown_risk
+    assert is_s21_contrarian("VIX stress regime (elevated market risk)")
+    assert is_s21_contrarian("term backwardation — near-term stress priced")
+    assert not is_s21_contrarian("daily near top of 1y range")
+    assert not is_s21_contrarian(None)
+
+    # drift guard: build the real factors from a synthetic ctx and assert they match
+    from modules.structure import rally_drawdown_risk
+    ctx = {"regime": "stress",
+           "gauges": [{"name": "Term structure", "value": 1.10}]}
+    risk = rally_drawdown_risk({}, ctx=ctx)
+    s21 = [f for f in risk["drawdown"] if is_s21_contrarian(f)]
+    assert len(s21) == 2, f"expected both S21 factors matched, got {s21}"
+
+
+def test_short_setup_factors():
+    """shortside.short_setup (S65): downtrend evidence lands on 'for', bounce/S21 evidence on
+    'against', the checklist inverts the long setup rows, and the S28 caveats always print."""
+    from modules.shortside import short_setup
+
+    dn = {"ok": True, "trend": "down", "rsi": 45.0, "rsi_state": "neutral",
+          "dist_ma20_pct": -0.02, "range_pos": 0.4,
+          "_vol": {"ok": True, "tag": "dn-distrib", "distribution": True, "unconfirmed": False}}
+    reads = {"1D": dn, "1W": {**dn, "_vol": None}, "1M": {**dn, "_vol": None}}
+    s = short_setup(
+        reads, profile={"price_location": "below_value"},
+        divergences={"1D": ("bearish", "price HH, RSI LH")},
+        rs={"bench": "SOX", "rs": {20: -0.03, 63: -0.08}},
+        sectors={"own": "XLK", "rows": [{"sym": "XLK", "tag": "lagging", "rank": 11}]},
+        gex={"net_gex": -1e9, "zero_gamma": 105.0, "spot": 100.0},
+        street={"ud": {"n_up": 1, "n_down": 4, "window_days": 90},
+                "rev_net": "estimates drifting DOWN"},
+        lvn_below_pct=-0.05,
+        regime={"state": "down", "label": "ESTABLISHED DOWNTREND", "why": ["1D+1W aligned"]})
+    joined = " | ".join(s["for"])
+    for token in ("ESTABLISHED DOWNTREND", "distribution", "bearish divergence",
+                  "BELOW value", "thin-volume air", "lagging SOX", "XLK lagging",
+                  "short gamma", "zero-gamma", "downgrades", "drifting DOWN"):
+        assert token in joined, f"missing '{token}' in for-factors: {joined}"
+    marks = {label: mark for label, mark, _ in s["checklist"]}
+    assert marks["HTF alignment"] == "✓" and marks["Volume confirms"] == "✓"
+    assert marks["Relative strength"] == "✓"
+    assert len(s["caveats"]) == 3 and "S28" in s["caveats"][0]
+
+    # uptrend + oversold + S21 conditions → against side; checklist flips
+    up = {"ok": True, "trend": "up", "rsi": 25.0, "rsi_state": "oversold",
+          "dist_ma20_pct": -0.10, "range_pos": 0.05,
+          "_vol": {"ok": True, "tag": "up-confirmed", "distribution": False}}
+    reads2 = {"1D": up, "1W": {**up, "_vol": None}, "1M": {**up, "_vol": None}}
+    s2 = short_setup(reads2, ctx={"regime": "stress",
+                                  "gauges": [{"name": "Term structure", "value": 1.10}]},
+                     rs={"bench": "SOX", "rs": {20: 0.02, 63: 0.05}},
+                     regime={"state": "up", "label": "ESTABLISHED UPTREND", "why": []})
+    j2 = " | ".join(s2["against"])
+    for token in ("ESTABLISHED UPTREND", "S28", "oversold", "snap-back", "bottom of 1y range",
+                  "VIX stress", "contrarian-BUY", "backwardation"):
+        assert token in j2, f"missing '{token}' in against: {j2}"
+    m2 = {label: mark for label, mark, _ in s2["checklist"]}
+    assert m2["Momentum room"] == "✗" and m2["Volume confirms"] == "✗"
+    assert m2["Relative strength"] == "✗"
+    assert short_setup({})["net"]                        # empty inputs never raise
+
+
+def test_short_setup_crowding():
+    """Crowding verdict off the squeeze read: ≥2 fuel → crowded (+ an against factor),
+    counters → uncrowded, None → unknown with the --squeeze hint."""
+    from modules.shortside import short_setup
+
+    crowded = short_setup({}, sqz_read={"fuel": ["DTC 16 — extreme", "shorts underwater"],
+                                        "counter": []})
+    assert crowded["crowding"]["state"] == "crowded"
+    assert any("CROWDED" in f for f in crowded["against"])
+    uncrowded = short_setup({}, sqz_read={"fuel": [], "counter": ["DTC 1.2 — low"]})
+    assert uncrowded["crowding"]["state"] == "uncrowded"
+    unknown = short_setup({})
+    assert unknown["crowding"]["state"] == "unknown"
+    assert any("--squeeze" in l for l in unknown["crowding"]["lines"])
+
+
+def test_thesis_bearish_s21_annotation():
+    """print_report (S65): under --thesis bearish, S21 contrarian factors in the confirmations
+    list carry the ⚠ annotation + a summary count; under bullish they don't."""
+    import contextlib
+    import io
+    from lens import print_report
+
+    risk = {"net": "x", "regime": None,
+            "drawdown": ["VIX stress regime (elevated market risk)", "daily near top of 1y range"],
+            "rally": []}
+    def render(thesis):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            print_report("TEST", reads={}, divs={}, summary={"synthesis": "s"}, profile=None,
+                         notes=[], color=False, candle_style="none", thesis=thesis, risk=risk)
+        return buf.getvalue()
+    bear = render("bearish")
+    assert "⚠ S21: historically contrarian-BUY" in bear
+    assert "1 of 2 confirmations are S21" in bear
+    bull = render("bullish")
+    assert "S21" not in bull
+
+
+def test_bottom_performers_read():
+    """sectors.bottom_performers_read (S65): worst-first tail of the same ranking that
+    top_performers_read heads; short series omitted identically."""
+    import numpy as np
+    import pandas as pd
+    from modules.sectors import bottom_performers_read, top_performers_read
+
+    idx = pd.date_range("2026-01-01", periods=80, freq="B")
+    def series(total_ret):
+        return pd.Series(np.linspace(100, 100 * (1 + total_ret), 80), index=idx)
+    closes = {"AAA": series(0.30), "BBB": series(0.10), "CCC": series(-0.20),
+              "DDD": pd.Series([100.0], index=idx[:1])}          # too short — omitted
+    cons = {"XLK": [("AAA", "A"), ("BBB", "B"), ("CCC", "C"), ("DDD", "D")]}
+    top = top_performers_read(cons, closes, top_n=2)
+    bot = bottom_performers_read(cons, closes, bottom_n=2)
+    assert [m["sym"] for m in top["XLK"]] == ["AAA", "BBB"]
+    assert [m["sym"] for m in bot["XLK"]] == ["CCC", "BBB"]      # worst first
+    assert bottom_performers_read({}, {}) == {}
+
+
+# ─── Test 59 (S65): enriched watchlist tile ────────────────────────────────────
+def test_load_tile_enrichment():
+    """api.loaders.load_tile (S65): the tile carries 52w position (0–1), a staleness count,
+    and (when a snapshot exists) risk lean + regime — all zero-network off disk."""
+    fastapi = __import__("pytest").importorskip("fastapi")  # noqa: F841 — api dep
+    from api.loaders import load_tile
+
+    t = load_tile("QQQ")
+    assert t is not None and t["ticker"] == "QQQ"
+    assert 0.0 <= t["pos52"] <= 1.0
+    assert t["stale_days"] is None or t["stale_days"] >= 1
+    assert "risk" in t and "regime" in t                       # keys present (values may be None)
+    if t["risk"] is not None:
+        assert set(t["risk"]) == {"dd", "rally"}
+
+
+# ─── Test 60 (S65): lens self-score (offline, tmp dir) ─────────────────────────
+def test_lens_score():
+    """lens_score (S65): snapshot rows join to forward returns at the score_ledger
+    convention; band edges land at 6/4/3; young rows pend; aggregates carry avg+median only;
+    empty history → no_snapshots. All offline via a tmp payload_history + synthetic closes."""
+    import json
+    import os
+    import tempfile
+
+    import numpy as np
+    import pandas as pd
+    from lens_score import (SCORE_BANDS, _band, aggregate, score, score_snapshots,
+                            snapshot_row)
+
+    assert _band(6) == SCORE_BANDS[0][2] and _band(8) == SCORE_BANDS[0][2]
+    assert _band(5) == "4–5 ✓" and _band(4) == "4–5 ✓"
+    assert _band(3) == "≤3 ✓" and _band(0) == "≤3 ✓"
+
+    snap = {"as_of": "2026-03-02", "close": 100.0,
+            "setup": {"a": "✓", "b": "✓", "c": "–", "d": "✗"},
+            "dd": ["x", "y"], "rally": ["z"], "regime": "ESTABLISHED UPTREND"}
+    row = snapshot_row(snap)
+    assert row == {"as_of": "2026-03-02", "ok": 2, "total": 4,
+                   "n_dd": 2, "n_rally": 1, "regime": "ESTABLISHED UPTREND"}
+
+    idx = pd.date_range("2026-03-02", periods=80, freq="B")
+    close = pd.Series(np.linspace(100.0, 110.0, 80), index=idx)   # +10% over 79 steps
+    scored = score_snapshots([row, {**row, "as_of": idx[-2].date().isoformat()}], close)
+    assert scored[0]["fwd15"] is not None and scored[0]["fwd15"] > 0
+    exp15 = float(close.iloc[15]) / float(close.iloc[0]) - 1
+    assert abs(scored[0]["fwd15"] - exp15) < 1e-12
+    assert scored[1]["fwd15"] is None                             # young row pends
+
+    agg = aggregate(scored)
+    cell = agg["bands"]["≤3 ✓"]                                   # ok=2 → ≤3 band
+    assert cell["n"] == 2 and cell["scored15"] == 1
+    assert set(cell) == {"n", "scored15", "avg15", "med15", "scored63", "avg63", "med63"}
+    assert "4–5 ✓" not in agg["bands"]                            # empty cells absent
+    assert agg["regimes"]["UPTREND"]["n"] == 2
+    assert agg["leans"]["dd>rally"]["n"] == 2
+
+    # end-to-end via a tmp dir: no history → no_snapshots; with history → ok
+    with tempfile.TemporaryDirectory() as td:
+        assert score("QQQ", td)["status"] == "no_snapshots"
+        d = os.path.join(td, "payload_history", "qqq")
+        os.makedirs(d)
+        with open(os.path.join(d, "2026-03-02.json"), "w", encoding="utf-8") as f:
+            json.dump(snap, f)
+        pd.DataFrame({"Close": close}, index=idx).to_csv(os.path.join(td, "qqq_indicators.csv"))
+        res = score("QQQ", td)
+        assert res["status"] == "ok" and res["n"] == 1
+        assert "NO significance" in res["note"]
+
+
+# ─── Test 61 (S66): chart timeframes (offline — daily-CSV paths only) ──────────
+def test_chart_tf_frame():
+    """api.charts.tf_frame (S66): constants cover every TF; 1D delegates to chart_frame;
+    1W/1M resample the daily CSV (W-FRI labels are Fridays); hour-bounds exist for exactly
+    the intraday TFs (4h reopens at 08:00 — its midnight-anchored bins sit before 09:30)."""
+    __import__("pytest").importorskip("fastapi")
+    from api import charts
+
+    assert set(charts.TF_VIEW) == set(charts.CHART_TFS)
+    assert set(charts.TF_HOUR_BOUNDS) == {t for t in charts.CHART_TFS
+                                          if t not in ("1D", "1W", "1M")}
+    assert charts.TF_HOUR_BOUNDS["4h"][1] < 9.5 <= charts.TF_HOUR_BOUNDS["1h"][1]
+
+    d1, nv1 = charts.tf_frame("QQQ", "1D")
+    assert nv1 == charts.CHART_BARS and len(d1) > nv1
+    dw, nvw = charts.tf_frame("QQQ", "1W")
+    assert nvw == charts.TF_VIEW["1W"]
+    assert all(d.weekday() == 4 for d in dw.index)          # W-FRI period-end labels
+    dm, _ = charts.tf_frame("QQQ", "1M")
+    assert len(dm) > 12
+    # as-of truncation on the resampled path
+    dw2, _ = charts.tf_frame("QQQ", "1W", as_of="2026-03-10")
+    assert dw2.index.max() <= __import__("pandas").Timestamp("2026-03-14")

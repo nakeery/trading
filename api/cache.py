@@ -21,8 +21,10 @@ reactions_cache = TTLCache(maxsize=64, ttl=3600)   # (ticker, asof) → earnings
 # S64 fix: the AH tile polls every ~30s off-hours. A short TTL keeps N open tabs from
 # multiplying Tradier calls without letting the print visibly lag its own poll interval.
 afterhours_cache = TTLCache(maxsize=64, ttl=10)    # ticker → after-hours read
+lens_score_cache = TTLCache(maxsize=64, ttl=600)   # ticker → lens self-score (S65)
 
-_PER_TICKER = (frame_cache, iv_cache, tile_cache, ledger_cache, season_cache, reactions_cache)
+_PER_TICKER = (frame_cache, iv_cache, tile_cache, ledger_cache, season_cache, reactions_cache,
+               lens_score_cache)
 
 # cachetools caches are NOT thread-safe, and the sync `def` endpoints run concurrently in
 # FastAPI's threadpool (the watchlist alone fires N parallel /api/tile calls) while

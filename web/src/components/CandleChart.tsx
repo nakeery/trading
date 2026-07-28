@@ -15,6 +15,11 @@ import Plot from './Plot'
 const LIVE_EVERY_MS = 10_000
 const LIVE_MISS_LIMIT = 3
 
+// chart timeframes (S66) — mirrors api/charts.CHART_TFS. Sub-hourly history only reaches
+// ~20-60 days back, so those pills are disabled in as-of (backtest) mode.
+const CHART_TFS = ['5m', '15m', '30m', '1h', '2h', '4h', '1D', '1W', '1M'] as const
+const SUB_HOURLY = new Set(['5m', '15m', '30m'])
+
 const OVERLAYS: { token: string; label: string; default: boolean }[] = [
   { token: 'ma20', label: 'MA20', default: true },
   { token: 'ma50', label: 'MA50', default: true },
@@ -41,6 +46,7 @@ export default function CandleChart({ ticker, payload, asOf, start, live = false
   // un-re-evaluated and the backoff could never engage (polling all night, the exact
   // scenario this exists for)
   const [misses, setMisses] = useState(0)
+  const [tf, setTf] = useState<string>('1D')   // S66 — chart bar timeframe
   const [on, setOn] = useState<Set<string>>(
     () => new Set(OVERLAYS.filter((o) => o.default).map((o) => o.token)),
   )
@@ -61,11 +67,11 @@ export default function CandleChart({ ticker, payload, asOf, start, live = false
   const chart = useQuery({
     // payload.as_of in the key: a fresh report (new data vintage) refetches the fig
     queryKey: ['chart', ticker, payload.as_of, asOf, start, overlays.sort().join(','),
-      on.has('vp') ? [...aspects].sort().join(',') : '', isLive],
+      on.has('vp') ? [...aspects].sort().join(',') : '', isLive, tf],
     queryFn: async () => {
       try {
         const d = await fetchChart(ticker, {
-          asOf, start, overlays, aspects: on.has('vp') ? [...aspects] : [], live: isLive,
+          asOf, start, overlays, aspects: on.has('vp') ? [...aspects] : [], live: isLive, tf,
         })
         if (isLive) setMisses((m) => (d.live?.found ? 0 : m + 1))
         return d
@@ -97,6 +103,36 @@ export default function CandleChart({ ticker, payload, asOf, start, live = false
             : 'live: no Tradier session data right now (market closed / no token?) — showing last close'}
         </div>
       )}
+      {/* price/Δ/52w/AH tiles ABOVE the fig (S65 — they're the first thing to read; they
+          rode below it for Streamlit parity until the verdict-strip pass) */}
+      <HeaderTiles payload={payload} range52={chart.data?.range52 ?? null}
+        live={isLive ? liveInfo : null} />
+      {/* S66 — bar-timeframe pills: the same frames the report reads, on the chart itself */}
+      <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', margin: '2px 0 6px' }}>
+        {CHART_TFS.map((t) => {
+          const disabled = Boolean(asOf) && SUB_HOURLY.has(t)
+          const active = t === tf
+          return (
+            <button key={t} onClick={() => !disabled && setTf(t)} disabled={disabled}
+              title={disabled ? 'sub-hourly history does not reach as-of dates' : `${t} bars`}
+              style={{
+                background: active ? 'var(--accent)' : 'transparent',
+                color: disabled ? 'var(--faint)' : active ? '#0e1117' : 'var(--muted)',
+                border: `1px solid ${active ? 'var(--accent)' : 'var(--border)'}`,
+                borderRadius: 999, padding: '2px 10px', fontSize: 12.5,
+                fontWeight: active ? 700 : 500,
+                cursor: disabled ? 'not-allowed' : 'pointer',
+              }}>
+              {t}
+            </button>
+          )
+        })}
+        {tf !== '1D' && (
+          <span style={{ color: 'var(--faint)', fontSize: 12, alignSelf: 'center' }}>
+            overlays/RSI/MACD compute on {tf} bars · events + live bar are daily-frame features
+          </span>
+        )}
+      </div>
       <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', color: 'var(--muted)', fontSize: 14 }}>
         {OVERLAYS.map((o) => (
           <label key={o.token} style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
@@ -134,11 +170,6 @@ export default function CandleChart({ ticker, payload, asOf, start, live = false
       {chart.isLoading && <p style={{ color: 'var(--muted)' }}>loading chart…</p>}
       {chart.isError && <p style={{ color: 'var(--red)' }}>chart failed: {String(chart.error)}</p>}
       {chart.data?.fig && <Plot fig={chart.data.fig} />}
-      {/* header tiles ride below the chart (mirrors the Streamlit layout: draw_chart then
-          _header_tiles); range52 comes from the chart's warm-up frame; in live mode the
-          tiles ride each fresh Tradier tick */}
-      <HeaderTiles payload={payload} range52={chart.data?.range52 ?? null}
-        live={isLive ? liveInfo : null} />
     </div>
   )
 }

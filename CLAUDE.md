@@ -114,6 +114,12 @@ npm run dev --prefix web    # Vite dev on :5173 (proxies /api). NB PowerShell: a
 # (React orientation + parity checklist). --reload-dir MUST stay restricted to api/ (a
 # generate writes under data/ — an unrestricted reload restarts the server mid-generate).
 # Never re-implement the candle fig in JS — api/charts.py builds every complex figure.
+# S66: the chart has a bar-TIMEFRAME pill row (5m/15m/30m/1h/2h/4h/1D/1W/1M) — `?tf=` on
+# /api/chart → charts.tf_frame (daily CSV for D/W/M; cached yfinance 60m for 1h/2h/4h;
+# Tradier 5m loader for sub-hourly, real-time). Overlays/RSI/MACD compute per-TF; intraday
+# axes collapse the overnight gap (4h reopens 08:00 — midnight-anchored bins); W/M skip
+# rangebreaks; event vlines 1D/1W/1M only; live-bar append 1D only (tick prev_close from the
+# daily frame elsewhere); range52 always daily; sub-hourly pills disabled in as-of mode.
 
 python lens.py --ticker QQQ --gex           # GAMMA EXPOSURE block (S56): dealer GEX by strike off
 # the live Tradier chain (expiries ≤60d via select_gex_expiries — nearest 5 + monthlies, capped 8;
@@ -128,6 +134,38 @@ python score_ledger.py --ticker QQQ         # score the entry.py forward signal 
 # OWN stamped vol-adjusted threshold (recalibration never rewrites history); rows younger than a
 # horizon print "pending"; on a STAY OUT row a ✗ means staying out was right. Reusable
 # score(ticker, data_dir); the lens_web signal-ledger expander shows the scored columns.
+
+python lens.py --ticker QQQ --level 700     # PRICE LADDER (S65, DEFAULT-ON, zero network): every
+# level the report knows — volume-profile POC/value-area/HVN/LVN, GEX walls/zero-gamma/max-pain
+# (when --gex ran), expected-move band (--vol), numeric 1D/1W MA20/50/200 (read_timeframe now
+# returns the values, not just booleans), 52w hi/lo, prior-day H/L/C, and YOUR --level — merged
+# into ONE distance-from-spot sorted ladder (modules/levels.py). Levels within ±0.5% cluster
+# into confluence zones (◆); nearest support/resistance called out; --level is finally COMPUTED
+# (distance, side, confluence membership — echoed in the THESIS CHECK). As-of-valid for free.
+# Web: SecLadder vertical ladder w/ distance bars.
+
+python lens.py --ticker AMD --short         # SHORT SETUP (S65): the tape through a short lens —
+# CONTEXT, not a signal (S28: put-side backtest was a cross-ticker NO-GO; the caveats print
+# unconditionally). Auto-enabled by --thesis bearish. Pure synthesis of reads the run already
+# computed (modules/shortside.py, zero network): FOR = downtrend regime / HTF aligned down /
+# distribution volume / bearish divs / below-value / lagging RS + lagging own sector / LVN air
+# BELOW (new levels.nearest_lvn_below mirror) / negative GEX / street downgrades; AGAINST =
+# uptrend regime / washout-oversold / S21 contrarian conditions (VIX stress + backwardation —
+# explicitly labeled contrarian-BUY, never short confirmations); CROWDING verdict off --squeeze
+# data when present (uncrowded/crowded/unknown — --short never fetches); a short-side CHECKLIST
+# (setupcheck rows 2/3/4 inverted HERE — setupcheck.py untouched so snapshots/diff keep meaning);
+# lagging-sector candidate pool (+ bottom-3 names per sector under --movers —
+# sectors.bottom_performers_read, cache shape-gated). S65 also FIXES --thesis bearish: S21
+# contrarian factors in the confirmations list now carry a ⚠ annotation + count (counts
+# untouched — S43).
+
+python lens_score.py --ticker QQQ           # LENS SELF-SCORE (S65): the lens' OWN payload_history
+# snapshots (setup marks / risk lean / trend regime, accumulated per run since S56) joined to
+# realized 15d/63d forward returns; aggregated by setup band (≥6✓/4–5✓/≤3✓), regime, and risk
+# lean. Averages/medians ONLY — the honesty note (small N, non-independent sessions, NO
+# significance) prints on every run. Reusable score(ticker, data_dir); web: "lens self-score"
+# expander via GET /api/lens_score/{ticker} (hidden in as-of mode — realized outcomes would be
+# lookahead).
 
 python lens.py --ticker AMD --street        # STREET & NEWS block (S58): analyst price-target range
 # (mean/median/high–low vs spot), 30d EPS-estimate revision momentum per period, trailing-90d
@@ -180,7 +218,7 @@ Run smoke tests:
 
 ```powershell
 .\trade\Scripts\python.exe -m pytest tests/ -v
-# 92 tests (S64; 3 skipped), ~3-12s. Requires data/QQQ_indicators.csv + data/QQQ_backtest_results.csv.
+# 101 tests (S65; 3 skipped), ~3-12s. Requires data/QQQ_indicators.csv + data/QQQ_backtest_results.csv.
 ```
 
 ### Prompt counts per script (for piped input via Claude Code)
@@ -198,9 +236,10 @@ Run smoke tests:
 | modules/vol_history.py | 1 (ticker); run as `python -m modules.vol_history`. Pre-earnings vol study; TTY-gated backfill prompt if IV history is thin. Non-interactive when imported by `lens.py --vol`. |
 | econ_calendar_view.py | 0 (argparse flags only — no prompts) |
 | market_context.py | 1 (ticker) + argparse flags (--graphical / --save-only / --no-vix) |
-| lens.py | 1 (ticker; or `--ticker QQQ JPM …` to skip prompt) + argparse flags (--thesis / --level / --geo / --no-intraday / --no-vix / --no-color / --candle box\|braille\|sixel\|none / --candle-px N / --prev N / --no-refresh / --refresh / --as-of YYYY-MM-DD / --pc-oi [all\|near\|leaps\|monthly …] / --vol / --call / --gex / --live / --ltf / --squeeze / --insider / --street / --movers) |
+| lens.py | 1 (ticker; or `--ticker QQQ JPM …` to skip prompt) + argparse flags (--thesis / --level / --geo / --no-intraday / --no-vix / --no-color / --candle box\|braille\|sixel\|none / --candle-px N / --prev N / --no-refresh / --refresh / --as-of YYYY-MM-DD / --pc-oi [all\|near\|leaps\|monthly …] / --vol / --call / --gex / --live / --ltf / --squeeze / --insider / --street / --movers / --short) |
 | lens_web.py | 0 prompts — browser UI; run `.\trade\Scripts\python.exe -m streamlit run lens_web.py` (not for piped/Claude runs; use lens.py). Deep links: `?ticker=QQQ&gex=1` (S56), `&asof=2025-03-10&from=2024-06-03` (S57 backtest/date-range) |
 | score_ledger.py | 0 with `--ticker SYM`, else 1 (ticker; EOF-safe default QQQ) |
+| lens_score.py | 0 with `--ticker SYM`, else 1 (ticker; EOF-safe default QQQ) — S65 lens self-score |
 
 ### Running scripts via Claude Code on Windows
 
@@ -248,6 +287,9 @@ cmd /c "(echo TICKER && echo.) | python -X utf8 script.py" 2>&1
 | `modules/marketsent.py` | **(S58)** Market-wide sentiment + liquidity — four gauges, each its own try (a miss never costs the rest), cached ~6h `data/marketsent_cache.json` with per-gauge stale fallback: **CBOE put/call ratios** (daily-stats page's Next.js blob, `parse_cboe` pure; EQUITY P/C banded 0.55/0.85, percentile accumulates forward-only ≥63d), **AAII bull−bear spread** (official free .xls, FULL history since 1987 → real percentile day one; OLE2 magic check — the server intermittently serves HTML/bot-blocks, weekly cadence means one success/week suffices), **NAAIM exposure** (site HTML table ~10 weeks; bands 90/30, percentile after ≥26 accumulated weeks), **Fed net liquidity** = WALCL − TGA − RRP (FRED, reuses `FRED_API_KEY`; WALCL/WTREGEN are $mn, RRPONTSYD $bn — probed; weekly W-WED aligned, 13w Δ tag ±$25bn, 1y level percentile). Shown as a `sent …` MARKET BACKDROP segment + market_context MARKET gauges; contrarian S21 note on the surveys | Imported by `lens.py` + `market_context.py` |
 | `modules/overnight.py` | **(S64)** Overnight & extended-hours context — the off-hours blind-spot fix (the stack is otherwise RTH-gated + daily-bar). Three DEFAULT-ON display-only surfaces, the first two rendered ONLY when the market is closed (`not session_open()` — during RTH the SPY tide/live bar cover direction, so RTH runs make zero extra calls): **(1) futures backdrop segment** `fut ES +0.1% · NQ −0.4% (o/n vs prior settle, HH:MM ET)` on the MARKET BACKDROP line — pure `read_futures` + `fetch_futures`, ONE batched yfinance `ES=F`/`NQ=F` daily download (the in-progress Globex row's Close IS the live print; probed 2026-07-27 — `fast_info.previous_close` matches no settle, prior settle must come from the daily history), cached `data/futures_cache.json` **TTL 20 MINUTES** (deliberate deviation from the ~6h convention — overnight tape decays in minutes; the segment carries its fetch timestamp); **(2) after-hours print** — one line under the O/H/L/C (`AH`/`pre-mkt`, last extended-hours trade vs official `close`/`prevclose`). **S64 fix — the price comes from the Tradier TIMESALES tape (`session_filter="all"`), NOT the quote**: `/markets/quotes` latches `last` to the official close at the bell exactly like `close` (probed live 2026-07-27 16:34 ET on SOFI, 34 min post-close with ~130k AH shares traded — `last` 16.88 == `close` 16.88, `trade_date` frozen at 16:00:00.153, while `bid_date` was 8s old and the tape showed 16.92), so the original quote-derived read was structurally pinned to +0.00%. `fetch_ext_print` takes the last **1min** bar (`EXT_INTERVAL` — 5min left the tile's stamp frozen for minutes at a time) strictly outside RTH and strictly after `_ext_window_start` (= the last completed session's 16:00 — one rule covering the evening AND the next pre-market; the strict `>` also drops the 16:00 closing-auction bar Tradier stamps at the bell, so a name with no real AH trade shows nothing rather than its own close); `afterhours_read(quote, ext, now)` stays pure with an injectable clock, uses the quote only for the reference close, stamps `hhmm` with the PRINT's time (not the wall clock), and returns **None when there is no extended-hours print** so the caller renders nothing rather than a frozen 0.00%; **(3) gap gauges** (in `sentiment.gap_gauges`, ride `gather_context`'s VOL group) — "Gap at open" + "Gap vol (5d)" off the indicators CSV's `gap_pct`/`gap_ma_5d`/`gap_vol_5d` columns (written by indicators.py since S1, previously unconsumed), zero network, percentile of \|gap\| (magnitude), historically valid in as-of mode for free. Futures/AH suppressed under `--as-of`. Never a model feature, NOT risk-scorecard factors (S20/S43). Web: fut chip + gap gauges automatic; AH header tile in `HeaderTiles.tsx` polls its OWN `GET /api/afterhours/{ticker}` every 30s (🔴 once the poll answers), falling back to `payload["ah"]` for the first paint. The endpoint short-circuits to `{"ah": null}` during RTH before any Tradier call (server is the authority on session state → the client polls unconditionally) and sits behind a 10s `afterhours_cache`. It is deliberately NOT on the live tick any more: riding `LiveInfo.ah` coupled it to `CandleChart`'s miss-counter, which counts `fetch_live_bar` misses — and that always misses overnight/pre-market (`trade_date` isn't today), so polling died after ~30s and froze the tile. It also no longer needs the **live** checkbox at all | Imported by `lens.py` (default-on) + `modules/sentiment.py` (gap gauges) |
 | `score_ledger.py` | **(S56)** Forward signal-ledger scorer — the S30 standing TODO, landed. Joins `data/{ticker}_signal_ledger.csv` to realized 15d/63d returns off the indicators CSV closes; WIN vs each row's OWN stamped `win_threshold`/`win_threshold_63` (threshold recalibration never rewrites history); young rows = pending; per-tier + ALL-ROWS aggregates. Reusable `score(ticker, data_dir)` status dict (backfill_iv pattern, never raises); the lens_web ledger expander renders the scored columns zero-network | Console + imported by `lens_web.py` |
+| `lens_score.py` | **(S65)** Lens self-scorer — `data/payload_history/{ticker}/` snapshots (setup marks / dd-rally counts / trend-regime label; written per report run since S56, format unchanged) joined to realized 15d/63d returns off the indicators CSV (score_ledger's searchsorted join). Aggregates: setup band (`SCORE_BANDS` ≥6✓/4–5✓/≤3✓) · regime (UPTREND/DOWNTREND/none) · risk lean (dd>rally/rally>dd/balanced) — avg+median ONLY, no win thresholds, honesty note (small N, non-independent, no significance) always printed. Pure `snapshot_row`/`score_snapshots`/`aggregate` + `score(ticker, data_dir)` status dict (never raises). Web: `GET /api/lens_score/{ticker}` (`loaders.load_lens_score`, ~10min cache) → `LensScore.tsx` expander, as-of hidden | Console + imported by `api/loaders.py` |
+| `modules/levels.py` | **(S65)** Price-level ladder — PURE merge of every level the report computes: profile POC/VA/HVN/LVN, GEX walls/zero-gamma/max-pain, expected-move band, numeric 1D/1W MA20/50/200, 52w hi/lo, prior-day H/L/C, the user's `--level`. `collect_levels` → `build_ladder` (distance-sorted rows; ±`CONFLUENCE_PCT`(0.5%) greedy clusters = confluence zones carrying every tag; nearest S/R; `user_level` w/ confluence membership; `MAX_SIDE`=6 display cap) + `nearest_lvn_below` (the below-spot mirror of shortint's LVN-air factor — consumed by the short lens). Zero network, None-tolerant, as-of-valid for free. DEFAULT-ON section after VOLUME PROFILE; web `SecLadder` | Imported by `lens.py` (default-on) + `modules/shortside.py` consumers |
+| `modules/shortside.py` | **(S65)** Short-opportunity lens for `lens.py --short` (auto-on under `--thesis bearish`) — PURE two-sided synthesis of reads the run already computed: `short_setup(...)` → {for, against, crowding (off `squeeze["read"]` fuel/counter — `CROWDED_FUEL_MIN`=2; "unknown" without --squeeze, never fetches), checklist (setupcheck rows 2/3/4 INVERTED here — `setupcheck.py` untouched so snapshot/diff/self-score meaning stays stable), net, caveats}. HARD GUARDRAILS encoded: S28 no-short-edge + S21 contrarian conditions land on AGAINST (never confirmations) + fuel≠ignition — `CAVEATS` print unconditionally. `S21_CONTRA_PREFIXES`/`is_s21_contrarian` also drive the `--thesis bearish` ⚠ annotations (CLI + `SecThesis` TS mirror; drift-guarded by test 58). Laggard pool: lagging-quadrant sectors + `sectors.bottom_performers_read` bottom-3 under `--movers` | Imported by `lens.py` (`--short`) |
 | `modules/timeframes.py` | (S34) `build_timeframes()` → per-timeframe OHLCV {5m,15m,30m,1h,2h,4h,1D,1W,1M}: resamples daily (indicators CSV or yfinance fallback) for D/W/M; yfinance 60m (~2yr/730d, cached `data/intraday/`) + 1h→4h/2h resample for intraday. **S63**: `TF_ORDER` (the single source of row order for CLI + React — any key absent from it is dropped) gains 2h/30m/15m/5m; `INTRADAY_TFS`/`TF_MINUTES`/`session_open()` (RTH gate, `now` injectable); `_load_intraday` parameterised by interval/label/period (own cache file each); `_load_ltf` = Tradier 5min → yfinance 5m fallback, 2min TTL; `build_timeframes(ltf=)` adds 5m/15m/30m only when `session_open()` and not as-of. (S35) `last_bar_partial()` flags an in-progress (or stale mid-period) W/M bar via source-bar count. (S40) `fetch_live_bar`/`append_live_bar`/`apply_live_bar` — live provisional today-bar from the Tradier quote for lens `--live` (display-only, never written to CSV); `merge_intraday_topup`/`_topup_intraday` — Tradier timesales 15min→60m top-up of the 1h frame (live mode); `_load_intraday` now falls back to a stale cache with a note when the yfinance download is refused (Yahoo throttles intraday intermittently) | Imported by `lens.py` |
 | `modules/structure.py` | (S34) transparent per-timeframe reads — `read_timeframe` (trend/RSI/Stoch/MACD), `read_volume` (RVOL/up-down/price-volume confirmation; S35 `exclude_last` drops an in-progress bar so partial-bar volume doesn't read artificially low), `detect_divergence` (price vs RSI/OBV), `multi_timeframe_summary` (confluence/conflict; **S63** drops `INTRADAY_TFS` up front — the `higher`/`lower` tuples already ignored unknown keys, but the OB/OS lists behind `rsi_conflict` iterated every read, so a 5m RSI spike would have raised an "RSI split" warning about a frame the synthesis never saw; `lower` also gains `2h`, which marginally tightens full-confluence since it is an `all()`), `rally_drawdown_risk` (two-sided scorecard). No ML, no prediction | Imported by `lens.py` |
 | `modules/volume_profile.py` | (S34) `volume_profile()` → volume-at-price: POC, value area (70%), HVN/LVN levels + price location | Imported by `lens.py` |
@@ -432,7 +474,10 @@ CLI flags (default OFF; available on direction/entry/volatility/exit/backtest):
   (15d -2.4% / 6mo -26.8%) and AMD (15d -1.5% / 6mo -35.1%, worst signal), hierarchy inverted.
   Confirms the framework's edge IS the long/mean-reversion bias: bearish signals on secular-
   uptrend names catch dips that mean-revert, so the puts get crushed at 6mo. Retained opt-in for
-  research; directional puts NOT productionized. Hedging puts → use Phase 4 (`exit.py`) instead.
+  research; directional puts NOT productionized. Hedging puts → Phase 4 (`exit.py`) — NOTE the
+  ML pipeline incl. exit.py is ARCHIVED (`archive/ml_pipeline/`), runnable ad-hoc but not
+  surfaced in the lens; the S65 SHORT SETUP section (`lens.py --short`) is the in-product
+  short-side CONTEXT surface, with these S28 findings printed as unconditional caveats.
 
 ## Sizing Config (`sizing.py`)
 

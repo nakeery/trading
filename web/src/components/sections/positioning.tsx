@@ -147,14 +147,17 @@ export function SecPcOi({ p }: { p: Payload }) {
           market close)
         </Caption>
       )}
-      <DataTable
-        rows={tbl}
-        columns={[
-          { key: 'expiry', header: 'Expiry' }, { key: 'dte', header: 'DTE' },
-          { key: 'pcoi', header: 'P/C OI' }, { key: 'pcvol', header: 'P/C Vol' },
-          { key: 'pos', header: 'Positioning' },
-        ]}
-      />
+      {/* S65 — the charts above carry the read; the per-expiry numbers fold */}
+      <Collapsible title={`by-expiry table (${tbl.length} rows)`}>
+        <DataTable
+          rows={tbl}
+          columns={[
+            { key: 'expiry', header: 'Expiry' }, { key: 'dte', header: 'DTE' },
+            { key: 'pcoi', header: 'P/C OI' }, { key: 'pcvol', header: 'P/C Vol' },
+            { key: 'pos', header: 'Positioning' },
+          ]}
+        />
+      </Collapsible>
       <Caption>
         P/C OI = put OI / call OI (positioning) · P/C Vol = latest-session flow (lower pane)
         · * = LEAPS tenor
@@ -238,10 +241,7 @@ export function SecGex({ p }: { p: Payload }) {
       )}
       <Plot fig={fig} />
       {!!g.unusual?.length && (
-        <>
-          <div style={{ color: INK, marginTop: 2 }}>
-            unusual activity today (volume running a multiple of OI):
-          </div>
+        <Collapsible title={`unusual activity today — ${g.unusual.length} strikes with volume running a multiple of OI`}>
           <DataTable
             rows={g.unusual.map((u) => ({
               strike: `${u.strike}${u.type[0]}`, expiry: u.expiry, dte: String(u.dte),
@@ -254,7 +254,7 @@ export function SecGex({ p }: { p: Payload }) {
               { key: 'oi', header: 'OI' }, { key: 'ratio', header: 'Vol/OI' },
             ]}
           />
-        </>
+        </Collapsible>
       )}
       <Caption>
         assumes dealers long calls / short puts (standard convention) — real inventory
@@ -349,6 +349,94 @@ export function SecSqueeze({ p }: { p: Payload }) {
           fuel/counter factors — the CLI/Streamlit print them unconditionally */}
       {(read.caveats ?? []).map((c, i) => <Caption key={i}>· {c}</Caption>)}
       {bz && <Caption>· buzz = attention, not direction — crowded names gap on headlines both ways</Caption>}
+    </>
+  )
+}
+
+// ── SHORT SETUP (S65) — the tape through a short lens; CONTEXT, not a signal ──
+interface ShortLaggard {
+  sym: string
+  name?: string | null
+  rank?: number | null
+  rel_63d?: number | null
+  bottom?: { sym: string; r20?: number | null; r63?: number | null }[] | null
+}
+interface ShortSetup {
+  for?: string[]
+  against?: string[]
+  crowding?: { state?: string; lines?: string[] } | null
+  checklist?: [string, string, string][]
+  laggards?: ShortLaggard[]
+  net?: string
+  caveats?: string[]
+}
+
+export function SecShort({ p }: { p: Payload }) {
+  const sh = p.short as ShortSetup | null
+  if (!sh) return null
+  const crowd = sh.crowding
+  const crowdColor = crowd?.state === 'crowded' ? RED
+    : crowd?.state === 'uncrowded' ? GREEN : GRAY
+  const rows = (sh.checklist ?? []).map(([label, mark, detail]) => ({ mark, label, detail }))
+  return (
+    <>
+      <Sec title="SHORT SETUP — the tape through a short lens  (CONTEXT, not a signal)" />
+      <Net label="NET" text={sh.net ?? 'n/a'} />
+      <BalanceBar left={sh.for?.length ?? 0} right={sh.against?.length ?? 0}
+        leftLabel="short-favorable" rightLabel="counter-evidence" leftColor={RED} rightColor={GREEN} />
+      {((sh.for?.length ?? 0) + (sh.against?.length ?? 0)) > 0 && (
+        <Collapsible title={`factor details (${sh.for?.length ?? 0} for · ${sh.against?.length ?? 0} against)`}>
+          <FactorColumns columns={[
+            { title: 'short-favorable', items: sh.for, color: RED },
+            { title: 'counter-evidence', items: sh.against, color: GREEN },
+          ]} />
+        </Collapsible>
+      )}
+      {crowd && (
+        <div style={{ margin: '4px 0' }}>
+          <Pill text={`crowding: ${crowd.state ?? 'unknown'}`} color={crowdColor} />
+          {(crowd.lines ?? []).map((l, i) => <Caption key={i}>· {l}</Caption>)}
+        </div>
+      )}
+      {!!sh.laggards?.length && (
+        <div style={{ marginTop: 4 }}>
+          <div style={{ color: INK }}>lagging sectors (short-candidate pool, RS vs SPY):</div>
+          {sh.laggards.map((lg) => (
+            <div key={lg.sym} style={{ marginLeft: 12, color: INK }}>
+              • <b>{lg.sym}</b> {lg.name ?? ''} — rank {lg.rank ?? '?'}
+              {lg.rel_63d != null && `, 63d RS ${lg.rel_63d >= 0 ? '+' : ''}${(lg.rel_63d * 100).toFixed(1)}%`}
+              {!!lg.bottom?.length && (
+                <Caption>
+                  weakest names: {lg.bottom.map((b) => {
+                    const r = b.r63 ?? b.r20
+                    return `${b.sym} ${r != null ? `${r >= 0 ? '+' : ''}${(r * 100).toFixed(0)}%` : ''}`
+                  }).join(' · ')}
+                </Caption>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+      {rows.length > 0 && (
+        <>
+          <div style={{ color: INK, marginTop: 6 }}>short checklist (setup rows re-read for the short side):</div>
+          <DataTable
+            rows={rows}
+            columns={[
+              {
+                key: 'mark', header: '',
+                style: (r) => ({
+                  color: r.mark === '✓' ? RED : r.mark === '✗' ? GREEN : GRAY, fontWeight: 700,
+                }),
+              },
+              { key: 'label', header: 'Check' },
+              { key: 'detail', header: 'Detail', style: () => ({ whiteSpace: 'normal' }) },
+            ]}
+          />
+          <Caption>✓ = favors the short side (note the inverted color: red = short-favorable)</Caption>
+        </>
+      )}
+      {(sh.caveats ?? []).map((c, i) => <Caption key={i}>· {c}</Caption>)}
     </>
   )
 }

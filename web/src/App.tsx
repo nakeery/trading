@@ -18,6 +18,8 @@ import Watchlist from './components/Watchlist'
 import EconCalendar from './components/EconCalendar'
 import DiffPanel from './components/DiffPanel'
 import SignalLedger from './components/SignalLedger'
+import LensScore from './components/LensScore'
+import VerdictStrip from './components/VerdictStrip'
 
 const DEBOUNCE_MS = 2000
 
@@ -52,6 +54,7 @@ export default function App() {
     initial.ticker ? { ticker: initial.ticker, flags: initial.flags, force: false, nonce: 0 } : null,
   )
   const [pendingIn, setPendingIn] = useState(false)
+  const [diffOpen, setDiffOpen] = useState(false)   // S65 — the verdict strip's Δ badge opens the diff
 
   const tickers = useQuery({ queryKey: ['tickers'], queryFn: fetchTickers })
 
@@ -149,6 +152,14 @@ export default function App() {
                   current-only blocks are disabled
                 </Status>
               )}
+              {/* S65 verdict strip — regime/setup/risk/synthesis + Δ badge, above the fold */}
+              {!shownAsOf && (
+                <VerdictStrip payload={payload} diff={report.data.diff}
+                  onDiffClick={() => {
+                    setDiffOpen(true)
+                    document.getElementById('diff-panel')?.scrollIntoView({ behavior: 'smooth' })
+                  }} />
+              )}
               {/* default (stretch) alignment is load-bearing: the nav column must be as
                   tall as the report column or the sticky nav has no room to travel and
                   scrolls off with the page */}
@@ -163,7 +174,7 @@ export default function App() {
                       live={shownLive}
                     />
                   </section>
-                  {!shownAsOf && <DiffPanel diff={report.data.diff} />}
+                  {!shownAsOf && <DiffPanel diff={report.data.diff} forceOpen={diffOpen} />}
                   <EconCalendar />
                   {/* IvHistoryChart renders null for tickers without harvested IV —
                       .card:empty collapses the wrapper */}
@@ -177,6 +188,9 @@ export default function App() {
                   {/* ledger hidden in as-of mode: its realized outcomes span dates after
                       the backtest as-of — showing them would defeat the no-lookahead point */}
                   {!shownAsOf && <SignalLedger ticker={payload.ticker} />}
+                  {/* S65 — the lens' own snapshots scored vs realized returns; as-of hidden
+                      for the same no-lookahead reason as the ledger */}
+                  {!shownAsOf && <LensScore ticker={payload.ticker} />}
                   <AnsiReport html={report.data.ansi_html} />
                 </div>
                 <div style={{ width: 190, flexShrink: 0 }}>

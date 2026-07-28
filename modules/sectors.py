@@ -106,6 +106,23 @@ def rotation_read(closes, bench=BENCH):
     return rows
 
 
+def _score_constituents(names, closes):
+    """Shared scorer behind top/bottom_performers_read: [(sym, name)] + closes →
+    [{sym, name, r20, r63}] sorted DESCENDING by 63d return (20d fallback)."""
+    scored = []
+    for sym, name in names or []:
+        if sym not in (closes or {}):
+            continue
+        s = pd.Series(closes[sym], dtype=float).dropna()
+        if len(s) <= REL_SHORT:
+            continue
+        r20 = float(s.pct_change(REL_SHORT).iloc[-1])
+        r63 = float(s.pct_change(REL_LONG).iloc[-1]) if len(s) > REL_LONG else None
+        scored.append({"sym": sym, "name": name, "r20": r20, "r63": r63})
+    scored.sort(key=lambda m: m["r63"] if m["r63"] is not None else m["r20"], reverse=True)
+    return scored
+
+
 def top_performers_read(constituents, closes, top_n=TOP_N):
     """PURE: {spdr_sym: [(ticker, name), …]} + {ticker: close series} →
     {spdr_sym: [{sym, name, r20, r63}, …]} — each sector's constituents ranked by 63d return
@@ -114,20 +131,21 @@ def top_performers_read(constituents, closes, top_n=TOP_N):
     name are omitted. Offline-testable."""
     out = {}
     for spdr, names in (constituents or {}).items():
-        scored = []
-        for sym, name in names or []:
-            if sym not in (closes or {}):
-                continue
-            s = pd.Series(closes[sym], dtype=float).dropna()
-            if len(s) <= REL_SHORT:
-                continue
-            r20 = float(s.pct_change(REL_SHORT).iloc[-1])
-            r63 = float(s.pct_change(REL_LONG).iloc[-1]) if len(s) > REL_LONG else None
-            scored.append({"sym": sym, "name": name, "r20": r20, "r63": r63})
-        if not scored:
-            continue
-        scored.sort(key=lambda m: m["r63"] if m["r63"] is not None else m["r20"], reverse=True)
-        out[spdr] = scored[:top_n]
+        scored = _score_constituents(names, closes)
+        if scored:
+            out[spdr] = scored[:top_n]
+    return out
+
+
+def bottom_performers_read(constituents, closes, bottom_n=TOP_N):
+    """PURE (S65): laggard mirror of top_performers_read — each sector's WORST `bottom_n`
+    constituents by 63d return, worst first. Short-candidate material for the lens' SHORT
+    SETUP section; same omission rules. Offline-testable."""
+    out = {}
+    for spdr, names in (constituents or {}).items():
+        scored = _score_constituents(names, closes)
+        if scored:
+            out[spdr] = scored[-bottom_n:][::-1]          # tail of the desc sort, worst first
     return out
 
 
@@ -148,12 +166,15 @@ def fetch_top_performers(data_dir="data", ttl_hours=TTL_HOURS):
     """Current top performers per sector, cached (S59 — lens --movers). ~11 yf.Sector
     constituent lookups (each in its own try — one bad sector never costs the rest) + ONE
     batched daily download for all names. Never raises; stale cache on failure, else None.
-    Returns {"sectors": {spdr_sym: [{sym, name, r20, r63}, …]}}."""
+    Returns {"sectors": {spdr_sym: [{sym, name, r20, r63}, …]}, "bottoms": {same, worst
+    first}} (S65 adds "bottoms" — a pre-S65 cache without it is treated as stale)."""
     path = os.path.join(data_dir, TOP_CACHE_FILE)
     try:
         if os.path.exists(path) and (time.time() - os.path.getmtime(path)) < ttl_hours * 3600:
             with open(path, encoding="utf-8") as f:
-                return json.load(f)
+                cached = json.load(f)
+            if isinstance(cached, dict) and "bottoms" in cached:   # S65 shape gate
+                return cached
     except Exception:
         pass
     try:
@@ -172,10 +193,11 @@ def fetch_top_performers(data_dir="data", ttl_hours=TTL_HOURS):
             raw = yf.download(symbols, period="6mo", interval="1d",
                               progress=False, auto_adjust=True)
             close = _close_frame(raw, symbols)
-            sectors = top_performers_read(
-                constituents, {s: close[s] for s in symbols if s in close.columns})
+            close_map = {s: close[s] for s in symbols if s in close.columns}
+            sectors = top_performers_read(constituents, close_map)
             if sectors:
-                out = {"sectors": sectors}
+                out = {"sectors": sectors,
+                       "bottoms": bottom_performers_read(constituents, close_map)}
                 try:
                     with open(path, "w", encoding="utf-8") as f:
                         json.dump(out, f)
