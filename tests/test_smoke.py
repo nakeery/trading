@@ -2501,6 +2501,222 @@ def test_fetch_rs_extra_rider(monkeypatch):
     assert flat and set(flat["rs"]) == {20, 63}
 
 
+# ─── Test 66 (S68): level projections — travel + repricing (offline, pure) ─────
+def test_levelproj_travel_and_reprice():
+    """travel_sessions is linear sigma-days off HV-20 (None/degenerate → None, 252 cap);
+    reprice_contract is exact BS repricing at the target — instant leg T unchanged, paced
+    leg T reduced by the trading→calendar conversion (huge travel → intrinsic), at-ask P&L
+    below at-mid, downside targets price to an honest loss, iv-less candidates → None."""
+    import math
+    from modules.bs_invert import black_scholes_call
+    from modules.levelproj import (travel_sessions, reprice_contract,
+                                   MAX_TRAVEL_SESSIONS, RISK_FREE)
+
+    daily = 0.16 / math.sqrt(252)                       # hv20 16% → σ/day ≈ 1.008%
+    assert abs(travel_sessions(0.03, 0.16) - 0.03 / daily) < 1e-12
+    assert travel_sessions(0.03, None) is None
+    assert travel_sessions(0.03, 0.0) is None
+    assert travel_sessions(9.0, 0.16) == MAX_TRAVEL_SESSIONS
+
+    cand = {"strike": 100.0, "mid": 5.0, "iv": 0.25, "ask": 5.6}
+    c = reprice_contract(110.0, cand, 45, expiry="2026-09-18", travel_td=3.0)
+    assert c["instant"]["value"] == black_scholes_call(110.0, 100.0, RISK_FREE, 45 / 365.0, 0.25)
+    assert c["paced"]["value"] < c["instant"]["value"]          # shorter T, same upside target
+    assert c["instant"]["pnl_ask_pct"] < c["instant"]["pnl_mid_pct"]
+    assert c["expiry"] == "2026-09-18" and c["entry_ask"] == 5.6
+
+    slow = reprice_contract(110.0, cand, 45, travel_td=1000.0)  # travel exceeds dte → intrinsic
+    assert slow["paced"]["t_rem_days"] == 0.0
+    assert abs(slow["paced"]["value"] - 10.0) < 1e-9            # max(110-100, 0)
+
+    down = reprice_contract(92.0, cand, 45, travel_td=3.0)
+    assert down["instant"]["pnl_mid_pct"] < 0 and down["paced"]["pnl_mid_pct"] < 0
+
+    assert reprice_contract(110.0, {"strike": 100.0, "mid": 5.0}, 45) is None   # no iv
+    assert reprice_contract(110.0, cand, 45)["paced"] is None                   # no pace
+
+
+# ─── Test 67 (S68): synthetic modeled call + IV-source fallback (offline, pure) ─
+def test_levelproj_synthetic_call():
+    """synthetic_call: premium is the exact BS ATM price; P&L is vs that premium; no ask
+    legs (a model has no spread); invalid inputs → None."""
+    from modules.bs_invert import black_scholes_call
+    from modules.levelproj import synthetic_call, RISK_FREE
+
+    s = synthetic_call(100.0, 106.0, 0.22, 30, travel_td=4.0)
+    assert s["premium"] == black_scholes_call(100.0, 100.0, RISK_FREE, 30 / 365.0, 0.22)
+    assert s["strike"] == 100.0 and s["iv_src"] == "ATM IV (30d)"
+    assert s["instant"]["pnl_mid_pct"] > 0 and s["instant"]["pnl_ask_pct"] is None
+    assert s["paced"]["value"] < s["instant"]["value"]
+    assert synthetic_call(100.0, 106.0, None, 30) is None
+    assert synthetic_call(None, 106.0, 0.22, 30) is None
+    assert synthetic_call(100.0, 106.0, 0.22, 30, iv_src="HV-20 proxy")["iv_src"] == "HV-20 proxy"
+
+
+# ─── Test 68 (S68): project_targets orchestration (offline, pure) ───────────────
+def test_project_targets():
+    """Target selection off a real build_ladder output (user level dedups with its S/R
+    cluster and keeps kind 'your level'; zone cap 2), quoted path populates contracts +
+    quote_meta (dte refreshed from expiry vs the injected today), synthetic fallback
+    covers callq=None (30d + 180d tenors when iv180 given), downside targets go negative."""
+    from datetime import date
+    from modules.levels import build_ladder
+    from modules.levelproj import project_targets, MAX_ZONE_TARGETS
+
+    # 704.4 user level sits within 0.5% of two other tags → one cluster, user_level set
+    levels = [(704.40, "YOUR LEVEL"), (704.20, "value-area high"), (705.10, "prior-day high"),
+              (688.20, "POC"), (688.90, "MA50 1D"),          # below-spot confluence zone
+              (660.00, "LVN"), (650.00, "MA200 1D"), (651.10, "HVN"),
+              (735.00, "52w high")]
+    ladder = build_ladder(692.0, levels)
+    assert ladder["user_level"] is not None
+
+    callq = {"as_of_str": "14:32", "age_str": "today", "stale": False,
+             "quotes": [{"expiry": "2026-09-18", "dte": 999,   # bogus cached dte — must refresh
+                         # mid ≈ fair BS value at spot 692 (a too-cheap fixture mid would make
+                         # even the DOWNSIDE reprice profitable and invert the loss assertion)
+                         "atm": {"strike": 690.0, "mid": 27.5, "iv": 0.24, "ask": 28.5},
+                         "otm": {"strike": 715.0, "mid": 9.0, "iv": 0.23}}]}
+    proj = project_targets(ladder, hv20=0.20, callq=callq, iv30=0.22, iv180=0.25,
+                           today=date(2026, 7, 29))
+    kinds = [t["kind"] for t in proj["targets"]]
+    assert kinds[0] == "your level"
+    assert "support" in kinds and "resistance" not in kinds   # user's cluster IS the nearest res
+    assert kinds.count("confluence") <= MAX_ZONE_TARGETS
+    prices = [round(t["price"], 2) for t in proj["targets"]]
+    assert len(prices) == len(set(prices))                    # deduped
+
+    yl = proj["targets"][0]
+    assert yl["contracts"] and not yl["synthetic"]            # quoted path wins
+    assert {c["kind"] for c in yl["contracts"]} == {"atm", "otm"}
+    assert yl["contracts"][0]["dte"] == (date(2026, 9, 18) - date(2026, 7, 29)).days  # refreshed
+    assert proj["quote_meta"]["as_of_str"] == "14:32"
+    sup = next(t for t in proj["targets"] if t["kind"] == "support")
+    atm_at_sup = next(c for c in sup["contracts"] if c["kind"] == "atm")
+    assert atm_at_sup["instant"]["pnl_mid_pct"] < 0           # long call loses on the way down
+
+    # STALE cache: mids were struck at another spot — entry is re-modeled at CURRENT spot
+    # (same strike/IV, refreshed dte), the dead ask leg is dropped, and the row is flagged
+    from modules.bs_invert import black_scholes_call
+    from modules.levelproj import RISK_FREE
+    stale_q = dict(callq, stale=True)
+    sproj = project_targets(ladder, hv20=0.20, callq=stale_q, iv30=0.22,
+                            today=date(2026, 7, 29))
+    satm = next(c for c in sproj["targets"][0]["contracts"] if c["kind"] == "atm")
+    dte_live = (date(2026, 9, 18) - date(2026, 7, 29)).days
+    assert satm["entry_modeled"] is True
+    assert satm["entry_mid"] == black_scholes_call(692.0, 690.0, RISK_FREE,
+                                                   dte_live / 365.0, 0.24)
+    assert satm["entry_ask"] is None and satm["instant"]["pnl_ask_pct"] is None
+    fresh_atm = next(c for c in yl["contracts"] if c["kind"] == "atm")
+    assert fresh_atm["entry_modeled"] is False and fresh_atm["entry_mid"] == 27.5
+
+    synth = project_targets(ladder, hv20=0.20, callq=None, iv30=0.22, iv180=0.25)
+    yl2 = synth["targets"][0]
+    assert not yl2["contracts"] and [s["dte"] for s in yl2["synthetic"]] == [30, 180]
+    assert synth["quote_meta"] is None
+    only30 = project_targets(ladder, hv20=0.20, callq=None, iv30=0.22)
+    assert [s["dte"] for s in only30["targets"][0]["synthetic"]] == [30]
+    proxy = project_targets(ladder, hv20=0.20, callq=None)    # no IV at all → HV proxy
+    assert proxy["targets"][0]["synthetic"][0]["iv_src"] == "HV-20 proxy"
+    assert project_targets(None) is None
+
+
+# ─── Test 69 (S68): cached_call_quote zero-network read (offline, tmp dir) ──────
+def test_cached_call_quote(tmp_path):
+    """The level-projection sibling of cached_liquidity: reads the call2 session cache with
+    zero network — wrapped quote (+ as_of_str/stale/cached) when usable, None when the file
+    is absent or holds no quote blocks."""
+    import json
+    import os
+    import time
+    from modules.callquote import cached_call_quote, SCOPEKEY
+    from modules.pc_oi import _cache_path
+
+    assert cached_call_quote("QQQ", data_dir=str(tmp_path)) is None      # no file
+
+    path = _cache_path("QQQ", SCOPEKEY, str(tmp_path))
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    quote = {"spot": 692.0, "quotes": [{"expiry": "2026-09-18", "dte": 51,
+                                        "atm": {"strike": 690.0, "mid": 20.0, "iv": 0.24}}]}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"as_of": time.time(), "quote": quote}, f)
+    got = cached_call_quote("QQQ", data_dir=str(tmp_path))
+    assert got and got["quotes"][0]["atm"]["iv"] == 0.24
+    assert got["cached"] is True and "as_of_str" in got and "stale" in got
+
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"as_of": time.time(), "quote": {"spot": 1.0, "quotes": []}}, f)
+    assert cached_call_quote("QQQ", data_dir=str(tmp_path)) is None      # empty quotes
+
+
+# ─── Test 70 (S68): projections render regression (offline) ─────────────────────
+def test_projections_render():
+    """print_report with a ladder carrying projections prints the block + the unconditional
+    caveat (paced=None → '—'); the SAME payload with projections stripped renders the ladder
+    byte-identically to the pre-S68 path (the block only adds output, never changes it)."""
+    import contextlib
+    import copy
+    import io
+    from lens import print_report
+
+    last_bar = {"open": 100.0, "high": 103.0, "low": 99.0, "close": 102.0, "prev_close": 100.5}
+    ladder = {"spot": 102.0,
+              "levels": [{"price": 106.0, "dist_pct": 0.0392, "tags": ["HVN"], "side": "above",
+                          "zone": None},
+                         {"price": 98.0, "dist_pct": -0.0392, "tags": ["POC"], "side": "below",
+                          "zone": None}],
+              "zones": [], "nearest_support": None, "nearest_resistance": None,
+              "user_level": None,
+              "projections": {
+                  "targets": [
+                      {"price": 106.0, "dist_pct": 0.0392, "kind": "resistance", "label": "HVN",
+                       "travel_sessions": 3.2,
+                       "contracts": [{"strike": 100.0, "dte": 45.0, "expiry": "2026-09-18",
+                                      "iv": 0.25, "entry_mid": 5.0, "entry_ask": 5.6,
+                                      "kind": "atm", "src": "quoted",
+                                      "instant": {"value": 7.5, "pnl_mid_pct": 0.5,
+                                                  "pnl_ask_pct": 0.339},
+                                      "paced": {"value": 6.9, "pnl_mid_pct": 0.38,
+                                                "pnl_ask_pct": 0.232, "t_rem_days": 40.6}}],
+                       "synthetic": []},
+                      {"price": 98.0, "dist_pct": -0.0392, "kind": "support", "label": "POC",
+                       "travel_sessions": None,                       # no hv20 → paced '—'
+                       "contracts": [],
+                       "synthetic": [{"strike": 102.0, "dte": 30, "iv": 0.22,
+                                      "iv_src": "ATM IV (30d)", "premium": 2.6, "src": "modeled",
+                                      "instant": {"value": 0.9, "pnl_mid_pct": -0.654,
+                                                  "pnl_ask_pct": None},
+                                      "paced": None}]}],
+                  "quote_meta": {"as_of_str": "14:32", "age_str": "today", "stale": True},
+                  "params": {"hv20": None, "r": 0.04},
+                  "pace_note": "…"}}
+    kw = dict(reads={}, divs={}, summary={"synthesis": "fixture"}, profile=None, notes=[],
+              last_bar=last_bar, as_of="2026-07-29", color=False, candle_style="none")
+
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        print_report("TEST", **kw, ladder=ladder)
+    out = buf.getvalue()
+    assert "level projections (quoted contracts as of 14:32 — STALE" in out
+    assert "→ resistance 106.00 (+3.9% · HVN) · ~3 sessions at recent pace" in out
+    assert "mid 5.00 → 7.50 instant / 6.90 paced   +50% / +38%  (at ask +34%/+23%)" in out
+    assert "~30d ATM call (modeled, IV 22.0% ATM IV (30d), prem ≈ 2.60 — not a quote)" in out
+    assert "→ 0.90 / —   -65% / —" in out                       # paced None prints —
+    assert "straight-line heuristic, not advice" in out          # unconditional caveat
+
+    bare = copy.deepcopy(ladder)
+    del bare["projections"]
+    buf2 = io.StringIO()
+    with contextlib.redirect_stdout(buf2):
+        print_report("TEST", **kw, ladder=bare)
+    out2 = buf2.getvalue()
+    assert "level projections" not in out2
+    # the block is purely additive — stripping it reproduces the pre-S68 ladder byte-for-byte
+    assert out2 == out.replace(out[out.index("\n    ── level projections"):
+                                   out.index("not advice") + len("not advice\n")], "")
+
+
 def test_s63_tf_order_and_ltf_gate(monkeypatch):
     """TF_ORDER is the single source of row order for the whole stack (CLI + React iterate
     insertion order), and build_timeframes drops any key absent from it. The sub-hourly

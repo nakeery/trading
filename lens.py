@@ -67,9 +67,13 @@ try:
 except Exception:
     earnings_dates = None
 try:
-    from modules.callquote import call_quote, cached_liquidity
+    from modules.callquote import call_quote, cached_liquidity, cached_call_quote
 except Exception:
-    call_quote = cached_liquidity = None
+    call_quote = cached_liquidity = cached_call_quote = None
+try:
+    from modules.levelproj import project_targets   # S68: level projections
+except Exception:
+    project_targets = None
 try:
     from modules.benchmarks import upcoming_catalysts
 except Exception:
@@ -768,6 +772,54 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
             print(f"    your level {ul['price']:g}: {ul['dist_pct']:+.1%} "
                   f"{'above' if ul['side'] == 'above' else 'below'} spot{conf}")
 
+        # 4c. LEVEL PROJECTIONS (S68) — what a move to each KEY level implies: travel estimate
+        # + long-call P&L (quoted contracts when a --call quote/cache exists, else a modeled
+        # ATM call). IV held constant; caveat prints unconditionally with the block (S43).
+        proj = ladder.get("projections")
+        if proj and proj.get("targets"):
+            qm = proj.get("quote_meta")
+            src = (f"quoted contracts as of {qm.get('as_of_str', '?')}"
+                   + (" — STALE, entries re-modeled at current spot" if qm.get("stale") else "")
+                   ) if qm else "modeled, not a quote"
+            print(f"\n    ── level projections ({src} · IV held constant) ──")
+            for t in proj["targets"]:
+                ts = t.get("travel_sessions")
+                pace = (f" · ~{ts:.0f} session{'s' if ts >= 1.5 else ''} at recent pace"
+                        if ts is not None else "")
+                lbl = f" · {t['label']}" if t.get("label") else ""
+                print(f"    → {t['kind']} {t['price']:.2f} ({t['dist_pct']:+.1%}{lbl}){pace}")
+                rows = t.get("contracts") or t.get("synthetic") or []
+                if t["kind"] != "your level" and t.get("contracts"):
+                    rows = [c for c in rows if c.get("kind") == "atm"]   # keep it compact
+                if not rows:
+                    print("        — (no IV available to model a call)")
+                for c in rows[:4]:
+                    inst, paced = c["instant"], c.get("paced")
+                    pnl_i = f"{inst['pnl_mid_pct']:+.0%}"
+                    v_p = f"{paced['value']:.2f}" if paced else "—"
+                    pnl_p = f"{paced['pnl_mid_pct']:+.0%}" if paced else "—"
+                    ask = ""
+                    if paced and inst.get("pnl_ask_pct") is not None:
+                        ask = (f"  (at ask {inst['pnl_ask_pct']:+.0%}"
+                               f"/{paced['pnl_ask_pct']:+.0%})")
+                    elif inst.get("pnl_ask_pct") is not None:
+                        ask = f"  (at ask {inst['pnl_ask_pct']:+.0%})"
+                    if c.get("src") == "quoted":
+                        exp = (c.get("expiry") or "")[5:] or f"{c['dte']:.0f}d"
+                        kind_s = "ATM  " if c.get("kind") == "atm" else "OTM Δ"
+                        entry_s = (f"entry≈ {c['entry_mid']:.2f}" if c.get("entry_modeled")
+                                   else f"mid {c['entry_mid']:.2f}")
+                        print(f"        {exp} {c['strike']:g}C {kind_s} "
+                              f"{entry_s} → {inst['value']:.2f} instant / "
+                              f"{v_p} paced   {pnl_i} / {pnl_p}{ask}")
+                    else:
+                        print(f"        ~{c['dte']:.0f}d ATM call (modeled, IV "
+                              f"{c['iv']:.1%} {c.get('iv_src', '')}, prem ≈ {c['premium']:.2f}"
+                              f" — not a quote) → {inst['value']:.2f} / {v_p}   "
+                              f"{pnl_i} / {pnl_p}")
+            print("    · modeled: IV held constant, no skew/vol-path; pace = |move| ÷ avg "
+                  "daily move (HV-20)\n      — straight-line heuristic, not advice")
+
     # 5. RALLY vs DRAWDOWN RISK  (S49: precomputed when supplied — gather_report lifts this so
     # the web app can render it natively; unsupplied = compute here, the pre-S49 behavior)
     if risk is None:
@@ -1281,6 +1333,19 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
                     if ul.get("confluence") else "no other known level nearby")
             print(f"    your level {ul['price']:g}: {ul['dist_pct']:+.1%} "
                   f"{'above' if ul['side'] == 'above' else 'below'} spot — {conf}")
+            # S68 — one-line long-call projection summary at the user's level (detail: ladder)
+            yl = next((t for t in ((ladder or {}).get("projections") or {}).get("targets", [])
+                       if t.get("kind") == "your level"), None)
+            row = ((yl or {}).get("contracts") or (yl or {}).get("synthetic") or [None])[0]
+            if row:
+                inst = f"{row['instant']['pnl_mid_pct']:+.0%} instant"
+                paced = (f" / {row['paced']['pnl_mid_pct']:+.0%} at "
+                         f"~{yl['travel_sessions']:.0f}-session pace"
+                         if row.get("paced") and yl.get("travel_sessions") is not None else "")
+                name = ((f"{(row.get('expiry') or '')[5:]} {row['strike']:g}C"
+                         if row.get("src") == "quoted"
+                         else f"~{row['dte']:.0f}d ATM call"))
+                print(f"    → at your level: {name} {inst}{paced} (modeled — see ladder)")
         confirm = risk["rally"] if thesis == "bullish" else risk["drawdown"]
         contra  = risk["drawdown"] if thesis == "bullish" else risk["rally"]
         print(f"    CONFIRMATIONS ({len(confirm)}):")
@@ -1850,6 +1915,26 @@ def gather_report(ticker, args, interactive, backdrop_base):
                 reads=reads, range52=r52, prior_day=prior_day, user_level=args.level))
         except Exception:
             ladder = None
+
+    # LEVEL PROJECTIONS (S68) — what a move to each KEY level (your --level, nearest S/R,
+    # nearest confluence zones) implies: travel estimate + long-call P&L via BS repricing.
+    # Quoted contracts when --call ran (or its session cache exists — zero network); else a
+    # synthetic ATM call from the harvested IV, labeled modeled. Rides inside the ladder dict.
+    if ladder is not None and project_targets is not None:
+        try:
+            cq = callq                        # this run's --call quote (already wrapped)
+            if cq is None and asof_ts is None and cached_call_quote is not None:
+                cq = cached_call_quote(ticker, data_dir=args.data_dir)
+            proj = project_targets(
+                ladder,
+                hv20=gauge_val(ctx, "HV-20 (annualized)") if gauge_val else None,
+                callq=cq,
+                iv30=gauge_val(ctx, "ATM IV (30d)") if gauge_val else None,
+                iv180=gauge_val(ctx, "ATM IV (180d)") if gauge_val else None)
+            if proj:
+                ladder["projections"] = proj
+        except Exception:
+            pass
 
     # SHORT SETUP (S65; --short, auto-on under --thesis bearish) — the tape through a short
     # lens, S28/S21 guardrails baked in. Pure synthesis of reads this run already computed

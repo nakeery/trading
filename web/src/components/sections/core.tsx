@@ -281,6 +281,34 @@ interface LadderRow {
   side: 'above' | 'below'
   zone: number | null
 }
+// S68 — level projections (all math server-side in modules/levelproj.py; render only)
+interface ProjLeg { value: number; pnl_mid_pct: number; pnl_ask_pct?: number | null; t_rem_days?: number }
+interface ProjRow {
+  src: 'quoted' | 'modeled'
+  kind?: 'atm' | 'otm'
+  expiry?: string | null
+  dte: number
+  strike: number
+  iv?: number | null
+  iv_src?: string
+  entry_mid?: number
+  entry_ask?: number | null
+  entry_modeled?: boolean   // stale quote — entry re-modeled at current spot
+  premium?: number
+  instant: ProjLeg
+  paced?: ProjLeg | null
+}
+interface ProjTarget {
+  price: number; dist_pct: number; kind: string; label?: string
+  travel_sessions?: number | null
+  contracts: ProjRow[]
+  synthetic: ProjRow[]
+}
+interface Projections {
+  targets: ProjTarget[]
+  quote_meta?: { as_of_str?: string; age_str?: string; stale?: boolean } | null
+  pace_note?: string
+}
 interface Ladder {
   spot: number
   levels: LadderRow[]
@@ -290,8 +318,87 @@ interface Ladder {
     price: number; dist_pct: number; side: string
     zone: number | null; confluence?: string[]
   } | null
+  projections?: Projections | null
 }
 const LADDER_MAX_SIDE = 6   // mirrors modules/levels.py MAX_SIDE
+
+const pnlS = (v: number | null | undefined) =>
+  v == null ? '—' : `${v >= 0 ? '+' : ''}${(v * 100).toFixed(0)}%`
+const pnlStyle = (v: number | null | undefined): CSSProperties | undefined =>
+  v == null ? undefined : { color: v >= 0 ? GREEN : RED, fontWeight: 600 }
+
+/** S68 — "what would a move there look like": travel estimate + long-call repricing per
+ *  key target. Purely additive under the ladder; absent projections render nothing. */
+function LadderProjections({ proj }: { proj: Projections }) {
+  const qm = proj.quote_meta
+  const src = qm
+    ? `quoted contracts as of ${qm.as_of_str ?? '?'}${qm.stale ? ' — STALE, entries re-modeled at current spot' : ''}`
+    : 'modeled, not a quote'
+  const contractName = (c: ProjRow) => (c.src === 'quoted'
+    ? `${(c.expiry ?? '').slice(5) || `${c.dte.toFixed(0)}d`} ${c.strike}C ${c.kind === 'atm' ? 'ATM' : 'OTM'}`
+    : `~${c.dte.toFixed(0)}d ATM call (modeled${c.iv != null ? `, IV ${(c.iv * 100).toFixed(1)}% ${c.iv_src ?? ''}` : ''})`)
+  return (
+    <div style={{ marginTop: 10 }}>
+      <div style={{ fontSize: 12, color: 'var(--muted)', marginBottom: 4 }}>
+        level projections ({src} · IV held constant)
+      </div>
+      {proj.targets.map((t) => {
+        let rows = t.contracts.length ? t.contracts : t.synthetic
+        if (t.kind !== 'your level' && t.contracts.length) {
+          rows = rows.filter((c) => c.kind === 'atm')   // mirror the CLI compactness rule
+        }
+        const ts = t.travel_sessions
+        return (
+          <div key={`${t.kind}-${t.price}`} style={{ margin: '6px 0' }}>
+            <div style={{ fontSize: 13.5 }}>
+              <span style={{ color: t.dist_pct >= 0 ? RED : GREEN, fontWeight: 600 }}>
+                → {t.kind} {fmt2(t.price)} ({pct1(t.dist_pct)})
+              </span>
+              {t.label && <span style={{ color: 'var(--muted)' }}> · {t.label}</span>}
+              {ts != null && (
+                <span style={{ color: 'var(--faint)' }}>
+                  {' '}· ~{ts.toFixed(0)} session{ts >= 1.5 ? 's' : ''} at recent pace
+                </span>
+              )}
+            </div>
+            {rows.length ? (
+              <DataTable
+                rows={rows.slice(0, 4).map((c) => ({
+                  contract: contractName(c),
+                  entry: c.src === 'quoted'
+                    ? (c.entry_modeled ? `entry ≈ ${fmt2(c.entry_mid ?? 0)}` : `mid ${fmt2(c.entry_mid ?? 0)}`)
+                    : `prem ≈ ${fmt2(c.premium ?? 0)}`,
+                  instant: fmt2(c.instant.value),
+                  paced: c.paced ? fmt2(c.paced.value) : '—',
+                  pnl: `${pnlS(c.instant.pnl_mid_pct)} / ${pnlS(c.paced?.pnl_mid_pct)}`,
+                  ask: c.instant.pnl_ask_pct != null
+                    ? `${pnlS(c.instant.pnl_ask_pct)} / ${pnlS(c.paced?.pnl_ask_pct)}` : '—',
+                  _c: c,
+                }))}
+                columns={[
+                  { key: 'contract', header: 'Contract' },
+                  { key: 'entry', header: 'Entry' },
+                  { key: 'instant', header: 'At level (instant)', align: 'right' },
+                  { key: 'paced', header: 'At level (paced)', align: 'right' },
+                  { key: 'pnl', header: 'P&L mid (inst/paced)', align: 'right',
+                    style: (r) => pnlStyle(r._c.instant.pnl_mid_pct) },
+                  { key: 'ask', header: 'P&L at ask', align: 'right',
+                    style: (r) => pnlStyle(r._c.instant.pnl_ask_pct) },
+                ]}
+              />
+            ) : (
+              <Caption>— (no IV available to model a call)</Caption>
+            )}
+          </div>
+        )
+      })}
+      <Caption>
+        modeled: IV held constant, no skew/vol-path;{' '}
+        {proj.pace_note ?? 'pace = |move| ÷ avg daily move (HV-20)'} — heuristic, not advice
+      </Caption>
+    </div>
+  )
+}
 
 export function SecLadder({ p }: { p: Payload }) {
   const lad = p.ladder as Ladder | null
@@ -345,6 +452,7 @@ export function SecLadder({ p }: { p: Payload }) {
           {ul.confluence?.length ? `confluence with ${ul.confluence.join(' · ')}` : 'no other known level nearby'}
         </Caption>
       )}
+      {lad.projections?.targets?.length ? <LadderProjections proj={lad.projections} /> : null}
       {lad.levels.length > above.length + below.length && (
         <Collapsible title={`all ${lad.levels.length} levels`}>
           {lad.levels.map(row)}

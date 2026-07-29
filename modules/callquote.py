@@ -294,3 +294,13 @@ def cached_liquidity(ticker, data_dir="data"):
     out.update({"as_of_str": _hhmm(c["as_of"]), "age_str": _cache_age(c["as_of"]),
                 "stale": cache_stale(c)})
     return out
+
+
+def cached_call_quote(ticker, data_dir="data"):
+    """Full quote blob from an existing --call cache, ZERO network — the level-projection
+    sibling of cached_liquidity (S68). _wrap-shaped (+ as_of_str/age_str/stale/cached=True)
+    or None when no usable cache exists."""
+    c = _load(ticker, data_dir)
+    if not c or not ((c.get("quote") or {}).get("quotes")):
+        return None
+    return _wrap(c["quote"], c["as_of"], cache_stale(c), True)

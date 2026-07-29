@@ -311,6 +311,28 @@ lens_web.py specifics (S48, +S49 native visuals):
   tables. Tests 62–65 + test-36/s62 monkeypatch lists gained fetch_breadth/ew_comparator;
   snapshot/diff deliberately NOT extended (market-level data would duplicate per ticker).
 
+- **S68 level projections** (user request: "when indicating a key level, what would a move to
+  that price look like — % change + projected long-call profit"): `modules/levelproj.py` (pure,
+  offline-testable, clock-injectable) rides INSIDE `ladder["projections"]` (payload contract
+  untouched). KEY targets only — --level / nearest S/R / ≤2 nearest confluence zones, deduped
+  ±0.5% (raw --level vs its cluster mid differ by construction). Per target: `travel_sessions`
+  = |dist| ÷ (HV-20/√252), linear sigma-days capped 252 (caveat: first-passage would be slower);
+  per contract TWO legs — instant (T unchanged) and paced (T − travel×365/252 calendar
+  conversion, floor→intrinsic). Quoted path: --call this run OR the call2 session cache via new
+  `callquote.cached_call_quote` (zero-network sibling of cached_liquidity); block dte REFRESHED
+  from expiry vs today (cached dte is stamp-day). **STALE-cache honesty fix (probed live — the
+  motivating bug)**: a stale cache's mids were struck at another spot (QQQ dropped 692→675
+  post-cache; +3.6% target read −47%), so under `stale` the ENTRY is re-modeled at CURRENT spot
+  (same strike/IV, ask leg dropped, `entry_modeled` flag, "entries re-modeled at current spot"
+  header + `entry≈` prefix). Synthetic fallback when no quote: BS ATM call at 30d (harvested
+  ATM IV 30d, else HV-20 proxy — labeled) + 180d (ATM IV 180d when present, the LEAPS tenor),
+  "modeled, not a quote". RISK_FREE=0.04 (gex convention); bs arg order r-before-T guarded by
+  exact-equality test. CLI: "level projections" sub-block under PRICE LADDER (non-user targets
+  ATM-only, rows[:4]) + a one-line at-your-level summary in THESIS CHECK; caveat unconditional
+  (IV constant, no skew/vol-path, straight-line pace, not advice). As-of: cache read gated →
+  synthetic-only (as-of ctx gauges are historically valid). Web: `LadderProjections` in
+  core.tsx (DataTable per target). Tests 66–70 (test 36 untouched — rides inside ladder).
+
 Modules the lens/web stack uses
 -------------------------------
 - `timeframes.py` — per-TF OHLCV (CSV else yfinance; 1h cached + Tradier timesales top-up in
