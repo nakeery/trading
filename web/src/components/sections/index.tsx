@@ -11,7 +11,7 @@ import {
 import { SecGeo, SecOptions } from './gauges'
 import { SecBuzz, SecGex, SecInsider, SecPcOi, SecShort, SecSqueeze, SecStreet } from './positioning'
 import { SecCall, SecVol } from './volcall'
-import { SecEvents, SecNotes, SecSectors, SecThesis, hasUpcomingEvents } from './misc'
+import { SecBreadth, SecEvents, SecNotes, SecSectors, SecThesis, hasUpcomingEvents } from './misc'
 
 // print_report order (sec_header is rendered by the chart block instead — skip_header)
 const SECTIONS: [string, ({ p }: { p: Payload }) => React.ReactElement | null][] = [
@@ -33,6 +33,7 @@ const SECTIONS: [string, ({ p }: { p: Payload }) => React.ReactElement | null][]
   ['volatility setup', SecVol],
   ['long call viability', SecCall],
   ['geo backdrop', SecGeo],
+  ['market breadth', SecBreadth], // S67 — equal-weight vs cap-weight, before rotation (print order)
   ['sector rotation', SecSectors],
   ['upcoming events', SecEvents], // S61 — merges the catalysts + macro tables onto one timeline
   ['thesis check', SecThesis],
@@ -79,6 +80,11 @@ const NAV: [string, string, (p: Payload) => unknown][] = [
   ['Volatility setup', 'volatility-setup', (p) => p.vol],
   ['Long call viability', 'long-call-viability', (p) => p.callq],
   ['Geo backdrop', 'geopolitical-cross-asset-backdrop', (p) => p.geo],
+  // predicate mirrors SecBreadth's null-guard exactly (dead-anchor rule)
+  ['Market breadth', 'market-breadth', (p) => {
+    const b = p.breadth as { pairs?: object | null; participation?: object | null } | null
+    return b && (Object.keys(b.pairs ?? {}).length || Object.keys(b.participation ?? {}).length)
+  }],
   ['Sector rotation', 'sector-rotation',
     (p) => (p.sectors as { rows?: unknown[] } | null)?.rows?.length],
   // shared predicate: SecEvents can render null even when earn/exd/macro keys exist (all

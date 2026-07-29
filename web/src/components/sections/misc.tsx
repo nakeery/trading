@@ -5,11 +5,98 @@ import type { CSSProperties } from 'react'
 import type { Payload, PlotlyFig } from '../../api/types'
 import { AMBER, BLUE, FAINT, GRAY, GREEN, GRID, INTRADAY_TFS, MUTED, RED, hexToRgba } from '../../utils/colors'
 import { DARK_LAYOUT, SPOT_GOLD } from '../../utils/plotly'
-import { Caption, Collapsible, DataTable, FactorColumns, Sec, Warning } from '../shared'
-import { BalanceBar, TimelineStrip, type TimelineEvent } from '../viz'
+import { Caption, Collapsible, DataTable, FactorColumns, Sec, Sparkline, Warning } from '../shared'
+import { BalanceBar, PctBar, TimelineStrip, type TimelineEvent } from '../viz'
 import Plot from '../Plot'
 
 const pctS = (v: number) => `${v >= 0 ? '+' : ''}${(v * 100).toFixed(1)}%`
+
+// mirror the CLI ±0.5% noise band (shared by SecBreadth + SecSectors)
+const rsStyle = (v: number | null | undefined): CSSProperties | undefined =>
+  v == null || Math.abs(v) <= 0.005 ? undefined
+    : { color: v > 0 ? GREEN : RED, fontWeight: 600 }
+
+// ── MARKET BREADTH (S67) ─────────────────────────────────────────────────────
+interface BreadthPair {
+  rel_20d?: number | null
+  rel_63d?: number | null
+  pct?: number | null
+  tag?: string | null
+  spark?: number[] | null
+  cap_off_high?: number | null
+  div_state?: string | null
+  div_desc?: string | null
+}
+interface Breadth {
+  pairs?: Record<string, BreadthPair> | null
+  participation?: Record<string, BreadthPair> | null
+  ticker_ew?: { sym: string; label?: string | null; rs_20d?: number | null; rs_63d?: number | null } | null
+}
+const BREADTH_TAG_COLOR: Record<string, string> = { 'broad-led': GREEN, narrow: RED }
+
+export function SecBreadth({ p }: { p: Payload }) {
+  const b = p.breadth as Breadth | null
+  const pairs = Object.entries(b?.pairs ?? {})
+  const part = Object.entries(b?.participation ?? {})
+  if (!pairs.length && !part.length) return null
+  const rows = [
+    ...pairs.map(([lbl, d]) => ({ lbl, d, isPart: false })),
+    ...part.map(([lbl, d]) => ({ lbl, d, isPart: true })),
+  ].map((r) => ({
+    pair: r.isPart ? `${r.lbl} (small-cap participation)` : r.lbl,
+    d20: r.d.rel_20d != null ? pctS(r.d.rel_20d) : '—',
+    d63: r.d.rel_63d != null ? pctS(r.d.rel_63d) : '—',
+    pct: '', spark: '',
+    tag: r.d.tag ?? '—',
+    _d: r.d,
+  }))
+  // divergence lines for the equal-weight pairs only (participation is a different read)
+  const divs = pairs.filter(([, d]) => d.div_state && d.div_state !== 'neutral' && d.div_desc)
+  const te = b?.ticker_ew
+  const teVals = [te?.rs_20d, te?.rs_63d].filter((v): v is number => v != null)
+  const teVerdict = teVals.length
+    ? (teVals.every((v) => v > 0) ? 'beating the average stock'
+      : teVals.every((v) => v < 0) ? 'lagging the average stock'
+        : 'mixed vs the average stock')
+    : null
+  return (
+    <>
+      <Sec title="MARKET BREADTH  (equal-weight vs cap-weight)" />
+      <DataTable
+        rows={rows}
+        columns={[
+          { key: 'pair', header: 'Pair' },
+          { key: 'd20', header: '20d', style: (r) => rsStyle(r._d.rel_20d) },
+          { key: 'd63', header: '63d', style: (r) => rsStyle(r._d.rel_63d) },
+          { key: 'pct', header: 'Spread percentile', cell: (r) => <PctBar pct={r._d.pct} /> },
+          { key: 'spark', header: '20d spread (1y)', cell: (r) => <Sparkline values={r._d.spark ?? []} /> },
+          { key: 'tag', header: 'Tag', style: (r) => ({ color: BREADTH_TAG_COLOR[r._d.tag ?? ''] ?? GRAY }) },
+        ]}
+      />
+      {divs.map(([lbl, d]) => {
+        const cap = lbl.split('−').pop()
+        const off = d.cap_off_high != null
+          ? `${Math.abs(d.cap_off_high * 100).toFixed(1)}% off its 52w high` : 'n/a'
+        const line = `${cap} ${off} — ${(d.div_state ?? '').toUpperCase()}: ${d.div_desc}`
+        return d.div_state === 'narrowing'
+          ? <Warning key={lbl}>{line}</Warning>
+          : <Caption key={lbl}>· {line}</Caption>
+      })}
+      {te && teVerdict && (
+        <Caption>
+          · {String(p.ticker ?? '')} vs {te.sym}{te.label ? ` (${te.label})` : ''}:{' '}
+          {[te.rs_20d != null ? `${pctS(te.rs_20d)} 20d` : null,
+            te.rs_63d != null ? `${pctS(te.rs_63d)} 63d` : null]
+            .filter(Boolean).join(' / ')} — {teVerdict}
+        </Caption>
+      )}
+      <Caption>
+        context, not a signal — narrow breadth is fragility, not a sell trigger;
+        IWM−SPY reads small-cap participation, not equal weighting
+      </Caption>
+    </>
+  )
+}
 
 // ── SECTOR ROTATION ──────────────────────────────────────────────────────────
 interface SectorRow {
@@ -19,6 +106,8 @@ interface SectorRow {
   rel_63d?: number | null
   tag: string
   rank: number
+  ew_20d?: number | null // S67 — equal-weight twin minus cap-weight sector, 20d
+  ew_tag?: string | null // broad / narrow / mixed (absent on stale pre-S67 caches)
 }
 interface Mover { sym: string; r63?: number | null; r20?: number | null }
 interface Sectors {
@@ -111,17 +200,16 @@ export function SecSectors({ p }: { p: Payload }) {
       return v != null ? `${m.sym} ${pctS(v)}` : m.sym
     }).join(' · ')
   }
+  const hasEw = rows.some((r) => r.ew_20d != null)
   const data = rows.map((r) => ({
     sector: `${own && r.sym === own ? '► ' : ''}${r.sym} ${r.name}`,
     d20: pctS(r.rel_20d),
     d63: r.rel_63d != null ? pctS(r.rel_63d) : '—',
-    tag: r.tag,
+    ew: r.ew_20d != null ? pctS(r.ew_20d) : '—',
+    tag: r.ew_tag ? `${r.tag} · ${r.ew_tag}` : r.tag,
     top: hasTop ? topTxt(top[r.sym]) : '',
     _r: r,
   }))
-  const rsStyle = (v: number | null | undefined): CSSProperties | undefined =>
-    v == null || Math.abs(v) <= 0.005 ? undefined // mirror the CLI ±0.5% noise band
-      : { color: v > 0 ? GREEN : RED, fontWeight: 600 }
   const ownRow = own ? rows.find((r) => r.sym === own) : null
   const fig = rrgFig(rows, own)
   return (
@@ -142,6 +230,10 @@ export function SecSectors({ p }: { p: Payload }) {
             { key: 'sector', header: 'Sector' },
             { key: 'd20', header: '20d', style: (r) => rsStyle(r._r.rel_20d) },
             { key: 'd63', header: '63d', style: (r) => rsStyle(r._r.rel_63d) },
+            ...(hasEw
+              ? [{ key: 'ew', header: 'EW−cap 20d',
+                   style: (r: typeof data[number]) => rsStyle(r._r.ew_20d) }]
+              : []),
             { key: 'tag', header: 'Tag', style: (r) => ({ color: TAG_COLOR[r._r.tag] ?? GRAY }) },
             ...(hasTop
               ? [{ key: 'top', header: 'Top performers (63d)',
@@ -149,6 +241,12 @@ export function SecSectors({ p }: { p: Payload }) {
               : []),
           ]}
         />
+        {hasEw && (
+          <Caption>
+            EW−cap = 20d equal-weight (RSP*) minus cap-weight sector return —
+            narrow = mega-cap-driven inside the sector
+          </Caption>
+        )}
         {hasTop && (
           <Caption>
             top performers = 63d ABSOLUTE return among the sector's ~10 largest constituents

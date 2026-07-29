@@ -124,9 +124,9 @@ try:
 except Exception:
     fetch_buzz = None
 try:
-    from modules.sectors import fetch_sectors, own_sector
+    from modules.sectors import fetch_sectors, own_sector, ew_comparator
 except Exception:
-    fetch_sectors = own_sector = None
+    fetch_sectors = own_sector = ew_comparator = None
 try:
     from modules.sectors import fetch_top_performers   # S59: lens --movers
 except Exception:
@@ -570,12 +570,22 @@ def _section(title, color=True, w=78):
     print(f"\n  {dim}──{rst} {title} {dim}{'─' * pad}{rst}")
 
 
+def _rs_cell(val, width, color=True):
+    """Fixed-width signed-percent cell, ±0.5% noise band tinted (S58, hoisted S67 so the
+    MARKET BREADTH and SECTOR ROTATION tables share it). Fixed-width text FIRST, colour wrap
+    second — ANSI escapes must not shift columns. None → '—'."""
+    cell = f"{(f'{val:+.1%}' if val is not None else '—'):>{width}}"
+    if color and val is not None and abs(val) > 0.005:
+        return f"{_GREEN if val > 0 else _RED}{cell}{_RESET}"
+    return cell
+
+
 def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as_of=None,
                  ctx=None, backdrop=None, thesis=None, level=None, color=True, candle_style="box",
                  panel_bars=None, candle_px=128, geo=None, pcoi=None, gex=None, vol=None,
                  live=None, setup=None, squeeze=None, insider=None, callq=None, liq=None,
                  cats=None, sectors=None, buzz=None, street=None, ah=None, ladder=None,
-                 short=None, risk=None, macro_events=_UNSET):
+                 short=None, breadth=None, risk=None, macro_events=_UNSET):
     w = 78
     print(f"\n{'═'*w}")
     hdr = f"  LENS — {ticker}"
@@ -1164,20 +1174,46 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         for n in geo.get("notes", []):
             print(f"      · {n}")
 
+    # 6b2. MARKET BREADTH (S67; default-on) — the backdrop's equal-weight segment promoted to a
+    # full section: both horizons + percentile, small-cap participation (IWM−SPY — NOT equal
+    # weight), a two-sided narrowing-tape divergence read, and the ticker-vs-equal-weight-
+    # comparator line ("beating the average stock or riding mega-caps?").
+    if breadth and (breadth.get("pairs") or breadth.get("participation")):
+        _section("MARKET BREADTH  (equal-weight vs cap-weight)", color)
+        pair_rows = list((breadth.get("pairs") or {}).items())
+        part_rows = list((breadth.get("participation") or {}).items())
+        print(f"      {'PAIR':<11}{'20d':>7}{'63d':>8}   {'percentile':<19}tag")
+        for lbl, d in pair_rows + part_rows:
+            pct_s = ordinal_percentile(d.get("pct")) or "—"
+            note = "  (small-cap participation)" if (lbl, d) in part_rows else ""
+            print(f"      {lbl:<11}{_rs_cell(d.get('rel_20d'), 7, color)}"
+                  f"{_rs_cell(d.get('rel_63d'), 8, color)}   {pct_s:<19}"
+                  f"{d.get('tag') or '—'}{note}")
+        for lbl, d in pair_rows:
+            if d.get("div_state") and d["div_state"] != "neutral" and d.get("div_desc"):
+                cap = lbl.split("−")[-1]
+                off = d.get("cap_off_high")
+                off_s = f"{abs(off):.1%} off its 52w high" if off is not None else "n/a"
+                print(f"    · {cap} {off_s} — {d['div_state'].upper()}: {d['div_desc']}")
+        te = breadth.get("ticker_ew")
+        if te and (te.get("rs_20d") is not None or te.get("rs_63d") is not None):
+            vals = [v for v in (te.get("rs_20d"), te.get("rs_63d")) if v is not None]
+            verdict = ("beating the average stock" if all(v > 0 for v in vals)
+                       else "lagging the average stock" if all(v < 0 for v in vals)
+                       else "mixed vs the average stock")
+            seg = " / ".join(f"{te[k]:+.1%} {h}d" for k, h in
+                             (("rs_20d", 20), ("rs_63d", 63)) if te.get(k) is not None)
+            print(f"    · {ticker} vs {te['sym']} ({te['label']}): {seg} — {verdict}")
+        print("    · context, not a signal — narrow breadth is fragility, not a sell trigger;"
+              "\n      IWM−SPY reads small-cap participation, not equal weighting")
+
     # 6c. SECTOR ROTATION (S58; default-on) — the 11 SPDR sectors ranked by RS vs SPY; ► marks
     # the ticker's own sector. Complements the SETUP CHECK's RS row (ticker vs its benchmark)
-    # with the benchmark-vs-market read.
+    # with the benchmark-vs-market read. S67 adds the EW−cap column (equal-weight twin minus
+    # cap-weight sector, 20d) — broad vs mega-cap-driven WITHIN the sector.
     if sectors and sectors.get("rows"):
         _section("SECTOR ROTATION  (RS vs SPY, ranked by 63d)", color)
         own = sectors.get("own")
-
-        def _rs_cell(val, width):
-            # fixed-width text first, colour wrap second — ANSI escapes must not shift columns
-            cell = f"{(f'{val:+.1%}' if val is not None else '—'):>{width}}"
-            if color and val is not None and abs(val) > 0.005:
-                return f"{_GREEN if val > 0 else _RED}{cell}{_RESET}"
-            return cell
-
         top_map = sectors.get("top") or {}
 
         def _top_seg(m):
@@ -1189,11 +1225,13 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
                 pct = f"{_GREEN if v > 0 else _RED}{pct}{_RESET}"
             return f"{m['sym']} {pct}"
 
-        print(f"      {'SECTOR':<21}{'20d':>7}{'63d':>8}   tag")
+        print(f"      {'SECTOR':<21}{'20d':>7}{'63d':>8}{'EW−cap':>9}   tag")
         for r in sectors["rows"]:
             mark = "►" if own and r["sym"] == own else " "
+            ew_tag = f" · {r['ew_tag']}" if r.get("ew_tag") else ""
             print(f"    {mark} {(r['sym'] + ' ' + r['name']):<21}"
-                  f"{_rs_cell(r['rel_20d'], 7)}{_rs_cell(r.get('rel_63d'), 8)}   {r['tag']}")
+                  f"{_rs_cell(r['rel_20d'], 7, color)}{_rs_cell(r.get('rel_63d'), 8, color)}"
+                  f"{_rs_cell(r.get('ew_20d'), 9, color)}   {r['tag']}{ew_tag}")
             if top_map.get(r["sym"]):
                 print(f"          top: {' · '.join(_top_seg(m) for m in top_map[r['sym']])}")
         if own:
@@ -1201,6 +1239,9 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
             if own_row:
                 print(f"    · {ticker} sector: {own} — rank {own_row['rank']}/"
                       f"{len(sectors['rows'])}, {own_row['tag']}")
+        if any(r.get("ew_20d") is not None for r in sectors["rows"]):
+            print("    · EW−cap = 20d equal-weight (RSP*) minus cap-weight sector return —"
+                  "\n      narrow = mega-cap-driven inside the sector")
         if top_map:
             print("    · top = 63d ABSOLUTE return among the sector's ~10 largest constituents"
                   "\n      (Yahoo classification) — biggest names, not full membership")
@@ -1453,8 +1494,8 @@ def gather_report(ticker, args, interactive, backdrop_base):
         notes.insert(0, f"AS-OF {asof_ts.date()}: historical mode — report reflects data through "
                         f"that session; current-only blocks disabled"
                         + (f" ({', '.join(on_flags)})" if on_flags else "")
-                        + "; ex-div, options liquidity, sector rotation, retail buzz, the "
-                          "futures/after-hours overnight reads, and "
+                        + "; ex-div, options liquidity, sector rotation, the market-breadth "
+                          "section, retail buzz, the futures/after-hours overnight reads, and "
                           "breadth/F&G/COT/sentiment omitted. Prices are on TODAY'S dividend-"
                           "adjusted basis — absolute levels can differ slightly from what a "
                           "viewer saw then; ratios/trends/percentiles are unaffected.")
@@ -1676,6 +1717,21 @@ def gather_report(ticker, args, interactive, backdrop_base):
         if "top" not in sectors:
             notes.append("sector top performers unavailable (constituent/price fetch failed).")
 
+    # MARKET BREADTH (S67; default-on, best-effort) — the backdrop's equal-weight segment
+    # promoted to a full section. Same cached fetch build_backdrop used (6h TTL → cache hit,
+    # no second download). ticker_ew is filled after the SETUP CHECK's RS fetch below.
+    # Current-only cache → omitted in as-of mode.
+    breadth = None
+    if asof_ts is None and fetch_breadth is not None:
+        try:
+            br = fetch_breadth(data_dir=args.data_dir)
+            if br and (br.get("pairs") or br.get("participation")):
+                breadth = {"pairs": br.get("pairs") or {},
+                           "participation": br.get("participation") or {},
+                           "ticker_ew": None}
+        except Exception:
+            breadth = None
+
     # RETAIL ATTENTION (S56, default-on S58) — reddit-board mention rank; cached ~6h, one feed
     # fetch serves every ticker. Ranked → read dict (+history/pct); unranked → explicit state;
     # feed down → None (silent). Current-only cache → omitted in as-of mode.
@@ -1723,7 +1779,11 @@ def gather_report(ticker, args, interactive, backdrop_base):
     if setup_check is not None and reads:
         try:
             # macro_t1 hoisted above the vol block (shared with the --vol scorecard)
-            rs = (fetch_rs(ticker, frames["1D"], data_dir=args.data_dir)
+            # S67: the equal-weight comparator rides fetch_rs's single download (extra=)
+            ew = (ew_comparator(ticker, own_sector_sym=(sectors or {}).get("own"))
+                  if ew_comparator is not None else None)
+            rs = (fetch_rs(ticker, frames["1D"], data_dir=args.data_dir,
+                           extra=([ew] if ew else None))
                   if (fetch_rs is not None and "1D" in frames) else None)
             beta = (fetch_beta(ticker, frames["1D"])
                     if (fetch_beta is not None and "1D" in frames) else None)
@@ -1731,6 +1791,13 @@ def gather_report(ticker, args, interactive, backdrop_base):
                                 macro_tier1_days=macro_t1, rs=rs, beta=beta, ex_div=exd)
         except Exception as e:
             notes.append(f"setup check unavailable ({type(e).__name__}).")
+    # S67 — ticker vs the average stock (scalar keys, not int-keyed dicts: the API JSON
+    # round-trip would stringify int keys)
+    if breadth is not None and rs and rs.get("extra"):
+        sym_e, d_e = next(iter(rs["extra"].items()))
+        breadth["ticker_ew"] = {"sym": sym_e, "label": d_e.get("label"),
+                                "rs_20d": (d_e.get("rs") or {}).get(20),
+                                "rs_63d": (d_e.get("rs") or {}).get(63)}
 
     # extended-hours quote (S64) — the ticker's own AH/pre-market move off one real-time Tradier
     # quote; only when the market is CLOSED (during RTH the live bar covers it). Display-only.
@@ -1823,6 +1890,7 @@ def gather_report(ticker, args, interactive, backdrop_base):
             "pcoi": pc, "gex": gex, "vol": vol, "live": live_bar, "setup": setup, "squeeze": sqz,
             "insider": ins, "callq": callq, "liq": liq, "cats": cats, "sectors": sectors,
             "buzz": buzz, "street": street, "ah": ah, "ladder": ladder, "short": short,
+            "breadth": breadth,                                          # S67 key
             "risk": risk,
             "macro_events": macro_events, "thesis": args.thesis, "level": args.level,
             "live_iv": live_iv,
@@ -1844,7 +1912,8 @@ def render_payload(p, use_color=True, candle_style="box", candle_px=128):
                  setup=p["setup"], squeeze=p["squeeze"], insider=p["insider"], callq=p["callq"],
                  liq=p["liq"], cats=p["cats"], sectors=p.get("sectors"), buzz=p.get("buzz"),
                  street=p.get("street"), ah=p.get("ah"), ladder=p.get("ladder"),
-                 short=p.get("short"), risk=p["risk"], macro_events=p["macro_events"])
+                 short=p.get("short"), breadth=p.get("breadth"),
+                 risk=p["risk"], macro_events=p["macro_events"])
 
 
 def render_ticker(ticker, args, use_color, interactive, backdrop_base):
@@ -1882,7 +1951,7 @@ if __name__ == "__main__":
                     help="Historical/backtest mode (S57): compute the report as of this past date "
                          "— every frame truncated (no lookahead). Live-chain/current-only blocks are "
                          "disabled: pc-oi, gex, vol quote, call, squeeze, insider, geo, live, sector "
-                         "rotation/movers, retail buzz, street, ex-div, liquidity line, the "
+                         "rotation/movers, market breadth, retail buzz, street, ex-div, liquidity line, the "
                          "sub-hourly entry-timing frames (--ltf), the extended-hours quote, and "
                          "the breadth/F&G/COT/sent/futures backdrop segments (SPY tide is "
                          "rebuilt as-of).")

@@ -282,6 +282,35 @@ lens_web.py specifics (S48, +S49 native visuals):
   iloc[-2] is just the prior bar); range52 always reads the daily frame; sub-hourly pills
   disabled in as-of mode (no historical source). uirevision includes tf.
 
+- **S67 equal-weight index checks** (user request: "a check against equal weighted indexes as
+  part of understanding the overall state of the market"; three tracks, all display-only):
+  (1) **MARKET BREADTH section** (default-on, CLI + React, before SECTOR ROTATION) — the S45
+  backdrop one-liner promoted: RSP−SPY / QQQE−QQQ at 20d+63d w/ spread percentile + ≤60-pt
+  `spark` (sentiment.spark_of), an IWM−SPY small-cap PARTICIPATION pair (labeled "not equal
+  weight"; NOT added to `PAIRS` — build_backdrop reads only "pairs" so the backdrop segment is
+  byte-unchanged), and a two-sided pure `divergence_read(rel_20d, pct, cap_off_high)` →
+  narrowing (cap leg ≤2% off its 252d high while EW spread < −dead-band or pct ≤ 0.25) / broad /
+  repair (>5% off high + EW leading) / neutral. `fetch_breadth` now downloads 5 symbols in the
+  same single batch and caches {"pairs", "participation"} with an S65-style TTL-fresh **shape
+  gate** ("participation" in cached); the stale-FALLBACK path still serves old shapes → every
+  consumer .get()s. Payload key `breadth`; as-of omitted (note extended). Web `SecBreadth`
+  (misc.tsx): DataTable + PctBar + Sparkline, narrowing → Warning; nav `market-breadth`.
+  (2) **EW−cap sector column** — `sectors.EW_TWIN` (XLK→RSPT … XLRE→RSPR, the 2023-renamed
+  Invesco equal-weight suite, verified); `rotation_read` rows gain `ew_20d`/`ew_tag`
+  (broad/narrow/mixed on ±ROT_DEAD, EW twin vs its OWN SPDR); `fetch_sectors` downloads 23
+  symbols (still one batch) and FINALLY got a shape gate ("ew_tag" in rows[0] — it had none).
+  CLI: EW−cap column + `tag · ew_tag`; web: conditional column, both `.get()`-safe vs stale rows.
+  (3) **ticker vs the average stock** — pure `sectors.ew_comparator(ticker, own_sector_sym)`
+  (QQQ→QQQE, SPY→RSP, SPDR/own-sector→RSP* twin, EW vehicle→None, else RSP);
+  `setupcheck.fetch_rs(..., extra=[(sym,label)])` rides the SAME single yf.download as a symbol
+  list (both MultiIndex and flat single-survivor shapes handled; extra=None → byte-identical
+  pre-S67 shape, setupcheck row 4 untouched per the S65 frozen-rows rule) → out["extra"] →
+  `breadth["ticker_ew"]` (scalar rs_20d/rs_63d keys — int keys would stringify over JSON) →
+  one line in the breadth section ("AMD vs RSPT (average Technology stock): … — beating the
+  average stock"). `_rs_cell` hoisted to lens module scope (color param) — shared by both
+  tables. Tests 62–65 + test-36/s62 monkeypatch lists gained fetch_breadth/ew_comparator;
+  snapshot/diff deliberately NOT extended (market-level data would duplicate per ticker).
+
 Modules the lens/web stack uses
 -------------------------------
 - `timeframes.py` — per-TF OHLCV (CSV else yfinance; 1h cached + Tradier timesales top-up in

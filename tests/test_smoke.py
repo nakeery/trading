@@ -1369,7 +1369,8 @@ def test_gather_payload_keys(monkeypatch):
 
     for name in ("next_earnings", "next_ex_dividend", "fetch_rs", "fetch_beta",
                  "fetch_sectors", "own_sector", "fetch_buzz", "fetch_street",   # S58 fetchers off
-                 "fetch_afterhours"):                                           # S64 off too
+                 "fetch_afterhours",                                            # S64 off too
+                 "fetch_breadth", "ew_comparator"):                             # S67 off too
         monkeypatch.setattr(lens, name, None, raising=False)
 
     args = SimpleNamespace(ticker=None, thesis=None, level=None, no_intraday=True, no_vix=True,
@@ -1386,7 +1387,8 @@ def test_gather_payload_keys(monkeypatch):
                 "thesis", "level", "live_iv", "earn", "exd", "as_of_mode",
                 "sectors", "buzz", "street",                                     # S58 keys
                 "ah",                                                            # S64 key
-                "ladder", "short"}                                               # S65 keys
+                "ladder", "short",                                               # S65 keys
+                "breadth"}                                                       # S67 key
     assert set(payload.keys()) == expected
     assert not any(isinstance(v, (pd.DataFrame, pd.Series)) for v in payload.values())
     assert payload["reads"] and payload["risk"] is not None      # frames were read + risk lifted
@@ -2218,7 +2220,8 @@ def test_s62_failed_squeeze_leaves_buzz_standalone(monkeypatch):
     import lens
 
     for name in ("next_earnings", "next_ex_dividend", "fetch_rs", "fetch_beta",
-                 "fetch_sectors", "own_sector", "fetch_street"):
+                 "fetch_sectors", "own_sector", "fetch_street",
+                 "fetch_breadth", "ew_comparator"):                             # S67 off too
         monkeypatch.setattr(lens, name, None, raising=False)
     ranked = {"rank": 42, "mentions": 100, "rank_prev": 50, "chg": 0.1}
     monkeypatch.setattr(lens, "fetch_buzz", lambda ticker, data_dir="data": dict(ranked))
@@ -2342,6 +2345,160 @@ def test_s63_entry_frames_excluded_from_analysis():
     r_raw = rally_drawdown_risk(trend, divergences=divs)
     assert len(r_clean["rally"]) == 0                    # …and 2 bogus rally factors without it
     assert len(r_raw["rally"]) == 2
+
+
+# ─── Test 62 (S67): market-breadth section reads (offline) ─────────────────────
+def test_breadth_section_reads(monkeypatch, tmp_path):
+    """S67 read_breadth extensions (spark / cap_off_high / divergence fields), the pure
+    divergence_read matrix, and the fetch_breadth cache shape gate (a TTL-fresh pre-S67 cache
+    refetches; the stale-FALLBACK path still serves the old shape, so consumers must .get())."""
+    import json
+    import pandas as pd
+    from modules.breadth import (read_breadth, divergence_read, fetch_breadth,
+                                 BREADTH_DEAD, CACHE_FILE)
+
+    n = 300
+    cap = pd.Series([100.0] * n)
+    lead = pd.Series([100.0 * (1.002 ** i) for i in range(n)])
+    out = read_breadth({"LEAD": (lead, cap)})["LEAD"]
+    assert isinstance(out["spark"], list) and 2 <= len(out["spark"]) <= 60
+    assert all(isinstance(v, float) for v in out["spark"])
+    assert abs(out["spark"][-1] - out["rel_20d"]) < 1e-12     # latest spread survives sampling
+    assert out["cap_off_high"] <= 0                           # distance from 252d high is ≤ 0
+    assert out["div_state"] in ("narrowing", "broad", "repair", "neutral")
+
+    # divergence matrix — two-sided per S43
+    assert divergence_read(-0.02, 0.10, -0.01)[0] == "narrowing"
+    assert divergence_read(0.0, 0.10, -0.01)[0] == "narrowing"   # low-percentile trigger alone
+    assert divergence_read(0.02, 0.80, -0.01)[0] == "broad"
+    assert divergence_read(0.02, 0.80, -0.10)[0] == "repair"
+    assert divergence_read(0.0, 0.50, -0.03) == ("neutral", "")
+    assert divergence_read(None, None, None) == ("neutral", "")
+    assert divergence_read(-0.02, 0.10, -0.10)[0] == "neutral"   # off the highs + lagging ≠ narrowing
+
+    # cache shape gate: a TTL-fresh pre-S67 cache (no "participation") must NOT satisfy the
+    # fresh-path read…
+    old = {"pairs": {"RSP−SPY": {"rel_20d": 0.01, "rel_63d": 0.02, "pct": 0.5, "tag": "broad-led"}}}
+    (tmp_path / CACHE_FILE).write_text(json.dumps(old), encoding="utf-8")
+    monkeypatch.setattr("yfinance.download",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("no network")))
+    got = fetch_breadth(data_dir=str(tmp_path))
+    assert got == old                          # …but the stale FALLBACK still serves it
+    # …and with a working download the refetch produces the new shape
+    idx = pd.bdate_range("2025-01-01", periods=n)
+    syms = ["IWM", "QQQ", "QQQE", "RSP", "SPY"]
+    frame = pd.DataFrame({("Close", s): [100.0 * (1.001 ** i) for i in range(n)] for s in syms},
+                         index=idx)
+    frame.columns = pd.MultiIndex.from_tuples(frame.columns)
+    monkeypatch.setattr("yfinance.download", lambda *a, **k: frame)
+    got2 = fetch_breadth(data_dir=str(tmp_path))
+    assert "participation" in got2 and "IWM−SPY" in got2["participation"]
+    assert set(got2["pairs"]) == {"RSP−SPY", "QQQE−QQQ"}
+    assert "spark" in got2["pairs"]["RSP−SPY"]
+
+
+# ─── Test 63 (S67): sector equal-weight twin read (offline) ────────────────────
+def test_sector_ew_twin(monkeypatch, tmp_path):
+    """rotation_read's ew_20d/ew_tag: EW twin lagging its SPDR beyond ±ROT_DEAD → 'narrow',
+    leading → 'broad', twin absent from closes → None/None; ranking untouched. Plus the new
+    fetch_sectors shape gate: a TTL-fresh pre-S67 cache (rows without 'ew_tag') refetches."""
+    import json
+    import numpy as np
+    import pandas as pd
+    from modules.sectors import rotation_read, fetch_sectors, CACHE_FILE
+
+    n = 80
+    spy = pd.Series(np.linspace(100, 102, n))
+    xlk = pd.Series(np.linspace(100, 112, n))
+    xle = pd.Series(np.linspace(100, 92, n))
+    rspt_lag = pd.Series(np.linspace(100, 104, n))       # well behind XLK → narrow
+    rows = rotation_read({"SPY": spy, "XLK": xlk, "XLE": xle, "RSPT": rspt_lag})
+    xlk_row = next(r for r in rows if r["sym"] == "XLK")
+    assert xlk_row["ew_tag"] == "narrow" and xlk_row["ew_20d"] < 0
+    xle_row = next(r for r in rows if r["sym"] == "XLE")
+    assert xle_row["ew_20d"] is None and xle_row["ew_tag"] is None   # no RSPG series supplied
+    assert [r["sym"] for r in rows] == ["XLK", "XLE"]                # ranking untouched
+    assert xlk_row["rank"] == 1
+
+    rspt_lead = pd.Series(np.linspace(100, 125, n))      # well ahead of XLK → broad
+    rows2 = rotation_read({"SPY": spy, "XLK": xlk, "RSPT": rspt_lead})
+    assert rows2[0]["ew_tag"] == "broad" and rows2[0]["ew_20d"] > 0
+
+    # shape gate: fresh old-shape cache must refetch instead of serving rows missing ew_tag
+    old = {"rows": [{"sym": "XLK", "name": "Technology", "rel_20d": 0.01, "rel_63d": 0.02,
+                     "tag": "leading", "rank": 1}]}
+    (tmp_path / CACHE_FILE).write_text(json.dumps(old), encoding="utf-8")
+    idx = pd.bdate_range("2025-01-01", periods=n)
+    frame = pd.DataFrame({("Close", "SPY"): spy.values, ("Close", "XLK"): xlk.values,
+                          ("Close", "RSPT"): rspt_lag.values}, index=idx)
+    frame.columns = pd.MultiIndex.from_tuples(frame.columns)
+    monkeypatch.setattr("yfinance.download", lambda *a, **k: frame)
+    got = fetch_sectors(data_dir=str(tmp_path))
+    assert got["rows"] and "ew_tag" in got["rows"][0]    # refetched, new shape
+
+
+# ─── Test 64 (S67): equal-weight comparator mapping (offline, pure) ────────────
+def test_ew_comparator():
+    """sectors.ew_comparator: QQQ→QQQE, SPY→RSP, a SPDR→its RSP* twin, a resolved own-sector
+    →its twin, unknown+no-sector→RSP fallback, an equal-weight vehicle itself→None."""
+    from modules.sectors import ew_comparator
+
+    assert ew_comparator("QQQ") == ("QQQE", "average NDX-100 stock")
+    assert ew_comparator("SPY") == ("RSP", "average S&P 500 stock")
+    assert ew_comparator("XLK") == ("RSPT", "average Technology stock")
+    assert ew_comparator("CRSP", own_sector_sym="XLV") == ("RSPH", "average Health Care stock")
+    assert ew_comparator("FAKE") == ("RSP", "average S&P 500 stock")
+    assert ew_comparator("FAKE", own_sector_sym=None) == ("RSP", "average S&P 500 stock")
+    for ew in ("RSP", "QQQE", "RSPT"):
+        assert ew_comparator(ew) is None
+
+
+# ─── Test 65 (S67): fetch_rs extra rider (offline) ─────────────────────────────
+def test_fetch_rs_extra_rider(monkeypatch):
+    """fetch_rs(extra=): comparators ride the SAME single download as a symbol list; extra=None
+    returns the exact pre-S67 shape and numbers (no 'extra' key); setup_check row 4 is
+    byte-identical with or without the rider (row semantics frozen, S65); the flat-columns
+    single-survivor download shape still resolves (S61 lesson)."""
+    import pandas as pd
+    from modules.setupcheck import fetch_rs, setup_check
+
+    n = 100
+    idx = pd.bdate_range("2025-01-01", periods=n)
+    daily = pd.DataFrame({"Close": [100.0 * (1.002 ** i) for i in range(n)]}, index=idx)
+    calls = []
+
+    def fake_download(syms, **k):
+        calls.append(list(syms) if isinstance(syms, (list, tuple)) else [syms])
+        cols = {("Close", s): [100.0 * (1.001 ** i) * (1 + j * 0.001)
+                               for i in range(n)]
+                for j, s in enumerate(calls[-1])}
+        f = pd.DataFrame(cols, index=idx)
+        f.columns = pd.MultiIndex.from_tuples(f.columns)
+        return f
+
+    monkeypatch.setattr("yfinance.download", fake_download)
+    base = fetch_rs("FAKE", daily)                             # FAKE → SPY fallback bench
+    assert set(base) == {"bench", "rs"} and base["bench"] == "SPY"
+    assert set(base["rs"]) == {20, 63}
+
+    withx = fetch_rs("FAKE", daily, extra=[("RSP", "average S&P 500 stock")])
+    assert calls[-1] == ["SPY", "RSP"]                         # ONE download, symbol list
+    assert withx["bench"] == "SPY" and withx["rs"] == base["rs"]   # bench math untouched
+    assert withx["extra"]["RSP"]["label"] == "average S&P 500 stock"
+    assert set(withx["extra"]["RSP"]["rs"]) == {20, 63}
+
+    # setup_check row 4 byte-identical with/without the rider
+    row4 = lambda rs: next(r for r in setup_check({}, rs=rs)["rows"]
+                           if r[0] == "Relative strength")
+    assert row4(base) == row4(withx)
+
+    # flat single-survivor shape (yfinance drops the MultiIndex when one symbol survives)
+    def flat_download(syms, **k):
+        return pd.DataFrame({"Close": [100.0 * (1.001 ** i) for i in range(n)]}, index=idx)
+
+    monkeypatch.setattr("yfinance.download", flat_download)
+    flat = fetch_rs("FAKE", daily)
+    assert flat and set(flat["rs"]) == {20, 63}
 
 
 def test_s63_tf_order_and_ltf_gate(monkeypatch):

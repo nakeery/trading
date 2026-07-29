@@ -29,24 +29,51 @@ def rel_strength(closes, bench_closes, horizons=RS_HORIZONS):
     return out or None
 
 
-def fetch_rs(ticker, daily, data_dir="data"):
+def fetch_rs(ticker, daily, data_dir="data", extra=None):
     """Best-effort relative strength vs the ticker's sector benchmark (TICKER_BENCHMARK first
-    entry; SPY fallback). One yfinance daily fetch; returns {bench, rs:{h: diff}} or None."""
+    entry; SPY fallback). One yfinance daily fetch; returns {bench, rs:{h: diff}} or None.
+    `extra` (S67) = optional list of (sym, label) comparators — e.g. the equal-weight twin from
+    sectors.ew_comparator — that ride the SAME single download by passing a symbol LIST; each
+    that computes lands in out["extra"][sym] = {"label", "rs": {h: diff}}. With extra=None the
+    return shape and the benchmark math are unchanged (no "extra" key)."""
     try:
         import yfinance as yf
         from modules.benchmarks import TICKER_BENCHMARK
         pairs = TICKER_BENCHMARK.get(ticker.upper())
         sym, name = (pairs[0] if pairs else ("SPY", "SPY"))
-        raw = yf.download(sym, period="6mo", interval="1d", progress=False, auto_adjust=True)
+        extras = [(s, lbl) for s, lbl in (extra or []) if s != sym]
+        syms = [sym] + [s for s, _ in extras]
+        raw = yf.download(syms, period="6mo", interval="1d", progress=False, auto_adjust=True)
         if raw is None or len(raw) == 0:
             return None
+        # per-symbol Close columns in both shapes (the S61 _close_frame lesson): a list
+        # download returns MultiIndex (field, symbol); yfinance flattens to single-level
+        # columns when exactly one symbol survives
         if isinstance(raw.columns, pd.MultiIndex):
-            raw.columns = raw.columns.get_level_values(0)
-        # align both series to the common last date — the bench can carry a fresher (or
-        # partial-today) bar than the ticker's CSV series, which would skew the short horizon
-        last = min(daily.index[-1], raw.index[-1])
-        rs = rel_strength(daily.loc[:last, "Close"], raw.loc[:last, "Close"])
-        return {"bench": name, "rs": rs} if rs else None
+            close = raw["Close"]
+        else:
+            close = raw[["Close"]].rename(columns={"Close": syms[0]})
+
+        def _rs_vs(s):
+            if s not in close.columns:
+                return None
+            ser = close[s].dropna()
+            if not len(ser):
+                return None
+            # align both series to the common last date — the bench can carry a fresher (or
+            # partial-today) bar than the ticker's CSV series, which would skew the short horizon
+            last = min(daily.index[-1], ser.index[-1])
+            return rel_strength(daily.loc[:last, "Close"], ser.loc[:last])
+
+        rs = _rs_vs(sym)
+        if not rs:
+            return None
+        out = {"bench": name, "rs": rs}
+        for s, lbl in extras:
+            rs_e = _rs_vs(s)
+            if rs_e:
+                out.setdefault("extra", {})[s] = {"label": lbl, "rs": rs_e}
+        return out
     except Exception:
         return None
 

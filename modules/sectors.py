@@ -42,6 +42,35 @@ SECTORS = {
 REL_SHORT, REL_LONG = 20, 63     # sessions — mirror breadth.py / setupcheck.RS_HORIZONS
 ROT_DEAD = 0.005                 # |RS| ≤ 0.5% reads flat (noise band, mirrors BREADTH_DEAD)
 
+# S67 — Invesco S&P 500 Equal Weight sector ETF per SPDR (the RYT/EW* family, renamed 2023-06).
+# EW twin return − cap-weight return WITHIN the sector tags whether sector strength is broad
+# or mega-cap-driven. A missing/dead symbol degrades that row's EW read to None ("—").
+EW_TWIN = {
+    "XLK": "RSPT", "XLC": "RSPC", "XLY": "RSPD", "XLF": "RSPF", "XLV": "RSPH",
+    "XLI": "RSPN", "XLE": "RSPG", "XLB": "RSPM", "XLP": "RSPS", "XLU": "RSPU",
+    "XLRE": "RSPR",
+}
+
+
+def ew_comparator(ticker, own_sector_sym=None):
+    """PURE (S67): ticker → (symbol, label) equal-weight comparator — "is this name beating
+    the AVERAGE stock or just riding mega-caps?". QQQ→QQQE; SPY→RSP; a SPDR sector (the
+    ticker itself, or its resolved own-sector) → its RSP* twin; anything else → RSP as the
+    average S&P 500 stock. Returns None when the ticker IS an equal-weight vehicle
+    (comparing RSP to RSP is noise). No network, no cache."""
+    t = (ticker or "").upper()
+    if t in {"RSP", "QQQE", *EW_TWIN.values()}:
+        return None
+    if t in ("QQQ", "^NDX"):
+        return ("QQQE", "average NDX-100 stock")
+    if t in ("SPY", "^GSPC"):
+        return ("RSP", "average S&P 500 stock")
+    if t in SECTORS:
+        return (EW_TWIN[t], f"average {SECTORS[t]} stock")
+    if own_sector_sym in EW_TWIN:
+        return (EW_TWIN[own_sector_sym], f"average {SECTORS[own_sector_sym]} stock")
+    return ("RSP", "average S&P 500 stock")
+
 # ── top performers per sector (S59, opt-in via lens --movers) ────────────────
 # yfinance Sector keys per SPDR (all 11 probed live 2026-07-16). Constituents come from
 # yf.Sector(key).top_companies — each sector's LARGEST names by market weight (Yahoo's
@@ -77,9 +106,12 @@ def _quadrant(r20, r63):
 
 def rotation_read(closes, bench=BENCH):
     """PURE: {sym: close series} (must include `bench`) → ranked rows
-    [{sym, name, rel_20d, rel_63d, tag, rank}] sorted by 63d RS (20d when 63d is missing).
-    rel_h = sector return − SPY return over the last h sessions, aligned per pair so one short
-    series never truncates the rest. Sectors with < REL_SHORT+1 aligned sessions are omitted.
+    [{sym, name, rel_20d, rel_63d, tag, rank, ew_20d, ew_tag}] sorted by 63d RS (20d when 63d
+    is missing). rel_h = sector return − SPY return over the last h sessions, aligned per pair
+    so one short series never truncates the rest. ew_20d (S67) = equal-weight twin return −
+    cap-weight sector return over 20 sessions WITHIN the sector (RSPT vs XLK); ew_tag =
+    broad / narrow / mixed on the same ±ROT_DEAD band — None/None when the twin's series is
+    absent or thin. Sectors with < REL_SHORT+1 aligned sessions are omitted.
     Offline-testable."""
     if bench not in (closes or {}):
         return None
@@ -95,8 +127,19 @@ def rotation_read(closes, bench=BENCH):
         r20 = float((df["sec"].pct_change(REL_SHORT) - df["spy"].pct_change(REL_SHORT)).iloc[-1])
         r63 = (float((df["sec"].pct_change(REL_LONG) - df["spy"].pct_change(REL_LONG)).iloc[-1])
                if len(df) > REL_LONG else None)
+        ew_20d = ew_tag = None
+        ew_sym = EW_TWIN.get(sym)
+        if ew_sym and ew_sym in closes:
+            dfe = pd.concat([pd.Series(closes[ew_sym], dtype=float),
+                             pd.Series(closes[sym], dtype=float)],
+                            axis=1, join="inner", keys=["ew", "cap"]).dropna()
+            if len(dfe) > REL_SHORT:
+                ew_20d = float((dfe["ew"].pct_change(REL_SHORT)
+                                - dfe["cap"].pct_change(REL_SHORT)).iloc[-1])
+                ew_tag = ("broad" if ew_20d > ROT_DEAD
+                          else "narrow" if ew_20d < -ROT_DEAD else "mixed")
         rows.append({"sym": sym, "name": name, "rel_20d": r20, "rel_63d": r63,
-                     "tag": _quadrant(r20, r63)})
+                     "tag": _quadrant(r20, r63), "ew_20d": ew_20d, "ew_tag": ew_tag})
     if not rows:
         return None
     rows.sort(key=lambda r: r["rel_63d"] if r["rel_63d"] is not None else r["rel_20d"],
@@ -277,18 +320,24 @@ def own_sector(ticker, data_dir="data"):
 
 
 def fetch_sectors(data_dir="data", ttl_hours=TTL_HOURS):
-    """Current sector-rotation table, cached. One batched yfinance daily download for all 12
-    symbols. Never raises; stale cache on failure, else None. Returns {"rows": [...]}."""
+    """Current sector-rotation table, cached. ONE batched yfinance daily download for all 23
+    symbols (11 SPDRs + SPY + the 11 equal-weight twins, S67). Never raises; stale cache on
+    failure, else None. Returns {"rows": [...]}. A TTL-fresh pre-S67 cache (rows without
+    "ew_tag") is treated as stale and refetched (shape gate); the stale FALLBACK path still
+    serves old-shape rows, so consumers must .get() the S67 keys."""
     path = os.path.join(data_dir, CACHE_FILE)
     try:
         if os.path.exists(path) and (time.time() - os.path.getmtime(path)) < ttl_hours * 3600:
             with open(path, encoding="utf-8") as f:
-                return json.load(f)
+                cached = json.load(f)
+            if (isinstance(cached, dict) and cached.get("rows")
+                    and "ew_tag" in cached["rows"][0]):            # S67 shape gate
+                return cached
     except Exception:
         pass
     try:
         import yfinance as yf
-        symbols = sorted(SECTORS) + [BENCH]
+        symbols = sorted(SECTORS) + [BENCH] + sorted(EW_TWIN.values())
         raw = yf.download(symbols, period="1y", interval="1d",
                           progress=False, auto_adjust=True)
         close = _close_frame(raw, symbols)
