@@ -2454,11 +2454,12 @@ def test_ew_comparator():
 
 
 # ─── Test 65 (S67): fetch_rs extra rider (offline) ─────────────────────────────
-def test_fetch_rs_extra_rider(monkeypatch):
+def test_fetch_rs_extra_rider(monkeypatch, tmp_path):
     """fetch_rs(extra=): comparators ride the SAME single download as a symbol list; extra=None
     returns the exact pre-S67 shape and numbers (no 'extra' key); setup_check row 4 is
     byte-identical with or without the rider (row semantics frozen, S65); the flat-columns
-    single-survivor download shape still resolves (S61 lesson)."""
+    single-survivor download shape still resolves (S61 lesson). S70: each call gets its own
+    empty data_dir so the rs_cache stays cold — the batching assertion keeps its meaning."""
     import pandas as pd
     from modules.setupcheck import fetch_rs, setup_check
 
@@ -2477,11 +2478,12 @@ def test_fetch_rs_extra_rider(monkeypatch):
         return f
 
     monkeypatch.setattr("yfinance.download", fake_download)
-    base = fetch_rs("FAKE", daily)                             # FAKE → SPY fallback bench
+    base = fetch_rs("FAKE", daily, data_dir=str(tmp_path / "a"))   # FAKE → SPY fallback bench
     assert set(base) == {"bench", "rs"} and base["bench"] == "SPY"
     assert set(base["rs"]) == {20, 63}
 
-    withx = fetch_rs("FAKE", daily, extra=[("RSP", "average S&P 500 stock")])
+    withx = fetch_rs("FAKE", daily, data_dir=str(tmp_path / "b"),
+                     extra=[("RSP", "average S&P 500 stock")])
     assert calls[-1] == ["SPY", "RSP"]                         # ONE download, symbol list
     assert withx["bench"] == "SPY" and withx["rs"] == base["rs"]   # bench math untouched
     assert withx["extra"]["RSP"]["label"] == "average S&P 500 stock"
@@ -2497,7 +2499,7 @@ def test_fetch_rs_extra_rider(monkeypatch):
         return pd.DataFrame({"Close": [100.0 * (1.001 ** i) for i in range(n)]}, index=idx)
 
     monkeypatch.setattr("yfinance.download", flat_download)
-    flat = fetch_rs("FAKE", daily)
+    flat = fetch_rs("FAKE", daily, data_dir=str(tmp_path / "c"))
     assert flat and set(flat["rs"]) == {20, 63}
 
 
@@ -2611,12 +2613,20 @@ def test_project_targets():
     fresh_atm = next(c for c in yl["contracts"] if c["kind"] == "atm")
     assert fresh_atm["entry_modeled"] is False and fresh_atm["entry_mid"] == 27.5
 
+    # synthetic fallback: three tenors (S69 — 30/180/365, the last two being what this project
+    # trades). Per tenor the IV preference is harvested gauge → --call curve → HV-20 proxy.
     synth = project_targets(ladder, hv20=0.20, callq=None, iv30=0.22, iv180=0.25)
     yl2 = synth["targets"][0]
-    assert not yl2["contracts"] and [s["dte"] for s in yl2["synthetic"]] == [30, 180]
+    assert not yl2["contracts"] and [s["dte"] for s in yl2["synthetic"]] == [30, 180, 365]
+    assert [s["iv_src"] for s in yl2["synthetic"]] == [
+        "ATM IV (30d)", "ATM IV (180d)", "HV-20 proxy"]   # no 365d gauge exists → proxy
     assert synth["quote_meta"] is None
+    # iv180 absent → the 180d leg falls to the HV-20 proxy rather than vanishing (pre-S69 it
+    # was dropped entirely, which is why the long row never rendered: atm_iv_180d is empty in
+    # every indicators CSV on disk)
     only30 = project_targets(ladder, hv20=0.20, callq=None, iv30=0.22)
-    assert [s["dte"] for s in only30["targets"][0]["synthetic"]] == [30]
+    assert [s["dte"] for s in only30["targets"][0]["synthetic"]] == [30, 180, 365]
+    assert only30["targets"][0]["synthetic"][1]["iv_src"] == "HV-20 proxy"
     proxy = project_targets(ladder, hv20=0.20, callq=None)    # no IV at all → HV proxy
     assert proxy["targets"][0]["synthetic"][0]["iv_src"] == "HV-20 proxy"
     assert project_targets(None) is None
@@ -2715,6 +2725,102 @@ def test_projections_render():
     # the block is purely additive — stripping it reproduces the pre-S68 ladder byte-for-byte
     assert out2 == out.replace(out[out.index("\n    ── level projections"):
                                    out.index("not advice") + len("not advice\n")], "")
+
+
+# ─── S69: long-tenor expiry selection + per-expiry strike ladder (offline) ──────
+def test_s69_long_tenor_expiry_selection():
+    """The ~6mo/~1yr tenors must resolve against REAL, sparse LEAPS grids. Out past ~5 months
+    the monthly ladder is ticker-specific, so: monthlies are preferred while one is inside
+    tolerance, the pool widens to every listed expiry beyond LONG_DTE_MIN, and a target with
+    nothing inside tenor_tol is OMITTED rather than mislabeled."""
+    from modules.callquote import _select_expiries, tenor_tol
+
+    assert tenor_tol(45) == 30 and abs(tenor_tol(365) - 127.75) < 1e-9
+
+    # SOFI (probed 2026-07-30): monthlies 169/232/505 + a NON-monthly 322d LEAP. The 1yr slot
+    # must take 322 (43 off) and not the monthly 232 (133 off) — the motivating case.
+    sofi = [("2026-08-21", 22), ("2026-09-18", 50), ("2026-10-16", 78), ("2026-11-20", 113),
+            ("2026-12-18", 141), ("2027-01-15", 169), ("2027-03-19", 232),
+            ("2027-06-17", 322), ("2027-12-17", 505), ("2028-01-21", 540)]
+    assert _select_expiries(sofi) == [("2026-09-18", 50), ("2026-10-16", 78),
+                                      ("2027-01-15", 169), ("2027-06-17", 322)]
+
+    # CRSP: 171d then 542d — nothing within ±128 of 365, so there is simply NO 1yr row
+    crsp = [("2026-09-18", 50), ("2026-10-16", 78), ("2027-01-15", 171), ("2028-01-21", 542)]
+    assert [d for _, d in _select_expiries(crsp)] == [50, 78, 171]
+
+    # a liquid monthly inside tolerance beats a closer non-monthly (QQQ: 414 monthly vs 335
+    # quarterly — 414 is 49 off, inside ±128, so the pool never widens)
+    qqq = [("2026-09-18", 50), ("2026-10-16", 78), ("2027-01-15", 169),
+           ("2027-06-30", 335), ("2027-09-17", 414)]
+    assert [d for _, d in _select_expiries(qqq)] == [50, 78, 169, 414]
+
+    # dedup: one expiry can only serve one tenor
+    thin = [("2026-09-18", 50), ("2027-01-15", 169)]
+    assert [d for _, d in _select_expiries(thin)] == [50, 169]
+
+
+def test_s69_strike_ladder():
+    """The per-expiry ladder rides the SAME parsed chain rows as the ATM pick (zero extra
+    network) and is what the web strike selector offers: tradeable only, bounded by ±pct of
+    spot, capped, tagged atm/otm/other with moneyness."""
+    from modules.callquote import strike_ladder
+
+    def row(strike, bid=1.0, delta=0.5, typ="call"):
+        return {"type": typ, "strike": strike, "bid": bid, "ask": bid * 1.05,
+                "oi": 100, "volume": 10, "delta": delta, "theta": -0.01, "iv": 0.5}
+
+    rows = [row(s, delta=max(0.05, 1.0 - (s - 80) / 50)) for s in range(80, 126, 5)]
+    rows.append(row(100.0, bid=0.0))            # no-bid duplicate must be ignored
+    rows.append(row(100.0, typ="put"))          # puts are not call candidates
+    lad = strike_ladder(rows, spot=100.0, max_n=5, pct=0.25)
+
+    assert [c["strike"] for c in lad] == sorted(c["strike"] for c in lad)   # sorted by strike
+    assert len(lad) <= 6                        # max_n, +1 only if the OTM pick sits outside
+    assert all(abs(c["moneyness"] - (c["strike"] / 100.0 - 1)) < 1e-12 for c in lad)
+    kinds = [c["kind"] for c in lad]
+    assert kinds.count("atm") == 1 and lad[[c["kind"] for c in lad].index("atm")]["strike"] == 100.0
+    assert all(k in ("atm", "otm", "other") for k in kinds)
+    # ±pct bound: a far strike is excluded
+    assert all(abs(c["strike"] - 100.0) / 100.0 <= 0.25 for c in lad if c["kind"] != "otm")
+    assert strike_ladder([], 100.0) == [] and strike_ladder(rows, 0) == []
+
+
+def test_s69_ladder_repricing():
+    """project_targets reprices the WHOLE ladder (the web selectors filter rows that already
+    exist — no BS in TypeScript), carrying kind/moneyness/delta for the selector labels, and
+    still handles a pre-S69 cache that only has atm/otm."""
+    from modules.levelproj import project_targets, curve_iv
+
+    ladder = {"spot": 100.0, "levels": [], "nearest_support": None, "nearest_resistance": None,
+              "user_level": {"price": 110.0, "dist_pct": 0.10, "confluence": []}}
+    blk = {"expiry": "2027-06-17", "dte": 322, "ladder": [
+        {"strike": 95.0, "mid": 12.0, "iv": 0.5, "delta": 0.62, "kind": "other", "moneyness": -0.05},
+        {"strike": 100.0, "mid": 9.5, "iv": 0.5, "delta": 0.55, "kind": "atm", "moneyness": 0.0},
+        {"strike": 115.0, "mid": 4.5, "iv": 0.52, "delta": 0.375, "kind": "otm", "moneyness": 0.15}]}
+    curve = {"points": [{"label": "27-01-15", "dte": 169, "iv": 0.6}]}
+    p = project_targets(ladder, hv20=0.45, callq={"quotes": [blk], "curve": curve})
+    rows = p["targets"][0]["contracts"]
+    assert len(rows) == 3                                    # every ladder strike repriced
+    assert {c["kind"] for c in rows} == {"atm", "otm", "other"}
+    assert all(c["moneyness"] is not None and c["delta"] is not None for c in rows)
+    assert all(c["dte"] == 322 and c["expiry"] == "2027-06-17" for c in rows)
+    # further OTM = more leverage into an up-move
+    by_k = {c["strike"]: c["instant"]["pnl_mid_pct"] for c in rows}
+    assert by_k[115.0] > by_k[100.0] > by_k[95.0]
+
+    # curve IV is the working long-tenor source; a 22d front point may not stand in for 365d
+    assert curve_iv({"curve": curve}, 180) == (0.6, 169)
+    assert curve_iv({"curve": curve}, 365) is None
+    assert curve_iv({"curve": {"points": []}}, 180) is None
+
+    # pre-S69 cached block (atm/otm, no ladder) still reprices — old caches must not break
+    old = {"expiry": "2026-09-18", "dte": 50,
+           "atm": {"strike": 100.0, "mid": 4.0, "iv": 0.5},
+           "otm": {"strike": 110.0, "mid": 1.2, "iv": 0.52}}
+    p2 = project_targets(ladder, hv20=0.45, callq={"quotes": [old]})
+    assert [(c["strike"], c["kind"]) for c in p2["targets"][0]["contracts"]] == [
+        (100.0, "atm"), (110.0, "otm")]
 
 
 def test_s63_tf_order_and_ltf_gate(monkeypatch):
@@ -3158,3 +3264,315 @@ def test_chart_tf_frame():
     # as-of truncation on the resampled path
     dw2, _ = charts.tf_frame("QQQ", "1W", as_of="2026-03-10")
     assert dw2.index.max() <= __import__("pandas").Timestamp("2026-03-14")
+
+
+# ─── Test 71 (S70): netcache conventions (offline, pure) ────────────────────────
+def test_s70_netcache_conventions(tmp_path):
+    """most_recent_close mirrors pc_oi._most_recent_close (drift guard — the 10-line duplicate
+    keeps pc_oi/tradier out of features.py's import chain); session_fresh flips exactly at the
+    close boundary; fresh_hours is a plain wall-clock TTL; JSON helpers never raise."""
+    import time
+    from modules import netcache
+    from modules import pc_oi
+
+    close = netcache.most_recent_close()
+    assert close == pc_oi._most_recent_close()               # drift guard
+    assert close.weekday() < 5 and close.hour == 16
+
+    ts = close.timestamp()
+    assert netcache.session_fresh(ts + 1)                    # just after the boundary
+    assert not netcache.session_fresh(ts - 1)                # just before → a close intervened
+    assert not netcache.session_fresh(None)                  # unusable → stale, never raises
+    assert not netcache.session_fresh("garbage")
+
+    assert netcache.fresh_hours(time.time() - 3600, 24)
+    assert not netcache.fresh_hours(time.time() - 25 * 3600, 24)
+    assert not netcache.fresh_hours(None, 24)
+
+    p = str(tmp_path / "sub" / "c.json")
+    assert netcache.load_json(p) is None                     # missing → None
+    netcache.save_json(p, {"a": 1})                          # makedirs
+    assert netcache.load_json(p) == {"a": 1}
+    with open(p, "w") as f:
+        f.write("{not json")
+    assert netcache.load_json(p) is None                     # corrupt → None, never raises
+
+
+# ─── Test 72 (S70): VIX-complex close cache (offline) ───────────────────────────
+def test_s70_vix_cache(tmp_path, monkeypatch):
+    """add_vix behind the session-stale close cache: 3 downloads cold, 0 warm with identical
+    values; an as-of sub-window is served from containment; an earlier start widens the fetch;
+    an aged as_of refetches; a failed download serves the stale covering cache."""
+    import json
+    import time as _t
+    import pandas as pd
+    from modules import features
+
+    n = 300
+    idx = pd.bdate_range("2024-01-02", periods=n)
+    df = pd.DataFrame({"Close": [100.0 + i * 0.1 for i in range(n)]}, index=idx)
+    start = idx.min().strftime("%Y-%m-%d")
+    end = (idx.max() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    calls = []
+
+    def fake_download(sym, start=None, end=None, **k):
+        calls.append((sym, start))
+        vals = pd.date_range(start, end, freq="B")
+        return pd.DataFrame({"Close": [20.0 + i * 0.01 for i in range(len(vals))]}, index=vals)
+
+    monkeypatch.setattr(features.yf, "download", fake_download)
+    d = str(tmp_path)
+
+    a = features.add_vix(df.copy(), start, end, data_dir=d)
+    assert len(calls) == 3                                    # cold: one per symbol
+    b = features.add_vix(df.copy(), start, end, data_dir=d)
+    assert len(calls) == 3                                    # warm: zero network
+    pd.testing.assert_frame_equal(a, b)                       # cache round-trips exact values
+
+    # as-of sub-window (narrower) — containment serves it with zero network
+    sub_end = (idx[150] + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
+    features.add_vix(df.iloc[:151].copy(), start, sub_end, data_dir=d)
+    assert len(calls) == 3
+
+    # earlier start — the fetch WIDENS (min rule) and goes to network once per symbol
+    features.add_vix(df.copy(), "2023-06-01", end, data_dir=d)
+    assert len(calls) == 6 and all(s == "2023-06-01" for _, s in calls[3:])
+    features.add_vix(df.copy(), start, end, data_dir=d)       # narrower again → contained
+    assert len(calls) == 6
+
+    # aged as_of → refetch
+    p = tmp_path / "vix_cache" / "vix.json"
+    c = json.loads(p.read_text())
+    c["as_of"] = _t.time() - 14 * 24 * 3600
+    p.write_text(json.dumps(c))
+    features.add_vix(df.copy(), start, end, data_dir=d)
+    assert len(calls) == 7                                    # only ^VIX was aged
+
+    # failed download with a covering (stale) cache → served, never raises
+    for f in (tmp_path / "vix_cache").iterdir():
+        c = json.loads(f.read_text())
+        c["as_of"] = 0.0
+        f.write_text(json.dumps(c))
+
+    def boom(*a, **k):
+        raise RuntimeError("yahoo down")
+
+    monkeypatch.setattr(features.yf, "download", boom)
+    out = features.add_vix(df.copy(), start, end, data_dir=d)
+    assert "VIX" in out.columns and out["VIX"].notna().any()
+
+
+# ─── Test 73 (S70): SKEW/VVIX tail cache (offline) ──────────────────────────────
+def test_s70_tail_cache(tmp_path, monkeypatch):
+    """_fetch_tail: one batched download cold, zero warm; stale cache served on failure;
+    empty Series (never a raise) on total failure with no cache."""
+    import pandas as pd
+    from modules import sentiment
+
+    idx = pd.bdate_range("2025-01-02", periods=50)
+    calls = []
+
+    def fake_download(syms, **k):
+        calls.append(syms)
+        f = pd.DataFrame({("Close", "^SKEW"): [130.0 + i for i in range(len(idx))],
+                          ("Close", "^VVIX"): [90.0 + i * 0.1 for i in range(len(idx))]},
+                         index=idx)
+        f.columns = pd.MultiIndex.from_tuples(f.columns)
+        return f
+
+    monkeypatch.setattr("yfinance.download", fake_download)
+    d = str(tmp_path)
+    sk, vv = sentiment._fetch_tail(d)
+    assert len(calls) == 1 and len(sk) == 50 and len(vv) == 50
+    sk2, vv2 = sentiment._fetch_tail(d)
+    assert len(calls) == 1                                    # warm: zero network
+    pd.testing.assert_series_equal(sk, sk2, check_names=False, check_freq=False)
+
+    def boom(*a, **k):
+        raise RuntimeError("yahoo down")
+
+    monkeypatch.setattr("yfinance.download", boom)
+    sk3, vv3 = sentiment._fetch_tail(d)                       # stale fallback
+    assert len(sk3) == 50 and float(sk3.iloc[-1]) == float(sk.iloc[-1])
+    sk4, vv4 = sentiment._fetch_tail(str(tmp_path / "empty")) # no cache + failure → empty
+    assert len(sk4) == 0 and len(vv4) == 0
+
+
+# ─── Test 74 (S70): rs_cache — fetch_rs/fetch_beta shared closes (offline) ──────
+def test_s70_rs_beta_cache(tmp_path, monkeypatch):
+    """fetch_rs twice = ONE download total; fetch_beta after a SPY-bench fetch_rs = ZERO
+    downloads (shared per-symbol cache); warm values equal the cold run; mixed fresh/stale
+    symbols batch only the stale ones."""
+    import pandas as pd
+    from modules import setupcheck
+
+    n = 100
+    idx = pd.bdate_range("2025-01-01", periods=n)
+    daily = pd.DataFrame({"Close": [100.0 * (1.002 ** i) for i in range(n)]}, index=idx)
+    calls = []
+
+    def fake_download(syms, **k):
+        got = list(syms) if isinstance(syms, (list, tuple)) else [syms]
+        calls.append(got)
+        cols = {("Close", s): [100.0 * (1.001 ** i) * (1 + j * 0.001) for i in range(n)]
+                for j, s in enumerate(got)}
+        f = pd.DataFrame(cols, index=idx)
+        f.columns = pd.MultiIndex.from_tuples(f.columns)
+        return f
+
+    monkeypatch.setattr("yfinance.download", fake_download)
+    d = str(tmp_path)
+
+    cold = setupcheck.fetch_rs("FAKE", daily, data_dir=d)     # FAKE → SPY fallback bench
+    assert len(calls) == 1 and calls[0] == ["SPY"]
+    warm = setupcheck.fetch_rs("FAKE", daily, data_dir=d)
+    assert len(calls) == 1                                    # zero network on the repeat
+    assert warm["rs"] == cold["rs"]                           # cache round-trips the math
+
+    beta = setupcheck.fetch_beta("FAKE", daily, data_dir=d)   # SPY already cached
+    assert len(calls) == 1 and beta and beta["n"] > 20
+
+    # mixed fresh/stale: RSP is new → ONE batched download of just the stale symbol
+    withx = setupcheck.fetch_rs("FAKE", daily, data_dir=d, extra=[("RSP", "ew twin")])
+    assert len(calls) == 2 and calls[1] == ["RSP"]
+    assert withx["rs"] == cold["rs"] and "RSP" in withx["extra"]
+
+
+# ─── Test 75 (S70): earnings + ex-div result caches (offline) ───────────────────
+def test_s70_earnings_exdiv_cache(tmp_path, monkeypatch):
+    """earnings_dates: 24h cache incl. the EMPTY list (ETFs), stale fallback on failure.
+    next_ex_dividend: result cached (null too), days recomputed on hit, past date refetches."""
+    import json
+    import time as _t
+    import pandas as pd
+    from modules import features
+
+    d = str(tmp_path)
+    future = (pd.Timestamp.today().normalize() + pd.Timedelta(days=30))
+    calls = []
+
+    class FakeT:
+        def __init__(self, t):
+            calls.append(t)
+
+        def get_earnings_dates(self, limit=16):
+            return pd.DataFrame({"EPS": [1.0]}, index=pd.DatetimeIndex([future]))
+
+    monkeypatch.setattr(features.yf, "Ticker", FakeT)
+    a = features.earnings_dates("FAKE", data_dir=d)
+    assert len(calls) == 1 and a == [future]
+    b = features.earnings_dates("FAKE", data_dir=d)
+    assert len(calls) == 1 and b == a                         # cache hit, Timestamps restored
+
+    class EmptyT:
+        def __init__(self, t):
+            calls.append(t)
+
+        def get_earnings_dates(self, limit=16):
+            return None
+
+    monkeypatch.setattr(features.yf, "Ticker", EmptyT)
+    assert features.earnings_dates("QETF", data_dir=d) == []
+    assert features.earnings_dates("QETF", data_dir=d) == []
+    assert calls.count("QETF") == 1                           # the EMPTY list is cached too
+
+    # TTL expiry → refetch; fetch failure → stale fallback
+    p = tmp_path / "earnings_cache" / "FAKE.json"
+    c = json.loads(p.read_text())
+    c["as_of"] = _t.time() - 25 * 3600
+    p.write_text(json.dumps(c))
+
+    class BoomT:
+        def __init__(self, t):
+            calls.append(t)
+
+        def get_earnings_dates(self, limit=16):
+            raise RuntimeError("yahoo down")
+
+    monkeypatch.setattr(features.yf, "Ticker", BoomT)
+    assert features.earnings_dates("FAKE", data_dir=d) == [future]   # stale beats nothing
+
+    # ── ex-div: result cached, days recomputed from the cached DATE on every hit
+    exd_date = (pd.Timestamp.today().normalize() + pd.Timedelta(days=10))
+    ex_calls = []
+
+    class DivT:
+        def __init__(self, t):
+            ex_calls.append(t)
+
+        def get_calendar(self):
+            return {"Ex-Dividend Date": exd_date}
+
+        @property
+        def dividends(self):
+            return pd.Series(dtype=float)
+
+    monkeypatch.setattr(features.yf, "Ticker", DivT)
+    v1 = features.next_ex_dividend("PAYER", data_dir=d)
+    assert len(ex_calls) == 1 and v1["days"] == 10 and v1["est"] is False
+    v2 = features.next_ex_dividend("PAYER", data_dir=d)
+    assert len(ex_calls) == 1 and v2 == v1                    # hit, zero network
+
+    class NoDivT:
+        def __init__(self, t):
+            ex_calls.append(t)
+
+        def get_calendar(self):
+            return {}
+
+        @property
+        def dividends(self):
+            return pd.Series(dtype=float)
+
+    monkeypatch.setattr(features.yf, "Ticker", NoDivT)
+    assert features.next_ex_dividend("GROWTH", data_dir=d) is None
+    assert features.next_ex_dividend("GROWTH", data_dir=d) is None
+    assert ex_calls.count("GROWTH") == 1                      # null cached (non-payers)
+
+    # past cached date → treated stale → refetch
+    p = tmp_path / "exdiv_cache" / "PAYER.json"
+    c = json.loads(p.read_text())
+    c["val"]["date"] = "2020-01-02"
+    p.write_text(json.dumps(c))
+    monkeypatch.setattr(features.yf, "Ticker", DivT)
+    v3 = features.next_ex_dividend("PAYER", data_dir=d)
+    assert ex_calls.count("PAYER") == 2 and v3["days"] == 10
+
+
+# ─── Test 76 (S70): session-stale report cache (offline) ────────────────────────
+def test_s70_report_session_cache(monkeypatch):
+    """put_report/get_report: hit while session-fresh; a market close having passed →
+    miss + prune; maxsize eviction drops the oldest."""
+    __import__("pytest").importorskip("fastapi")
+    import pandas as pd
+    from api import cache as api_cache
+    from modules import netcache
+
+    api_cache.report_cache.clear()
+    try:
+        key = ("QQQ", (("vol", False),))
+        bundle = {"payload": {"ticker": "QQQ"}, "preamble": "", "ansi_html": ""}
+        api_cache.put_report(key, bundle)
+        assert api_cache.get_report(key) is bundle             # same-session hit
+
+        # a close has occurred since the entry was stored → miss AND pruned
+        future_close = netcache.most_recent_close() + pd.Timedelta(days=5)
+        monkeypatch.setattr(netcache, "most_recent_close", lambda: future_close)
+        assert api_cache.get_report(key) is None
+        assert key not in api_cache.report_cache
+        monkeypatch.undo()
+
+        # maxsize eviction — oldest entry goes first
+        api_cache.report_cache.clear()
+        old_max = api_cache._REPORT_MAX
+        api_cache._REPORT_MAX = 3
+        try:
+            for i in range(4):
+                api_cache.put_report((f"T{i}", ()), {"payload": {"i": i}})
+            assert len(api_cache.report_cache) == 3
+            assert ("T0", ()) not in api_cache.report_cache
+            assert api_cache.get_report(("T3", ()))["payload"]["i"] == 3
+        finally:
+            api_cache._REPORT_MAX = old_max
+    finally:
+        api_cache.report_cache.clear()

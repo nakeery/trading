@@ -13,9 +13,14 @@ Import pattern:
     )
 """
 
+import os
+import time
+
 import numpy as np
 import pandas as pd
 import yfinance as yf
+
+from modules import netcache
 
 # ─── Shared constants ────────────────────────────────────────────────────────
 HV_WINDOW        = 20    # Rolling window for realized vol (trading days)
@@ -229,28 +234,43 @@ def add_earnings_proximity(df, ticker):
     return df
 
 
-def earnings_dates(ticker, limit=16):
+def earnings_dates(ticker, limit=16, data_dir="data"):
     """Sorted, tz-naive, normalized earnings dates (past + future) from yfinance.
     Returns a list of pd.Timestamp, or [] on any failure/empty. Best-effort: never raises.
-    Shared by next_earnings and modules/vol_history.py."""
+    Shared by next_earnings and modules/vol_history.py.
+
+    Cached 24h per ticker (S70) — data/earnings_cache/{T}.json {as_of, limit, dates}. The
+    EMPTY list is cached too (ETFs previously re-hit yfinance every run); a cached list is
+    served only when its limit covers the request. Stale cache = fallback on fetch failure."""
+    path = os.path.join(data_dir, "earnings_cache", f"{ticker.upper()}.json")
+    cache = netcache.load_json(path)
+    if (cache and netcache.fresh_hours(cache.get("as_of"), 24)
+            and int(cache.get("limit", 0)) >= limit):
+        return [pd.Timestamp(d) for d in cache.get("dates", [])]
     try:
         dates = yf.Ticker(ticker).get_earnings_dates(limit=limit)
         if dates is None or len(dates) == 0:
-            return []
-        idx = pd.DatetimeIndex(dates.index)
-        if idx.tz is not None:
-            idx = idx.tz_convert(None)
-        return sorted(idx.normalize().unique())
+            out = []
+        else:
+            idx = pd.DatetimeIndex(dates.index)
+            if idx.tz is not None:
+                idx = idx.tz_convert(None)
+            out = sorted(idx.normalize().unique())
+        netcache.save_json(path, {"as_of": time.time(), "limit": limit,
+                                  "dates": [d.strftime("%Y-%m-%d") for d in out]})
+        return out
     except Exception:
+        if cache and int(cache.get("limit", 0)) >= limit:   # stale fallback
+            return [pd.Timestamp(d) for d in cache.get("dates", [])]
         return []
 
 
-def next_earnings(ticker, daily=None):
+def next_earnings(ticker, daily=None, data_dir="data"):
     """Next scheduled earnings for `ticker` via yfinance + the typical historical earnings move.
     Returns {date: 'YYYY-MM-DD'|None, days: int|None, hist_move: float|None} or None (ETF / no data).
     `hist_move` = median |close-to-close| % around the last few past earnings (needs `daily` OHLCV).
     Best-effort: never raises (mirrors add_earnings_proximity's yfinance access)."""
-    ed = earnings_dates(ticker)
+    ed = earnings_dates(ticker, data_dir=data_dir)
     if not ed:
         return None
 
@@ -301,11 +321,36 @@ def estimate_next_ex_div(ex_dates, today=None):
     return nxt.normalize()
 
 
-def next_ex_dividend(ticker):
+def next_ex_dividend(ticker, data_dir="data"):
     """Next ex-dividend date for `ticker` (S46) — a long call doesn't earn the dividend, the stock
     gaps down by it, and deep-ITM calls face early-exercise into ex-div. Exact date from the
     yfinance calendar when available; else estimated from the dividend-history cadence (flagged
-    `est`). Returns {date, days, est} or None (non-payer / no data). Best-effort: never raises."""
+    `est`). Returns {date, days, est} or None (non-payer / no data). Best-effort: never raises.
+
+    Cached 24h per ticker (S70) — data/exdiv_cache/{T}.json {as_of, val} with the RESULT cached
+    (null too — non-payers). On a hit `days` is recomputed from the cached date vs today; a
+    now-past date is treated stale and refetched. Stale cache = fallback on fetch failure."""
+    path = os.path.join(data_dir, "exdiv_cache", f"{ticker.upper()}.json")
+    cache = netcache.load_json(path)
+
+    def _rehydrate(c):
+        """Cached val with `days` recomputed; False when unusable/past-date (refetch)."""
+        val = c.get("val")
+        if val is None:
+            return None
+        try:
+            d = pd.Timestamp(val["date"]).normalize()
+            days = int((d - pd.Timestamp.today().normalize()).days)
+            if days < 0:
+                return False
+            return {"date": val["date"], "days": days, "est": bool(val.get("est"))}
+        except Exception:
+            return False
+
+    if cache and netcache.fresh_hours(cache.get("as_of"), 24):
+        hit = _rehydrate(cache)
+        if hit is not False:
+            return hit
     try:
         t = yf.Ticker(ticker)
         today = pd.Timestamp.today().normalize()
@@ -318,16 +363,23 @@ def next_ex_dividend(ticker):
                 exd = cal.loc["Ex-Dividend Date"].iloc[0]
         except Exception:
             exd = None
+        val = None
         if exd is not None:
             d = pd.Timestamp(exd).normalize()
             if d >= today:
-                return {"date": d.date().isoformat(), "days": int((d - today).days), "est": False}
-        div = t.dividends
-        nxt = estimate_next_ex_div(div.index if (div is not None and len(div)) else None, today)
-        if nxt is None:
-            return None
-        return {"date": nxt.date().isoformat(), "days": int((nxt - today).days), "est": True}
+                val = {"date": d.date().isoformat(), "days": int((d - today).days), "est": False}
+        if val is None:
+            div = t.dividends
+            nxt = estimate_next_ex_div(div.index if (div is not None and len(div)) else None, today)
+            if nxt is not None:
+                val = {"date": nxt.date().isoformat(), "days": int((nxt - today).days), "est": True}
+        netcache.save_json(path, {"as_of": time.time(), "val": val})
+        return val
     except Exception:
+        if cache:                                   # stale fallback
+            hit = _rehydrate(cache)
+            if hit is not False:
+                return hit
         return None
 
 
@@ -417,11 +469,75 @@ def compute_vol_thresholds(df, verbose=True,
     return win_threshold, win_threshold_63, expansion_threshold
 
 
-def add_vix(df, start_date, end_date):
-    """Download VIX/VIX9D/VIX3M and compute all VIX feature columns."""
-    vix_raw   = yf.download("^VIX",   start=start_date, end=end_date, progress=False)
-    vix9d_raw = yf.download("^VIX9D", start=start_date, end=end_date, progress=False)
-    vix3m_raw = yf.download("^VIX3M", start=start_date, end=end_date, progress=False)
+def _cached_close_frame(symbol, start, end, data_dir="data"):
+    """Session-stale disk cache in front of a daily-Close yf.download (S70).
+
+    File data/vix_cache/{sym}.json = {as_of, start, end, close: {ISO-date: value}}.
+    Hit: cache is session-fresh AND its [start, end] window CONTAINS the request → slice,
+    zero network. Miss: ONE download over the WIDENED window (min start / max end — the first
+    long-history ticker of the day sets the widest cache; an as-of run can never shrink it),
+    saved, sliced. A failed/empty download serves a stale covering cache; else the raw result
+    is returned (empty frame) / the exception re-raised — callers keep their old failure modes.
+    Returns a DataFrame with a single 'Close' column on a tz-naive daily index — byte-identical
+    inputs to compute_vix_features, which reads only 'Close' (its docstring blesses cached
+    equivalents)."""
+    start_ts, end_ts = pd.Timestamp(start), pd.Timestamp(end)
+    path = os.path.join(data_dir, "vix_cache", f"{symbol.strip('^').lower()}.json")
+    cache = netcache.load_json(path)
+
+    def _frame(c):
+        idx = pd.to_datetime(list(c["close"].keys()))
+        f = pd.DataFrame({"Close": [float(v) for v in c["close"].values()]}, index=idx)
+        return f.sort_index()
+
+    def _covers(c):
+        try:
+            return (pd.Timestamp(c["start"]) <= start_ts) and (pd.Timestamp(c["end"]) >= end_ts)
+        except Exception:
+            return False
+
+    if cache and netcache.session_fresh(cache.get("as_of")) and _covers(cache):
+        return _frame(cache).loc[start_ts:end_ts]
+
+    fetch_start, fetch_end = start_ts, end_ts
+    if cache:
+        try:
+            fetch_start = min(fetch_start, pd.Timestamp(cache["start"]))
+            fetch_end   = max(fetch_end,   pd.Timestamp(cache["end"]))
+        except Exception:
+            pass
+    try:
+        raw = yf.download(symbol, start=fetch_start.strftime("%Y-%m-%d"),
+                          end=fetch_end.strftime("%Y-%m-%d"), progress=False)
+    except Exception:
+        if cache and _covers(cache):          # stale fallback — old rows beat no rows
+            return _frame(cache).loc[start_ts:end_ts]
+        raise
+    if raw is None or len(raw) == 0:
+        if cache and _covers(cache):
+            return _frame(cache).loc[start_ts:end_ts]
+        return raw if raw is not None else pd.DataFrame()
+    if isinstance(raw.columns, pd.MultiIndex):
+        raw.columns = raw.columns.get_level_values(0)
+    close = raw["Close"].dropna()
+    idx = close.index
+    if getattr(idx, "tz", None) is not None:
+        idx = idx.tz_convert(None)
+    netcache.save_json(path, {
+        "as_of": time.time(),
+        "start": fetch_start.strftime("%Y-%m-%d"), "end": fetch_end.strftime("%Y-%m-%d"),
+        "close": {d.strftime("%Y-%m-%d"): float(v) for d, v in zip(idx.normalize(), close)},
+    })
+    out = pd.DataFrame({"Close": close.values}, index=idx.normalize())
+    return out.loc[start_ts:end_ts]
+
+
+def add_vix(df, start_date, end_date, data_dir="data"):
+    """Download VIX/VIX9D/VIX3M (session-stale disk cache, S70) and compute all VIX
+    feature columns."""
+    vix_raw   = _cached_close_frame("^VIX",   start_date, end_date, data_dir)
+    vix9d_raw = _cached_close_frame("^VIX9D", start_date, end_date, data_dir)
+    vix3m_raw = _cached_close_frame("^VIX3M", start_date, end_date, data_dir)
     df = compute_vix_features(df, vix_raw, vix9d_raw, vix3m_raw)
     print("  ✓ VIX, VIX_chg_5d, VIX_vs_ma20, VIX9D_VIX_ratio, VIX_VIX3M_ratio")
     return df

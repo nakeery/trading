@@ -1,7 +1,7 @@
 // Core report sections (print order): MARKET BACKDROP, MULTI-TIMEFRAME, DIVERGENCES,
 // VOLUME PROFILE, RALLY vs DRAWDOWN, SETUP CHECK — ports of the same-named sec_* renderers
 // in lens_web_sections.py, each mirroring its None/empty guard.
-import type { CSSProperties } from 'react'
+import { useState, type CSSProperties } from 'react'
 import type { Payload } from '../../api/types'
 import {
   AMBER, ARROW, BLUE, BLUEGRAY, GRAY, GREEN, HEAT_DEAD, INK, INTRADAY_TFS, OB, RED,
@@ -285,10 +285,12 @@ interface LadderRow {
 interface ProjLeg { value: number; pnl_mid_pct: number; pnl_ask_pct?: number | null; t_rem_days?: number }
 interface ProjRow {
   src: 'quoted' | 'modeled'
-  kind?: 'atm' | 'otm'
+  kind?: 'atm' | 'otm' | 'other'
   expiry?: string | null
   dte: number
   strike: number
+  moneyness?: number | null   // S69 — strike/spot − 1, labels the strike selector
+  delta?: number | null
   iv?: number | null
   iv_src?: string
   entry_mid?: number
@@ -327,25 +329,98 @@ const pnlS = (v: number | null | undefined) =>
 const pnlStyle = (v: number | null | undefined): CSSProperties | undefined =>
   v == null ? undefined : { color: v >= 0 ? GREEN : RED, fontWeight: 600 }
 
+/** S69 — expiry/strike multi-select. Every offered row is ALREADY repriced server-side
+ *  (modules/levelproj.py), so this only filters — no refetch, no Black-Scholes in TS. */
+function Picker({ label, options, selected, onChange }: {
+  label: string
+  options: { key: string; text: string }[]
+  selected: Set<string>
+  onChange: (s: Set<string>) => void
+}) {
+  if (options.length <= 1) return null
+  const toggle = (k: string) => {
+    const next = new Set(selected)
+    if (next.has(k)) next.delete(k)
+    else next.add(k)
+    if (next.size) onChange(next)          // never allow an empty table
+  }
+  return (
+    <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', margin: '4px 0' }}>
+      <span style={{ color: 'var(--muted)', fontSize: 11.5, minWidth: 46 }}>{label}</span>
+      {options.map((o) => {
+        const on = selected.has(o.key)
+        return (
+          <button
+            key={o.key}
+            onClick={() => toggle(o.key)}
+            style={{
+              cursor: 'pointer', fontSize: 11.5, padding: '2px 8px', borderRadius: 999,
+              border: `1px solid ${on ? BLUE : 'var(--border)'}`,
+              background: on ? hexToRgba(BLUE, 0.18) : 'transparent',
+              color: on ? 'var(--text)' : 'var(--muted)',
+            }}
+          >
+            {o.text}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
 /** S68 — "what would a move there look like": travel estimate + long-call repricing per
- *  key target. Purely additive under the ladder; absent projections render nothing. */
+ *  key target. Purely additive under the ladder; absent projections render nothing.
+ *  S69: four quoted tenors (~45d/~90d/~6mo/~1yr) and a per-expiry strike ladder, surfaced
+ *  through the two pickers; defaults to the ATM row of every tenor (the CLI's view). */
 function LadderProjections({ proj }: { proj: Projections }) {
   const qm = proj.quote_meta
   const src = qm
     ? `quoted contracts as of ${qm.as_of_str ?? '?'}${qm.stale ? ' — STALE, entries re-modeled at current spot' : ''}`
     : 'modeled, not a quote'
+  // YY-MM-DD (slice 2, not 5): a 2027 LEAP is ambiguous without the year
+  const expKey = (c: ProjRow) => (c.expiry ?? '') || `${c.dte.toFixed(0)}d`
+  const expText = (c: ProjRow) => `${(c.expiry ?? '').slice(2) || `${c.dte.toFixed(0)}d`} · ${c.dte.toFixed(0)}d`
   const contractName = (c: ProjRow) => (c.src === 'quoted'
-    ? `${(c.expiry ?? '').slice(5) || `${c.dte.toFixed(0)}d`} ${c.strike}C ${c.kind === 'atm' ? 'ATM' : 'OTM'}`
+    ? `${(c.expiry ?? '').slice(2) || `${c.dte.toFixed(0)}d`} ${c.dte.toFixed(0)}d ${c.strike}C`
+      + `${c.kind === 'atm' ? ' ATM' : c.kind === 'otm' ? ' OTMΔ' : ''}`
     : `~${c.dte.toFixed(0)}d ATM call (modeled${c.iv != null ? `, IV ${(c.iv * 100).toFixed(1)}% ${c.iv_src ?? ''}` : ''})`)
+
+  // every quoted expiry / strike across all targets — the pickers are shared, so switching
+  // target doesn't reset the selection
+  const all = proj.targets.flatMap((t) => t.contracts)
+  const expOpts = [...new Map(all.map((c) => [expKey(c), expText(c)])).entries()]
+    .map(([key, text]) => ({ key, text, dte: all.find((c) => expKey(c) === key)?.dte ?? 0 }))
+    .sort((a, b) => a.dte - b.dte)
+  const strikeOpts = [...new Set(all.map((c) => c.strike))].sort((a, b) => a - b)
+    .map((s) => {
+      const c = all.find((x) => x.strike === s)
+      const mny = c?.moneyness
+      return { key: String(s), text: mny != null ? `${s} (${pct1(mny)})` : String(s) }
+    })
+  const [expSel, setExpSel] = useState<Set<string> | null>(null)
+  const [strikeSel, setStrikeSel] = useState<Set<string> | null>(null)
+  // defaults: every tenor, ATM strike only — recomputed from the payload, so a regenerate
+  // (new spot → new ATM strike) doesn't leave a stale selection pinned
+  const defExp = new Set(expOpts.filter((o) => o.dte >= 150).map((o) => o.key))   // ~6mo+ (ATM) only
+  const defStrikes = new Set(all.filter((c) => c.kind === 'atm').map((c) => String(c.strike)))
+  const exps = expSel ?? defExp
+  const strikes = strikeSel ?? (defStrikes.size ? defStrikes : new Set(strikeOpts.map((o) => o.key)))
+
   return (
     <div style={{ marginTop: 10 }}>
       <div style={{ fontSize: 12, color: 'var(--muted)', marginBottom: 4 }}>
         level projections ({src} · IV held constant)
       </div>
+      {all.length > 0 && (
+        <div style={{ margin: '2px 0 8px' }}>
+          <Picker label="expiry" options={expOpts} selected={exps} onChange={setExpSel} />
+          <Picker label="strike" options={strikeOpts} selected={strikes} onChange={setStrikeSel} />
+        </div>
+      )}
       {proj.targets.map((t) => {
         let rows = t.contracts.length ? t.contracts : t.synthetic
-        if (t.kind !== 'your level' && t.contracts.length) {
-          rows = rows.filter((c) => c.kind === 'atm')   // mirror the CLI compactness rule
+        if (t.contracts.length) {
+          rows = rows.filter((c) => exps.has(expKey(c)) && strikes.has(String(c.strike)))
         }
         const ts = t.travel_sessions
         return (
@@ -363,8 +438,9 @@ function LadderProjections({ proj }: { proj: Projections }) {
             </div>
             {rows.length ? (
               <DataTable
-                rows={rows.slice(0, 4).map((c) => ({
+                rows={rows.map((c) => ({
                   contract: contractName(c),
+                  delta: c.delta != null ? c.delta.toFixed(2) : '—',
                   entry: c.src === 'quoted'
                     ? (c.entry_modeled ? `entry ≈ ${fmt2(c.entry_mid ?? 0)}` : `mid ${fmt2(c.entry_mid ?? 0)}`)
                     : `prem ≈ ${fmt2(c.premium ?? 0)}`,
@@ -377,6 +453,7 @@ function LadderProjections({ proj }: { proj: Projections }) {
                 }))}
                 columns={[
                   { key: 'contract', header: 'Contract' },
+                  { key: 'delta', header: 'Δ', align: 'right' },
                   { key: 'entry', header: 'Entry' },
                   { key: 'instant', header: 'At level (instant)', align: 'right' },
                   { key: 'paced', header: 'At level (paced)', align: 'right' },

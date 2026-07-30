@@ -1,6 +1,7 @@
 """TTL caches for the FastAPI backend (S60) — the st.cache_data replacement.
 
-Same cadences as lens_web.py's @st.cache_data decorators; `force=True` evicts the entry
+Same cadences as lens_web.py's @st.cache_data decorators — EXCEPT report_cache, which is
+session-stale since S70 (see below); `force=True` evicts the entry
 before recomputing (the Run button / live mode, mirroring generate_payload.clear).
 evict_ticker() mirrors lens_web.py's post-generate clears — a generate may have auto-refreshed
 the indicators CSV, so every per-ticker cache must drop that ticker or the chart shows a stale
@@ -8,10 +9,18 @@ data vintage vs the report.
 """
 
 import threading
+import time
 
 from cachetools import TTLCache
 
-report_cache = TTLCache(maxsize=64, ttl=120)       # (ticker, flags_key) → report bundle
+from modules import netcache
+
+# (ticker, flags_key) → (as_of_epoch, bundle). SESSION-STALE (S70), not a short TTL: a report
+# generated today is valid until the next market close — switching CRSP → SOFI → CRSP within a
+# day serves the morning's report instantly. The Run button (force) and live mode still bypass
+# via the /api/report endpoint; the boundary matches the pc_oi/gex/volquote chain caches.
+report_cache = {}
+_REPORT_MAX = 64
 frame_cache = TTLCache(maxsize=64, ttl=600)        # ticker → full daily frame
 iv_cache = TTLCache(maxsize=64, ttl=600)           # (ticker, asof) → iv history dict
 tile_cache = TTLCache(maxsize=256, ttl=600)        # ticker → watchlist tile
@@ -30,6 +39,29 @@ _PER_TICKER = (frame_cache, iv_cache, tile_cache, ledger_cache, season_cache, re
 # FastAPI's threadpool (the watchlist alone fires N parallel /api/tile calls) while
 # evict_ticker runs on the event-loop thread — one lock covers every mutation.
 _LOCK = threading.Lock()
+
+
+def get_report(key):
+    """Session-fresh report bundle for `key`, or None. Stale entries (a market close has
+    occurred since their generate) are pruned on sight."""
+    with _LOCK:
+        entry = report_cache.get(key)
+        if entry is None:
+            return None
+        as_of, bundle = entry
+        if not netcache.session_fresh(as_of):
+            report_cache.pop(key, None)
+            return None
+        return bundle
+
+
+def put_report(key, bundle):
+    """Store `bundle` stamped now; evict the oldest entries beyond _REPORT_MAX."""
+    with _LOCK:
+        report_cache[key] = (time.time(), bundle)
+        while len(report_cache) > _REPORT_MAX:
+            oldest = min(report_cache, key=lambda k: report_cache[k][0])
+            report_cache.pop(oldest, None)
 
 
 def cached(cache, key, fn, force=False):

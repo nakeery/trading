@@ -788,12 +788,24 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
                         if ts is not None else "")
                 lbl = f" · {t['label']}" if t.get("label") else ""
                 print(f"    → {t['kind']} {t['price']:.2f} ({t['dist_pct']:+.1%}{lbl}){pace}")
+                # ONE ATM row per tenor (S69). The old `rows[:4]` cap sliced an expiry-ordered
+                # list, so once callquote gained the 180d/365d tenors it would have silently
+                # truncated away exactly the long-dated rows this block exists to show. Selecting
+                # per tenor is cap-free and keeps every tenor visible; the web offers the full
+                # strike ladder behind its selectors.
                 rows = t.get("contracts") or t.get("synthetic") or []
-                if t["kind"] != "your level" and t.get("contracts"):
-                    rows = [c for c in rows if c.get("kind") == "atm"]   # keep it compact
+                if t.get("contracts"):
+                    by_tenor = {}
+                    for c in rows:
+                        key = c.get("expiry") or c.get("dte")
+                        if c.get("kind") == "atm" or key not in by_tenor:
+                            by_tenor.setdefault(key, c)
+                            if c.get("kind") == "atm":
+                                by_tenor[key] = c
+                    rows = sorted(by_tenor.values(), key=lambda c: c.get("dte") or 0)
                 if not rows:
                     print("        — (no IV available to model a call)")
-                for c in rows[:4]:
+                for c in rows:
                     inst, paced = c["instant"], c.get("paced")
                     pnl_i = f"{inst['pnl_mid_pct']:+.0%}"
                     v_p = f"{paced['value']:.2f}" if paced else "—"
@@ -805,11 +817,13 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
                     elif inst.get("pnl_ask_pct") is not None:
                         ask = f"  (at ask {inst['pnl_ask_pct']:+.0%})"
                     if c.get("src") == "quoted":
-                        exp = (c.get("expiry") or "")[5:] or f"{c['dte']:.0f}d"
+                        # YY-MM-DD, not MM-DD: a 2027 LEAP is ambiguous without the year
+                        # (same convention callquote already uses for its curve labels)
+                        exp = (c.get("expiry") or "")[2:] or f"{c['dte']:.0f}d"
                         kind_s = "ATM  " if c.get("kind") == "atm" else "OTM Δ"
                         entry_s = (f"entry≈ {c['entry_mid']:.2f}" if c.get("entry_modeled")
                                    else f"mid {c['entry_mid']:.2f}")
-                        print(f"        {exp} {c['strike']:g}C {kind_s} "
+                        print(f"        {exp} {c['dte']:.0f}d {c['strike']:g}C {kind_s} "
                               f"{entry_s} → {inst['value']:.2f} instant / "
                               f"{v_p} paced   {pnl_i} / {pnl_p}{ask}")
                     else:
@@ -1647,7 +1661,8 @@ def gather_report(ticker, args, interactive, backdrop_base):
         # masquerade as "next" (the S31 lesson, display edition).
         if earnings_dates is not None:
             try:
-                eds = sorted(pd.Timestamp(e).normalize() for e in (earnings_dates(ticker) or []))
+                eds = sorted(pd.Timestamp(e).normalize()
+                             for e in (earnings_dates(ticker, data_dir=args.data_dir) or []))
                 fut = [e for e in eds if e >= asof_ts]
                 if fut and (fut[0] - asof_ts).days <= 120:
                     earn = {"date": fut[0].date().isoformat(),
@@ -1656,7 +1671,7 @@ def gather_report(ticker, args, interactive, backdrop_base):
                 earn = None
     elif next_earnings is not None:
         try:
-            earn = next_earnings(ticker, daily=frames.get("1D"))
+            earn = next_earnings(ticker, daily=frames.get("1D"), data_dir=args.data_dir)
         except Exception:
             earn = None
 
@@ -1665,7 +1680,7 @@ def gather_report(ticker, args, interactive, backdrop_base):
     exd = None
     if asof_ts is None and next_ex_dividend is not None:
         try:
-            exd = next_ex_dividend(ticker)
+            exd = next_ex_dividend(ticker, data_dir=args.data_dir)
         except Exception:
             exd = None
 
@@ -1850,7 +1865,7 @@ def gather_report(ticker, args, interactive, backdrop_base):
             rs = (fetch_rs(ticker, frames["1D"], data_dir=args.data_dir,
                            extra=([ew] if ew else None))
                   if (fetch_rs is not None and "1D" in frames) else None)
-            beta = (fetch_beta(ticker, frames["1D"])
+            beta = (fetch_beta(ticker, frames["1D"], data_dir=args.data_dir)
                     if (fetch_beta is not None and "1D" in frames) else None)
             setup = setup_check(reads, profile=profile, ctx=ctx, earn=earn,
                                 macro_tier1_days=macro_t1, rs=rs, beta=beta, ex_div=exd)
@@ -2070,10 +2085,11 @@ if __name__ == "__main__":
                     help="Add a VOLATILITY SETUP block — Bollinger-Keltner squeeze, expected move + breakevens, "
                          "earnings catalyst, and a two-sided long-vol (straddle/strangle) vs short-vol scorecard.")
     ap.add_argument("--call", action="store_true",
-                    help="Add a LONG CALL VIABILITY block — ~45d/~90d monthly call quotes (ATM + "
+                    help="Add a LONG CALL VIABILITY block — ~45d/~90d/~6mo/~1yr call quotes (ATM + "
                          "~0.35-0.40 delta) with breakeven move, theta/day as %% of premium, an "
-                         "ATM-IV-by-expiry curve, and a chain liquidity grade. Network; needs "
-                         "TRADIER_TOKEN; cached like --vol.")
+                         "ATM-IV-by-expiry curve, and a chain liquidity grade. Also feeds the "
+                         "LEVEL PROJECTIONS block its quoted contracts + strike ladder. Network; "
+                         "needs TRADIER_TOKEN; cached like --vol.")
     ap.add_argument("--street", action="store_true",
                     help="Add a STREET & NEWS block — analyst price-target range, EPS estimate "
                          "revisions (30d momentum), upgrade/downgrade counts, and recent "

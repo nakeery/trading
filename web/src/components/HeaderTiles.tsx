@@ -5,6 +5,7 @@ import { useQuery } from '@tanstack/react-query'
 
 import { fetchAfterhours } from '../api/client'
 import type { AhRead, LastBar, LiveInfo, Payload, Range52 } from '../api/types'
+import { centerHex } from '../utils/colors'
 
 const AH_POLL_MS = 30_000       // extended-hours tape is thin; 30s is plenty and cheap
 
@@ -77,6 +78,7 @@ export default function HeaderTiles({ payload, range52, live: liveTick }: {
           label="52-week range"
           value={`${(range52.pos * 100).toFixed(0)}%`}
           sub={`${fmt(range52.lo)} – ${fmt(range52.hi)} · ${(range52.off_hi * 100).toFixed(1)}% off high`}
+          color={centerHex(range52.pos * 100) ?? undefined}
         />
       )}
       {ah && ah.last != null && (

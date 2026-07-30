@@ -14,10 +14,12 @@ has no dependency on entry.py; entry.py/pc_oi.py can later import these labelers
 """
 
 import os
+import time
 
 import numpy as np
 import pandas as pd
 
+from modules import netcache
 from modules.features import IV_RANK_WINDOW, compute_hv_features, add_vix
 from modules.regime import (
     classify_regime, REGIME_VIX_NORMAL, REGIME_VIX_STRESS, REGIME_TERM_STRESS,
@@ -187,6 +189,42 @@ def gap_gauges(df):
     return out
 
 
+def _fetch_tail(data_dir="data"):
+    """SKEW + VVIX close series (2y) behind a session-stale disk cache (S70) —
+    data/tail_cache.json {as_of, skew, vvix}. One batched yfinance download per session;
+    stale cache served on fetch failure. Returns (skew_series, vvix_series) — empty Series
+    on total failure. Never raises."""
+    path = os.path.join(data_dir, "tail_cache.json")
+    cache = netcache.load_json(path)
+
+    def _series(c, key):
+        d = (c or {}).get(key) or {}
+        if not d:
+            return pd.Series(dtype=float)
+        s = pd.Series({pd.Timestamp(k): float(v) for k, v in d.items()})
+        return s.sort_index()
+
+    if cache and netcache.session_fresh(cache.get("as_of")):
+        return _series(cache, "skew"), _series(cache, "vvix")
+    try:
+        import yfinance as yf
+        tail = yf.download(["^SKEW", "^VVIX"], period="2y", interval="1d",
+                           progress=False, auto_adjust=True)["Close"]
+        sk = tail["^SKEW"].dropna() if "^SKEW" in tail else pd.Series(dtype=float)
+        vv = tail["^VVIX"].dropna() if "^VVIX" in tail else pd.Series(dtype=float)
+
+        def _dump(s):
+            idx = s.index.tz_convert(None) if getattr(s.index, "tz", None) is not None else s.index
+            return {d.strftime("%Y-%m-%d"): float(v) for d, v in zip(idx.normalize(), s)}
+
+        netcache.save_json(path, {"as_of": time.time(), "skew": _dump(sk), "vvix": _dump(vv)})
+        return sk, vv
+    except Exception:
+        if cache:                                   # stale fallback — old rows beat no rows
+            return _series(cache, "skew"), _series(cache, "vvix")
+        return pd.Series(dtype=float), pd.Series(dtype=float)
+
+
 def gather_context(ticker, data_dir="data", with_vix=True, as_of=None):
     """
     Assemble the consolidated market-context gauges for `ticker`.
@@ -318,7 +356,7 @@ def gather_context(ticker, data_dir="data", with_vix=True, as_of=None):
         try:
             start = df.index.min().strftime("%Y-%m-%d")
             end   = (df.index.max() + pd.Timedelta(days=1)).strftime("%Y-%m-%d")
-            dfx   = add_vix(df.copy(), start, end)
+            dfx   = add_vix(df.copy(), start, end, data_dir=data_dir)
             rrow  = dfx.iloc[-1]
             regime = str(classify_regime(dfx).iloc[-1])
             vix = float(rrow["VIX"]) if pd.notna(rrow.get("VIX")) else None
@@ -344,11 +382,9 @@ def gather_context(ticker, data_dir="data", with_vix=True, as_of=None):
         # Display-only context, NEVER a model feature (S31 lesson); own try so a fetch miss
         # never costs the VIX gauges above.
         try:
-            import yfinance as yf
-            tail = yf.download(["^SKEW", "^VVIX"], period="2y", interval="1d",
-                               progress=False, auto_adjust=True)["Close"]
-            sk = tail["^SKEW"].dropna() if "^SKEW" in tail else pd.Series(dtype=float)
-            vv = tail["^VVIX"].dropna() if "^VVIX" in tail else pd.Series(dtype=float)
+            sk, vv = _fetch_tail(data_dir)
+            if not len(sk) and not len(vv):            # total miss with no cache to fall back on
+                notes.append("SKEW/VVIX unavailable — tail-risk gauges skipped.")
             if asof_ts is not None:                    # 2y fetch window — empty beyond it → skipped
                 def _cut(s):
                     if not len(s):

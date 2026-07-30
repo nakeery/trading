@@ -17,7 +17,7 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.staticfiles import StaticFiles
 
 from api import charts, loaders, reportgen
-from api.cache import afterhours_cache, cached, evict_ticker, report_cache
+from api.cache import afterhours_cache, cached, evict_ticker, get_report, put_report
 from api.sanitize import sanitize
 
 DATA_DIR = "data"
@@ -92,11 +92,12 @@ async def report(ticker: str,
 
     Serialized under GENERATE_LOCK — gather_report captures stdout via a process-global
     redirect, so generates must never run concurrently (keep this endpoint `async def`).
-    Cached 120s per (ticker, flags); `force` (the Run button) and live mode always refetch.
-    On success: LATEST[ticker] updated (the chart's payload source), per-ticker caches
-    evicted (the generate may have restamped the indicators CSV — data-vintage match), and
-    a day-over-day snapshot is saved + diffed (skipped in as-of mode: a backtest rerun must
-    not overwrite that date's real end-of-day snapshot)."""
+    Cached SESSION-STALE per (ticker, flags) (S70) — valid until the next market close, so
+    same-day ticker switch-backs are instant; `force` (the Run button) and live mode always
+    regenerate. On a real generate: LATEST[ticker] updated (the chart's payload source),
+    per-ticker caches evicted (the generate may have restamped the indicators CSV —
+    data-vintage match), and a day-over-day snapshot is saved + diffed (skipped in as-of
+    mode: a backtest rerun must not overwrite that date's real end-of-day snapshot)."""
     t = ticker.strip().upper()
     _check_date("as_of", as_of, allow_future=False)
     flags = {"vol": vol, "call": call, "gex": gex, "squeeze": squeeze, "insider": insider,
@@ -106,14 +107,11 @@ async def report(ticker: str,
              "thesis": thesis, "level": level or None, "as_of": as_of or None}
     key = (t, reportgen.flags_key(flags))
     async with reportgen.GENERATE_LOCK:
-        if force or flags["live"]:
-            report_cache.pop(key, None)
-        if key in report_cache:
-            bundle = report_cache[key]
-        else:
+        bundle = None if (force or flags["live"]) else get_report(key)
+        if bundle is None:
             bundle = await asyncio.to_thread(reportgen.generate, t, flags)
             if bundle["payload"] is not None:
-                report_cache[key] = bundle
+                put_report(key, bundle)
                 evict_ticker(t)
         if bundle["payload"] is not None:
             # LATEST must track the report the client is actually looking at — on cache HITS

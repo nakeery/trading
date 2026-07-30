@@ -332,6 +332,37 @@ lens_web.py specifics (S48, +S49 native visuals):
   (IV constant, no skew/vol-path, straight-line pace, not advice). As-of: cache read gated →
   synthetic-only (as-of ctx gauges are historically valid). Web: `LadderProjections` in
   core.tsx (DataTable per target). Tests 66–70 (test 36 untouched — rides inside ladder).
+- **S69 long tenors + expiry/strike pickers** (user request: "keep the current timeframe, but add
+  ones for about 6 months out, and about a year out as well" → then "add a dropdown … selecting
+  one or multiple strikes" and the same for expiries). The block was pricing 45/90 DTE while the
+  user trades 6–12mo calls (sizing.py MIN_DTE=180/MAX_DTE=365), so:
+  · `callquote.TARGET_DTES = (45, 90, 180, 365)`, SCOPEKEY `call2`→`call3`.
+  · **Long-tenor selection is grid-aware** — the LEAPS ladder is sparse and ticker-specific, so a
+    naive nearest-monthly mislabels: SOFI's monthlies run 169 → 232 → 505 (nearest to 365 is 133
+    days off) while a NON-monthly 322d LEAP is the real 1-year contract; CRSP has 171 then 542
+    and no 1-year tenor at all. Rule: prefer monthlies while one is inside `tenor_tol` =
+    ±max(30, 0.35×target); past `LONG_DTE_MIN`=150 widen the pool to every listed expiry; OMIT a
+    target with nothing inside tolerance. Verified against real grids — SOFI→322, CRSP→no row,
+    QQQ→414 (the liquid monthly beats the closer 335d quarterly, since 414 is inside tolerance).
+    Rows are ALWAYS labeled with the actual expiry+DTE, never the target.
+  · **`strike_ladder`** — ≤`LADDER_MAX`=9 tradeable calls within ±`LADDER_PCT`=25% of spot, off
+    the SAME parsed chain rows the ATM pick already used (zero extra network), tagged
+    atm/otm/other + `moneyness`. Rides each block as `ladder`; `levelproj` reprices ALL of them
+    server-side so the web pickers only FILTER — no Black-Scholes duplicated in TS (the
+    api/charts.py precedent). Pre-S69 caches (atm/otm, no ladder) still reprice.
+  · **Net chain calls unchanged (~7, measured both ways)**: the quote expiries seed `curve_pts`,
+    so the two new tenors consume the curve's `CURVE_MAX_EXPIRIES` budget instead of adding to it
+    — and the curve now reaches 322d instead of 232d for free.
+  · Synthetic legs `(30, 180, 365)` with a real IV chain: harvested gauge → `curve_iv` (nearest
+    curve point, `max_gap`=120d) → HV-20 proxy, each labeled. **The 180d synthetic row was dead
+    code**: it was keyed to `atm_iv_180d`, which is empty in EVERY indicators CSV on disk.
+  · CLI: one ATM row per tenor. The old `rows[:4]` sliced an expiry-ordered list and would have
+    silently truncated away exactly the new long-dated rows — the trap this change had to dodge.
+    Labels use `YY-MM-DD` + DTE (`expiry[2:]`); `[5:]` dropped the year and made a 2027 LEAP
+    ambiguous.
+  · **Also found (NOT fixed, needs a session)**: the Massive harvest looks stalled —
+    `atm_iv_30d` last stamped 2026-06-19 (SOFI) / 06-23 (QQQ), and `atm_iv_180d` has never been
+    populated since S47 shipped. Degrades every IV gauge and the no---call synthetic path.
 
 Modules the lens/web stack uses
 -------------------------------
@@ -355,9 +386,10 @@ Modules the lens/web stack uses
   the em factor was REMOVED S43 — it duplicated IV/HV and could flip the verdict alone) +
   earnings-aware ATM straddle / auto-strangle pricer (post-earnings expiries, liquidity-snapped
   wings, at-ask honesty lines, no-bid flags).
-- `callquote.py` — --call: 45/90-DTE monthly ATM + ~0.375Δ call quotes (BE move, theta/day as %
-  of premium), IV-by-expiry curve to LEAPS tenors (≤400 DTE, S47), chain `liquidity_grade`
-  (tight/ok/wide/dead) + `cached_liquidity` zero-network default-on line.
+- `callquote.py` — --call: ATM + ~0.375Δ call quotes (BE move, theta/day as % of premium) at
+  `TARGET_DTES`, IV-by-expiry curve to LEAPS tenors (≤400 DTE, S47), chain `liquidity_grade`
+  (tight/ok/wide/dead) + `cached_liquidity` zero-network default-on line. **S69**: tenors are
+  `(45, 90, 180, 365)` + a per-expiry `strike_ladder` — see the S69 entry below.
 - `vol_history.py` — pre-earnings IV ramp/crush/straddle-P&L study off on-disk IV; prefers
   `atm_iv_event` when all three sessions have it (never mixes tenors); MIN_USABLE=3.
 - `pc_oi.py` (--pc-oi), `shortint.py` (--squeeze; NASDAQ-listed only), `setupcheck.py`

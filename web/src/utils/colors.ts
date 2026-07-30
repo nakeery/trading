@@ -74,6 +74,15 @@ export function rsiHex(rsi: number | null | undefined): string | null {
   return rampHex(0.5 - (0.5 * d) / Math.max(RSI_FULL - RSI_DEAD, 1e-9))
 }
 
+/** Symmetric center-anchored tint: center of a 0–100 scale → green, either extreme → red,
+ *  amber in between. For stats like the 52-week range position where BOTH extremes (sitting
+ *  at the low OR the high) are the "notable" ends, unlike heatHex's monotonic low→high ramp. */
+export function centerHex(pos: number | null | undefined, center = 50, span = 50): string | null {
+  if (pos == null) return null
+  const dist = Math.min(Math.abs(pos - center) / span, 1)
+  return rampHex(1 - dist)
+}
+
 /** Verdict pill color from NET-line keywords; gray when the tilt isn't obvious. */
 export function netColor(text: string | null | undefined): string {
   const t = (text ?? '').toLowerCase()

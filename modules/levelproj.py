@@ -10,6 +10,12 @@ harvested IV when no quote exists. Each contract shows TWO numbers: value if spo
 immediately (T unchanged) and at the recent pace (T reduced by the travel estimate — the
 theta cost of a slow grind made explicit).
 
+S69: callquote now quotes four tenors (~45d/~90d/~6mo/~1yr — the last two are what this
+project actually trades) and hands over a bounded STRIKE LADDER per expiry. Every candidate is
+repriced here, server-side, so the web expiry/strike selectors just filter rows that already
+exist and no Black-Scholes is duplicated in TypeScript. Renderers default to the ATM row per
+tenor (`kind == "atm"`).
+
 Honesty posture (S43): IV held constant (no skew shift, no vol path), the pace estimate is
 a straight-line sigma-days heuristic (a random-walk first-passage read would be slower),
 synthetic premiums carry no spread/fees — the caveat line prints unconditionally. Display
@@ -24,7 +30,11 @@ from datetime import date
 from modules.bs_invert import black_scholes_call
 
 RISK_FREE = 0.04        # matches gex.RISK_FREE — level, not sensitivity-critical
-SYNTH_DTES = (30, 180)  # 30d = the harvested ATM IV tenor; 180d = the LEAPS entry tenor
+# 30d = the harvested ATM IV tenor; 180d/365d (S69) = the tenors this project trades. The long legs
+# used to be dead in practice: they were keyed to the `atm_iv_180d` gauge, which has never been
+# populated in any indicators CSV, so the row silently vanished. They now source IV from the --call
+# IV-by-expiry curve (already cached, zero network) and fall back to the HV-20 proxy.
+SYNTH_DTES = (30, 180, 365)
 MAX_ZONE_TARGETS = 2    # confluence zones beyond user/S/R, nearest by |dist|
 MAX_TRAVEL_SESSIONS = 252
 PACE_NOTE = ("sessions = |move| / avg daily move (HV-20/sqrt252) — straight-line; "
@@ -105,6 +115,41 @@ def synthetic_call(spot, target, iv, dte, r=RISK_FREE, travel_td=None,
     return out
 
 
+def curve_iv(callq, dte, max_gap=120):
+    """PURE: nearest ATM IV to `dte` from the --call IV-by-expiry curve, or None (S69).
+    The curve is already in the cached quote blob (reaches ~170-250 DTE for every tracked
+    ticker) and costs nothing to read — it is the only working long-tenor IV source, since the
+    harvested `atm_iv_180d` column has never been populated. `max_gap` keeps a 22d front point
+    from standing in for a 365d tenor."""
+    pts = ((callq or {}).get("curve") or {}).get("points") or []
+    usable = [p for p in pts if p.get("iv") and p.get("dte") is not None]
+    if not usable or dte is None:
+        return None
+    best = min(usable, key=lambda p: abs(p["dte"] - dte))
+    if abs(best["dte"] - dte) > max_gap:
+        return None
+    return float(best["iv"]), int(best["dte"])
+
+
+def _synth_legs(callq, iv30, iv180, hv20):
+    """PURE: the (dte, iv, source-label) table for the modeled fallback rows (S69).
+    Per tenor the IV preference is: harvested gauge → --call curve → HV-20 proxy. Each row is
+    labeled with what it actually used, so a proxy is never mistaken for a real quote."""
+    out = []
+    for dte in SYNTH_DTES:
+        gauge = iv30 if dte <= 45 else (iv180 if dte <= 240 else None)
+        label = "ATM IV (30d)" if dte <= 45 else "ATM IV (180d)"
+        if gauge:
+            out.append((dte, gauge, label))
+            continue
+        cv = curve_iv(callq, dte)
+        if cv:
+            out.append((dte, cv[0], f"chain IV ~{cv[1]}d"))
+        elif hv20:
+            out.append((dte, hv20, "HV-20 proxy"))
+    return out
+
+
 def _pick_targets(ladder):
     """Key targets in priority order: your --level, nearest support, nearest resistance,
     then the nearest MAX_ZONE_TARGETS confluence-zone rows. Deduped within ±0.5% relative
@@ -163,10 +208,17 @@ def project_targets(ladder, hv20=None, callq=None, iv30=None, iv180=None, r=RISK
             dte = max((date.fromisoformat(expiry) - today).days, 0)
         except (TypeError, ValueError):
             pass
-        for kind in ("atm", "otm"):
-            cand = blk.get(kind)
-            if not (cand and cand.get("iv") and cand.get("mid")):
-                continue
+        # S69: price the whole per-expiry strike LADDER when present (the web strike selector
+        # filters these client-side, so every offered strike must already be repriced here).
+        # Pre-S69 blocks carry only atm/otm — fall back so an old cache still renders.
+        cands = blk.get("ladder")
+        if cands:
+            cands = [dict(c) for c in cands if c.get("iv") and c.get("mid")]
+        else:
+            cands = [dict(blk[k], kind=k) for k in ("atm", "otm")
+                     if (blk.get(k) or {}).get("iv") and (blk.get(k) or {}).get("mid")]
+        for cand in cands:
+            kind = cand.get("kind") or "other"
             modeled_entry = False
             if stale and spot:
                 m = black_scholes_call(float(spot), float(cand["strike"]), r,
@@ -187,13 +239,13 @@ def project_targets(ladder, hv20=None, callq=None, iv30=None, iv180=None, r=RISK
                 c["kind"] = kind
                 c["src"] = "quoted"
                 c["entry_modeled"] = modeled_entry
+                # carried through for the web strike selector's labels (S69)
+                c["moneyness"] = cand.get("moneyness")
+                c["delta"] = cand.get("delta")
                 t["contracts"].append(c)
         if not t["contracts"]:            # synthetic fallback — modeled, not a quote
-            iv1 = iv30 if iv30 else hv20
-            src1 = "ATM IV (30d)" if iv30 else "HV-20 proxy"
-            for dte, iv, src in ((SYNTH_DTES[0], iv1, src1), (SYNTH_DTES[1], iv180, "ATM IV (180d)")):
-                s = synthetic_call(spot, t["price"], iv, dte, r=r, travel_td=tsess,
-                                   iv_src=src) if iv else None
+            for dte, iv, src in _synth_legs(callq, iv30, iv180, hv20):
+                s = synthetic_call(spot, t["price"], iv, dte, r=r, travel_td=tsess, iv_src=src)
                 if s:
                     s["src"] = "modeled"
                     t["synthetic"].append(s)

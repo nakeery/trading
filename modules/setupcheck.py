@@ -10,7 +10,12 @@ unconfirmed rally, paying very-rich vol, or sitting on an earnings print uninten
 Marks: ✓ favorable · ✗ against · – flagged/neutral/unavailable. Every row carries its reading.
 """
 
+import os
+import time
+
 import pandas as pd
+
+from modules import netcache
 
 TIER1_MACRO = {"FOMC", "CPI", "NFP", "PCE"}   # mirror econ_calendar Tier-1 (display-only here)
 RS_HORIZONS = (20, 63)                        # sessions — classic momentum/RS lookbacks
@@ -29,6 +34,64 @@ def rel_strength(closes, bench_closes, horizons=RS_HORIZONS):
     return out or None
 
 
+def _cached_closes(syms, data_dir="data"):
+    """Per-symbol 6mo daily closes behind a session-stale disk cache (S70) —
+    data/rs_cache/{sym}.json {as_of, close}. Stale/missing symbols batch into ONE
+    yf.download; per-symbol stale fallback when the download misses. SPY dedupes across
+    fetch_rs, fetch_beta, and tickers sharing a benchmark. Returns a close DataFrame
+    (one column per resolved symbol) or None. Never raises."""
+    try:
+        import yfinance as yf
+        syms = list(dict.fromkeys(syms))
+
+        def _path(s):
+            return os.path.join(data_dir, "rs_cache", f"{s.strip('^').lower()}.json")
+
+        def _ser(c):
+            s = pd.Series({pd.Timestamp(k): float(v) for k, v in (c.get("close") or {}).items()})
+            return s.sort_index()
+
+        series, stale = {}, []
+        for s in syms:
+            c = netcache.load_json(_path(s))
+            if c and netcache.session_fresh(c.get("as_of")) and c.get("close"):
+                series[s] = _ser(c)
+            else:
+                stale.append((s, c))
+        if stale:
+            close = None
+            try:
+                raw = yf.download([s for s, _ in stale], period="6mo", interval="1d",
+                                  progress=False, auto_adjust=True)
+                if raw is not None and len(raw):
+                    # per-symbol Close columns in both shapes (the S61 _close_frame lesson): a
+                    # list download returns MultiIndex (field, symbol); yfinance flattens to
+                    # single-level columns when exactly one symbol survives
+                    if isinstance(raw.columns, pd.MultiIndex):
+                        close = raw["Close"]
+                    else:
+                        close = raw[["Close"]].rename(columns={"Close": stale[0][0]})
+            except Exception:
+                close = None
+            for s, c in stale:
+                ser = close[s].dropna() if (close is not None and s in close.columns) else None
+                if ser is not None and len(ser):
+                    idx = (ser.index.tz_convert(None)
+                           if getattr(ser.index, "tz", None) is not None else ser.index)
+                    netcache.save_json(_path(s), {
+                        "as_of": time.time(),
+                        "close": {d.strftime("%Y-%m-%d"): float(v)
+                                  for d, v in zip(idx.normalize(), ser)}})
+                    series[s] = ser
+                elif c and c.get("close"):              # stale fallback — old rows beat no rows
+                    series[s] = _ser(c)
+        if not series:
+            return None
+        return pd.concat(series, axis=1)
+    except Exception:
+        return None
+
+
 def fetch_rs(ticker, daily, data_dir="data", extra=None):
     """Best-effort relative strength vs the ticker's sector benchmark (TICKER_BENCHMARK first
     entry; SPY fallback). One yfinance daily fetch; returns {bench, rs:{h: diff}} or None.
@@ -37,22 +100,14 @@ def fetch_rs(ticker, daily, data_dir="data", extra=None):
     that computes lands in out["extra"][sym] = {"label", "rs": {h: diff}}. With extra=None the
     return shape and the benchmark math are unchanged (no "extra" key)."""
     try:
-        import yfinance as yf
         from modules.benchmarks import TICKER_BENCHMARK
         pairs = TICKER_BENCHMARK.get(ticker.upper())
         sym, name = (pairs[0] if pairs else ("SPY", "SPY"))
         extras = [(s, lbl) for s, lbl in (extra or []) if s != sym]
         syms = [sym] + [s for s, _ in extras]
-        raw = yf.download(syms, period="6mo", interval="1d", progress=False, auto_adjust=True)
-        if raw is None or len(raw) == 0:
+        close = _cached_closes(syms, data_dir)          # session-stale cache (S70)
+        if close is None or len(close) == 0:
             return None
-        # per-symbol Close columns in both shapes (the S61 _close_frame lesson): a list
-        # download returns MultiIndex (field, symbol); yfinance flattens to single-level
-        # columns when exactly one symbol survives
-        if isinstance(raw.columns, pd.MultiIndex):
-            close = raw["Close"]
-        else:
-            close = raw[["Close"]].rename(columns={"Close": syms[0]})
 
         def _rs_vs(s):
             if s not in close.columns:
@@ -94,18 +149,20 @@ def beta_corr(closes, bench_closes, window=60):
             "corr": float(df["s"].corr(df["m"])), "n": len(df)}
 
 
-def fetch_beta(ticker, daily, window=60):
+def fetch_beta(ticker, daily, window=60, data_dir="data"):
     """Best-effort 60d beta/corr vs SPY (S46) — how much the MARKET BACKDROP applies to THIS name.
-    One yfinance daily fetch, aligned to the common last date like fetch_rs; None on any failure."""
+    SPY closes come from the shared session-stale rs_cache (S70) — a pure cache hit whenever
+    fetch_rs already pulled SPY this session. Aligned to the common last date like fetch_rs;
+    None on any failure."""
     try:
-        import yfinance as yf
-        raw = yf.download("SPY", period="6mo", interval="1d", progress=False, auto_adjust=True)
-        if raw is None or len(raw) == 0:
+        close = _cached_closes(("SPY",), data_dir)
+        if close is None or "SPY" not in close.columns:
             return None
-        if isinstance(raw.columns, pd.MultiIndex):
-            raw.columns = raw.columns.get_level_values(0)
-        last = min(daily.index[-1], raw.index[-1])
-        return beta_corr(daily.loc[:last, "Close"], raw.loc[:last, "Close"], window=window)
+        ser = close["SPY"].dropna()
+        if not len(ser):
+            return None
+        last = min(daily.index[-1], ser.index[-1])
+        return beta_corr(daily.loc[:last, "Close"], ser.loc[:last], window=window)
     except Exception:
         return None
 

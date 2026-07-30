@@ -22,11 +22,26 @@ import time
 from modules.tradier import TRADIER_TOKEN, get_current_price, get_expirations, get_chain
 from modules.pc_oi import _cache_path, cache_stale, _cache_age, _hhmm, is_monthly_expiry
 
-SCOPEKEY = "call2"           # bumped when the cached payload shape changes (S47: LEAPS-reach curve)
-TARGET_DTES = (45, 90)       # research consensus: 45–60d+ slows theta; ~90d = swing tenor
+SCOPEKEY = "call3"           # bumped when the cached payload shape changes (S69: per-expiry ladder)
+# ~45d/~90d = the research-consensus short tenors (45–60d+ slows theta, ~90d swing). 180/365 (S69)
+# are the tenors this project actually TRADES — archive/ml_pipeline/sizing.py targets MIN_DTE=180 /
+# MAX_DTE=365 — so the level projections can price the instrument the user actually buys.
+TARGET_DTES = (45, 90, 180, 365)
 OTM_DELTA = 0.375            # midpoint of the 0.35–0.40Δ trend band
 CURVE_MAX_DTE = 400          # IV-by-expiry curve horizon — reaches the LEAPS tenors (S47)
 CURVE_MAX_EXPIRIES = 7       # …and its API-call budget (1 chain call per expiry)
+# Long-tenor expiry selection (S69). Out past ~5 months the monthly grid goes sparse and
+# ticker-specific: SOFI jumps 232d → 505d with only a NON-monthly 322d in between, so a
+# monthly-only pick would label 232d (7.6mo) as "~1yr". Past LONG_DTE_MIN the pool widens to every
+# listed expiry, and a pick further than tenor_tol() from target is dropped rather than mislabeled
+# (CRSP has 171d then 542d — it simply has no 1-year tenor).
+LONG_DTE_MIN = 150
+TENOR_TOL_FRAC = 0.35        # ±35% of target (±128d at 365) …
+TENOR_TOL_MIN = 30           # … with a floor so short tenors keep a usable window
+# Per-expiry strike ladder (S69) — the chain rows are already fetched for the ATM/OTM pick, so
+# retaining a bounded ladder costs ZERO extra network. Feeds the web strike selector.
+LADDER_PCT = 0.25            # keep tradeable calls within ±25% of spot …
+LADDER_MAX = 9               # … nearest-to-spot first, capped (payload size + a usable dropdown)
 # Liquidity-grade bands — ATM region = the 5 strikes nearest spot, calls + puts:
 LIQ_TIGHT_SPR = 0.01         # median spread ≤1% of mid (and OI ≥ LIQ_TIGHT_OI) → "tight"
 LIQ_OK_SPR    = 0.03         # ≤3% → "ok"
@@ -156,17 +171,69 @@ def curve_read(points):
     return {"points": [{"label": l, "dte": d, "iv": float(iv)} for l, d, iv in pts], "tag": tag}
 
 
-def _select_expiries(future, targets=TARGET_DTES):
-    """PURE: nearest MONTHLY (liquidity) to each target DTE, deduped, sorted by dte."""
+def tenor_tol(target):
+    """PURE: how far from `target` DTE an expiry may sit and still represent that tenor (S69)."""
+    return max(TENOR_TOL_MIN, TENOR_TOL_FRAC * target)
+
+
+def _select_expiries(future, targets=TARGET_DTES, long_dte_min=LONG_DTE_MIN):
+    """PURE: nearest expiry to each target DTE, deduped, sorted by dte.
+
+    Monthlies (3rd Friday = liquidity) are preferred. For targets at/above `long_dte_min` the pool
+    widens to EVERY listed expiry when no monthly lands within tolerance — out past ~5 months the
+    grid is sparse and ticker-specific, and a non-monthly LEAP that is 43 days off target beats a
+    monthly that is 133 days off (the SOFI 322d-vs-232d case). A target with nothing inside
+    `tenor_tol` is OMITTED, so a tenor is never mislabeled (CRSP: 171d then 542d = no 1yr)."""
     monthlies = [(e, d) for e, d in future
                  if is_monthly_expiry(datetime.date.fromisoformat(e))]
-    pool = monthlies or future
     sel = []
     for t in targets:
-        e, d = min(pool, key=lambda ed: abs(ed[1] - t))
-        if all(e != s[0] for s in sel):
-            sel.append((e, d))
+        tol = tenor_tol(t)
+        best = None
+        for pool in ((monthlies or future), future if t >= long_dte_min else []):
+            if not pool:
+                continue
+            e, d = min(pool, key=lambda ed: abs(ed[1] - t))
+            if abs(d - t) <= tol:
+                best = (e, d)
+                break                     # monthly inside tolerance wins — don't widen
+        if best and all(best[0] != s[0] for s in sel):
+            sel.append(best)
     return sorted(sel, key=lambda s: s[1])
+
+
+def strike_ladder(rows, spot, max_n=LADDER_MAX, pct=LADDER_PCT, otm_delta=OTM_DELTA):
+    """PURE: parsed chain rows → a bounded ladder of tradeable call candidates around spot (S69),
+    nearest-to-spot first, each formatted by `_candidate` so mid/iv/delta/oi/spread semantics match
+    the ATM/OTM blocks exactly. Every entry carries `kind` ('atm' / 'otm' for the ~0.375Δ pick /
+    'other') and `moneyness` so a strike selector can label itself. Zero network — these rows were
+    already fetched for the ATM pick."""
+    calls = [r for r in rows if r["type"] == "call" and (r.get("bid") or 0) > 0]
+    if not calls or not spot:
+        return []
+    atm, otm = pick_call_candidates(rows, spot, otm_delta=otm_delta)
+    atm_k = atm["strike"] if atm else None
+    otm_k = otm["strike"] if otm else None
+    near = [r for r in calls if abs(r["strike"] - spot) / spot <= pct]
+    near.sort(key=lambda r: abs(r["strike"] - spot))
+    out = []
+    for r in near[:max_n]:
+        c = _candidate(r, spot)
+        if not c:
+            continue
+        c["kind"] = ("atm" if r["strike"] == atm_k
+                     else "otm" if r["strike"] == otm_k else "other")
+        c["moneyness"] = r["strike"] / spot - 1.0
+        out.append(c)
+    # the ~0.375Δ pick can sit outside `pct` on a wide chain — never lose it, the CLI/default rows
+    # and the pre-S69 `otm` block both reference that strike
+    if otm_k is not None and all(c["strike"] != otm_k for c in out):
+        c = _candidate(otm, spot)
+        if c:
+            c["kind"] = "otm"
+            c["moneyness"] = otm_k / spot - 1.0
+            out.append(c)
+    return sorted(out, key=lambda c: c["strike"])
 
 
 def _fetch(ticker, earnings_date=None, ex_div_date=None):
@@ -203,7 +270,10 @@ def _fetch(ticker, earnings_date=None, ex_div_date=None):
             continue
         blk = {"expiry": e, "dte": d,
                "monthly": is_monthly_expiry(datetime.date.fromisoformat(e)),
-               "atm": cand, "otm": _candidate(otm, spot), "notes": []}
+               "atm": cand, "otm": _candidate(otm, spot),
+               # S69: the full bounded ladder off the SAME parsed rows (no extra call) — the
+               # level-projection strike selector prices any of these
+               "ladder": strike_ladder(rows, spot), "notes": []}
         ed = datetime.date.fromisoformat(e)
         if earn is not None and earn_days is not None and 0 <= earn_days <= 45:
             blk["notes"].append("expires BEFORE earnings — no event exposure" if ed <= earn else
@@ -219,7 +289,12 @@ def _fetch(ticker, earnings_date=None, ex_div_date=None):
     if not blocks:
         return None
 
-    # extend the IV curve with additional monthlies (budget-capped: 1 chain call per expiry)
+    # Extend the IV curve with additional monthlies (budget-capped: 1 chain call per expiry).
+    # The quote expiries above already seeded curve_pts, and this loop skips anything within 2
+    # days of an existing point while breaking at CURVE_MAX_EXPIRIES — so S69's two extra quote
+    # tenors consume curve budget rather than adding to it, and the total chain-call count per
+    # --call run is unchanged (~7). A >CURVE_MAX_DTE quote expiry (a 431d 1yr pick) stays in the
+    # curve: it is a tenor actually being quoted, so the curve should show it.
     monthlies = [(e, d) for e, d in future
                  if d <= CURVE_MAX_DTE and is_monthly_expiry(datetime.date.fromisoformat(e))]
     for e, d in sorted(monthlies, key=lambda ed: ed[1]):

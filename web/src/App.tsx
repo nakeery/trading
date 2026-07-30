@@ -8,6 +8,7 @@ import { useQuery } from '@tanstack/react-query'
 import { fetchReport, fetchTickers, flagsToParams } from './api/client'
 import type { Flags } from './api/types'
 import { readUrl, writeUrl } from './hooks/useUrlState'
+import { msUntilNextClose } from './utils/session'
 import TopBar from './components/TopBar'
 import StatusLog from './components/StatusLog'
 import CandleChart from './components/CandleChart'
@@ -93,6 +94,12 @@ export default function App() {
     queryKey: ['report', reqKey, req?.force ? req.nonce : 0],
     queryFn: () => fetchReport(req!.ticker, req!.flags, req!.force),
     enabled: req !== null,
+    // S70: session-aligned staleness — switching A→B→A within the day renders the cached
+    // payload with NO background refetch (the server's report cache is session-stale too, so
+    // both boundaries coincide at the next market close). Run (force) bumps the nonce → new
+    // query key → always fetches; live mode carries live=1 → the server regenerates.
+    staleTime: msUntilNextClose(),
+    gcTime: 24 * 3600 * 1000,
   })
 
   const pickTicker = (t: string) => {
@@ -101,7 +108,7 @@ export default function App() {
     const newKey = `${t}|${flagsToParams(flags).toString()}`
     if (req && newKey === reqKey) {
       // same-key pick: setReq would be a no-op (identical query key never refetches) —
-      // re-ask the server instead; its 120s report cache still absorbs rapid repeats
+      // re-ask the server instead; its session-stale report cache absorbs the repeat (S70)
       void report.refetch()
       return
     }
