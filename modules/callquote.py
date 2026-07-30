@@ -22,23 +22,30 @@ import time
 from modules.tradier import TRADIER_TOKEN, get_current_price, get_expirations, get_chain
 from modules.pc_oi import _cache_path, cache_stale, _cache_age, _hhmm
 
-SCOPEKEY = "call4"           # bumped when the cached payload shape changes (S72: every monthly)
+SCOPEKEY = "call5"           # bumped when the cached payload shape changes (S73: wider ladder)
 # S72 — EXPIRY WINDOW. Superseded the S69 "nearest expiry to each of 4 target DTEs" rule, which
 # quoted only 4 expiries and silently hid the rest: SOFI lists monthlies at 113/141/232 DTE that
 # never appeared. Now every MONTHLY inside the window is quoted, and the picker shows them all —
 # so the user chooses the tenor instead of the code guessing which 4 they meant. Widen/narrow
 # here; each added expiry is one Tradier chain call (~0.55s measured).
-EXPIRY_MIN_DTE = 20          # below this it's weekly/gamma territory, not a long-call tenor
-EXPIRY_MAX_DTE = 550         # ~18mo — past the next Jan LEAP; beyond it OI thins out badly
-MAX_EXPIRIES = 12            # network cap, nearest-first (rarely binds: 10 SOFI / 12 QQQ / 5 CRSP)
+# S73: the window is now effectively open — EVERY listed monthly is quoted (measured: 12 SOFI,
+# 14 QQQ, 13 AMD, 5 CRSP, out to ~869 DTE). The bounds remain as guard rails, not curation.
+EXPIRY_MIN_DTE = 0           # every future monthly, including the one expiring this month
+EXPIRY_MAX_DTE = 1100        # ~3y — past the furthest LEAP any tracked ticker lists (869d)
+MAX_EXPIRIES = 20            # hard network guard; does not bind on any tracked ticker today
 # The tenors the CLI curates down to — a terminal can't have a picker, and 12 expiries × 5 targets
 # would be 60 rows. The WEB gets every expiry; the CLI shows the nearest monthly to each of these.
 TARGET_DTES = (45, 90, 180, 365)
 OTM_DELTA = 0.375            # midpoint of the 0.35–0.40Δ trend band
 # Per-expiry strike ladder (S69) — the chain rows are already fetched for the ATM/OTM pick, so
 # retaining a bounded ladder costs ZERO extra network. Feeds the web strike selector.
-LADDER_PCT = 0.25            # keep tradeable calls within ±25% of spot …
-LADDER_MAX = 9               # … nearest-to-spot first, capped (payload size + a usable dropdown)
+# S73: NOT "every strike" — QQQ lists 2,661 tradeable calls across its monthlies (149 inside
+# ±25% alone, strikes 205-1115 against a 684 spot); unbounded measured out at a ~3MB payload,
+# ~13k repriced rows and a 200-pill picker. Instead the server keeps the nearest `LADDER_MAX`
+# and the WEB picks how many of them to show ("strikes around spot"), so the choice is the
+# user's and the payload stays bounded.
+LADDER_PCT = 0.40            # tradeable calls within ±40% of spot …
+LADDER_MAX = 25              # … the nearest this many (= the web strike-count picker's ceiling)
 # Liquidity-grade bands — ATM region = the 5 strikes nearest spot, calls + puts:
 LIQ_TIGHT_SPR = 0.01         # median spread ≤1% of mid (and OI ≥ LIQ_TIGHT_OI) → "tight"
 LIQ_OK_SPR    = 0.03         # ≤3% → "ok"
@@ -229,10 +236,16 @@ def nearest_to_targets(pairs, targets=TARGET_DTES):
 
 def strike_ladder(rows, spot, max_n=LADDER_MAX, pct=LADDER_PCT, otm_delta=OTM_DELTA):
     """PURE: parsed chain rows → a bounded ladder of tradeable call candidates around spot (S69),
-    nearest-to-spot first, each formatted by `_candidate` so mid/iv/delta/oi/spread semantics match
-    the ATM/OTM blocks exactly. Every entry carries `kind` ('atm' / 'otm' for the ~0.375Δ pick /
-    'other') and `moneyness` so a strike selector can label itself. Zero network — these rows were
-    already fetched for the ATM pick."""
+    each formatted by `_candidate` so mid/iv/delta/oi/spread semantics match the ATM/OTM blocks
+    exactly. Every entry carries `kind` ('atm' / 'otm' for the ~0.375Δ pick / 'other') and
+    `moneyness` so a strike selector can label itself. Zero network — these rows were already
+    fetched for the ATM pick.
+
+    S73: the ladder is the `max_n` strikes NEAREST SPOT inside the band — dense and adjacent,
+    because the web control on top of it is "how many strikes around spot to view". An earlier
+    attempt sampled evenly across the whole ±band so it would span 415-955 on QQQ, but that put
+    ~$20 between adjacent rungs, so "show me 3 strikes around spot" returned spot ±$20 instead of
+    the three actually-adjacent strikes. Reach is the expiry picker's job; this axis is proximity."""
     calls = [r for r in rows if r["type"] == "call" and (r.get("bid") or 0) > 0]
     if not calls or not spot:
         return []

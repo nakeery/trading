@@ -1025,12 +1025,12 @@ def test_callquote_helpers():
     assert curve_read([("Aug21", 46, 0.28)]) is None
     assert curve_read([("A", 30, 0.25), ("B", 90, 0.25)])["tag"] == "flat curve"
 
-    # S72: every MONTHLY inside the DTE window (was: nearest to each of 4 target DTEs).
-    # 07-17 and 08-07 are third-Friday-shaped only for their own months — 07-17 IS July's
-    # third Friday but sits below EXPIRY_MIN_DTE; 08-07 is a weekly.
+    # S72/S73: every MONTHLY (was: nearest to each of 4 target DTEs). 07-17 IS July's third
+    # Friday and now qualifies (S73 opened EXPIRY_MIN_DTE to 0); 08-07 is a weekly and never does.
     future = [("2026-07-17", 10), ("2026-08-07", 31), ("2026-08-21", 45),
               ("2026-09-18", 73), ("2026-10-16", 101)]
-    assert [s[0] for s in select_expiries(future)] == ["2026-08-21", "2026-09-18", "2026-10-16"]
+    assert [s[0] for s in select_expiries(future)] == [
+        "2026-07-17", "2026-08-21", "2026-09-18", "2026-10-16"]
 
 
 # ─── Test 31: beta / ex-div / catalysts helpers (offline) ─────────────────────
@@ -2754,12 +2754,13 @@ def test_s72_monthly_window_selection():
     assert mon == [22, 50, 78, 113, 141, 169, 232, 322, 505, 540, 687, 869]
     assert all(w not in mon for w in (1, 8, 15, 29, 36, 43))     # weeklies excluded
 
-    # the window keeps everything tradeable and drops only the 687/869 tail (EXPIRY_MAX_DTE)
+    # S73 opened the window — EVERY monthly is quoted, including the 687/869 LEAP tail
     sel = [d for _, d in select_expiries(sofi)]
-    assert sel == [22, 50, 78, 113, 141, 169, 232, 322, 505, 540]
-    assert all(20 <= d <= 550 for d in sel)
-    # …and the previously-hidden monthlies are now present
+    assert sel == mon == [22, 50, 78, 113, 141, 169, 232, 322, 505, 540, 687, 869]
+    # …and the monthlies S69 hid (it quoted only the 4 nearest 45/90/180/365) are present
     assert {113, 141, 232} <= set(sel)
+    # the window bounds still guard: a narrow one curates
+    assert [d for _, d in select_expiries(sofi, min_dte=100, max_dte=400)] == [113, 141, 169, 232, 322]
 
     # month-end quarterlies are NOT monthlies (QQQ lists 26-12-31 Thu and 27-03-31 Wed), and
     # a Thursday weekly in the 15-21 window must not be mistaken for a holiday shift
@@ -2801,6 +2802,23 @@ def test_s69_strike_ladder():
     # ±pct bound: a far strike is excluded
     assert all(abs(c["strike"] - 100.0) / 100.0 <= 0.25 for c in lad if c["kind"] != "otm")
     assert strike_ladder([], 100.0) == [] and strike_ladder(rows, 0) == []
+
+    # S73: the ladder is the max_n strikes NEAREST SPOT — dense and adjacent, because the web
+    # control above it is "how many strikes around spot". (An even-sampled version spanning the
+    # whole ±band was tried and reverted: it put ~$20 between adjacent QQQ rungs, so asking for
+    # 3 strikes around spot returned spot ±$20 instead of the three adjacent strikes.)
+    dense = [row(s, delta=max(0.02, 1.0 - (s - 60) / 80)) for s in range(60, 141)]  # $1 grid
+    near9 = strike_ladder(dense, spot=100.0, max_n=9, pct=0.40)
+    ks = [c["strike"] for c in near9]
+    assert ks == sorted(ks) and len(ks) <= 10          # +1 only if the Δ pick sits outside
+    assert [k for k in ks if 96 <= k <= 104] == [96, 97, 98, 99, 100, 101, 102, 103, 104]
+    assert next(c for c in near9 if c["kind"] == "atm")["strike"] == 100.0
+    # under the cap nothing is dropped; the ±pct band still bounds it
+    assert len(strike_ladder(dense, spot=100.0, max_n=200, pct=0.40)) == 81
+    # ±5% = strikes 95-105 (11), +1 because the ~0.375Δ pick (110 here) sits outside the band
+    # and is force-kept — the CLI rows and the `otm` block both name that strike
+    tight = strike_ladder(dense, spot=100.0, max_n=200, pct=0.05)
+    assert len(tight) == 12 and next(c for c in tight if c["kind"] == "otm")["strike"] == 110.0
 
 
 def test_s69_ladder_repricing():

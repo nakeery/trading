@@ -422,6 +422,28 @@ lens_web.py specifics (S48, +S49 native visuals):
     deleted — every window monthly is already fetched, so the IV curve went from ≤7 points to
     all of them for free). ~0.55s per expiry; SOFI 10 calls/6.4s vs 7/~4.5s before. Payload
     23KB. SCOPEKEY call3→call4.
+- **S73 all monthlies + user-chosen strike count** (user: "expand the number of strike prices and
+  expiries to all that are available … display 5 at a time and add a button to scroll left and
+  right", then after seeing the measurements: "instead add a picker for the amount of strikes
+  around spot to view … let the user decide how many they want to view").
+  · **Expiries: genuinely all.** `EXPIRY_MIN_DTE` 20→0, `EXPIRY_MAX_DTE` 550→1100, cap 12→20 —
+    bounds are guard rails now, not curation. 12 SOFI / 14 QQQ / 13 AMD / 5 CRSP, out to 869d.
+  · **Strikes: NOT all — measured and rejected.** QQQ lists 2,661 tradeable calls across its
+    monthlies (149 inside ±25% alone; strikes 205-1115 against a 684 spot) → ~13k repriced rows,
+    ~3MB payload, a 200-pill picker (40+ pages at 5/page, which defeats the paging). Told the
+    user with numbers rather than silently narrowing.
+  · **An even-sampled ladder was tried and REVERTED.** Spanning the full ±40% band with 25 rungs
+    put ~$20 between adjacent QQQ strikes, so "3 strikes around spot" gave spot ±$20 instead of
+    the three adjacent strikes. `strike_ladder` is back to nearest-N (dense, adjacent); reach is
+    the expiry axis, proximity is this one. LADDER_PCT 0.25→0.40, LADDER_MAX 9→25.
+  · **The count is the user's**: `STRIKE_COUNTS` (1/3/5/9/25) = "N nearest spot PER EXPIRY".
+    Per-expiry matters — a union-wide "5 nearest" rendered 2 rows on some expiries and 4 on
+    others because each expiry lists a different grid. Default 1 = ATM only (the pre-S73 view).
+  · `Picker` is paged: `PICKER_PAGE`=5, ‹ › arrows, auto-positioned on the first selected
+    option, `n–m of N · k selected off-screen` so a filtered table is never a mystery.
+    STRIKE_COUNTS is exactly 5 entries so that picker never needs arrows of its own.
+  · Cost: SOFI 12 chain calls ~9s / 366KB report; QQQ 14 calls ~16s / 783KB. The DOM stays
+    small — only SELECTED rows render. SCOPEKEY call4→call5.
   · **Also found (NOT fixed, needs a session)**: the Massive harvest looks stalled —
     `atm_iv_30d` last stamped 2026-06-19 (SOFI) / 06-23 (QQQ), and `atm_iv_180d` has never been
     populated since S47 shipped. Degrades every IV gauge and the no---call synthetic path.

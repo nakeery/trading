@@ -347,14 +347,30 @@ const pnlS = (v: number | null | undefined) =>
 const pnlStyle = (v: number | null | undefined): CSSProperties | undefined =>
   v == null ? undefined : { color: v >= 0 ? GREEN : RED, fontWeight: 600 }
 
+const PICKER_PAGE = 5   // S73 — pills visible at once; ‹ › page through the rest
+// strikes-near-spot pool: QQQ's ladders span ~103 distinct strikes across its 14 monthlies, so
+// "one pill per strike, unfiltered" is unusable. The stepper below bounds how many of the
+// nearest-to-spot strikes (per expiry, capped by callquote.LADDER_MAX=25) become pills —
+// selection itself stays per-strike (actual price + % from spot), not a preset count.
+const DEFAULT_STRIKE_POOL = 5
+
 /** S69 — expiry/strike multi-select. Every offered row is ALREADY repriced server-side
- *  (modules/levelproj.py), so this only filters — no refetch, no Black-Scholes in TS. */
+ *  (modules/levelproj.py), so this only filters — no refetch, no Black-Scholes in TS.
+ *  S73: shows PICKER_PAGE at a time behind ‹ › arrows, since the expiry list is now every
+ *  monthly (12-14) and the strike ladder spans ±40% of spot. Selections OUTSIDE the visible
+ *  window still apply — the count on the right says how many, so a filtered-looking table is
+ *  never a mystery. */
 function Picker({ label, options, selected, onChange }: {
   label: string
   options: { key: string; text: string }[]
   selected: Set<string>
   onChange: (s: Set<string>) => void
 }) {
+  // start the window on the first selected option (defaults sit mid-list: ATM strikes, ≥150d
+  // expiries), clamped so the last page is always full
+  const firstSel = Math.max(0, options.findIndex((o) => selected.has(o.key)))
+  const maxStart = Math.max(0, options.length - PICKER_PAGE)
+  const [start, setStart] = useState(() => Math.min(firstSel, maxStart))
   if (options.length <= 1) return null
   const toggle = (k: string) => {
     const next = new Set(selected)
@@ -362,10 +378,29 @@ function Picker({ label, options, selected, onChange }: {
     else next.add(k)
     if (next.size) onChange(next)          // never allow an empty table
   }
+  const paged = options.length > PICKER_PAGE
+  const at = Math.min(start, maxStart)
+  const view = paged ? options.slice(at, at + PICKER_PAGE) : options
+  const nOff = [...selected].filter((k) => !view.some((o) => o.key === k)).length
+  const arrow: CSSProperties = {
+    cursor: 'pointer', border: '1px solid var(--border)', background: 'transparent',
+    color: 'var(--text)', borderRadius: 'var(--r-sm, 4px)', width: 22, height: 22,
+    fontSize: 12, lineHeight: 1, padding: 0,
+  }
   return (
     <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', margin: '4px 0' }}>
       <span style={{ color: 'var(--muted)', fontSize: 11.5, minWidth: 46 }}>{label}</span>
-      {options.map((o) => {
+      {paged && (
+        <button
+          style={{ ...arrow, opacity: at === 0 ? 0.35 : 1 }}
+          disabled={at === 0}
+          onClick={() => setStart(Math.max(0, at - PICKER_PAGE))}
+          aria-label={`${label} previous`}
+        >
+          ‹
+        </button>
+      )}
+      {view.map((o) => {
         const on = selected.has(o.key)
         return (
           <button
@@ -382,6 +417,22 @@ function Picker({ label, options, selected, onChange }: {
           </button>
         )
       })}
+      {paged && (
+        <>
+          <button
+            style={{ ...arrow, opacity: at >= maxStart ? 0.35 : 1 }}
+            disabled={at >= maxStart}
+            onClick={() => setStart(Math.min(maxStart, at + PICKER_PAGE))}
+            aria-label={`${label} next`}
+          >
+            ›
+          </button>
+          <span style={{ color: 'var(--faint)', fontSize: 11 }}>
+            {at + 1}–{Math.min(at + PICKER_PAGE, options.length)} of {options.length}
+            {nOff > 0 && ` · ${nOff} selected off-screen`}
+          </span>
+        </>
+      )}
     </div>
   )
 }
@@ -570,24 +621,53 @@ function LadderProjections({ proj, ticker, spot }: {
 
   // every quoted expiry / strike across all targets — the pickers are shared, so switching
   // target doesn't reset the selection
+  const [expSel, setExpSel] = useState<Set<string> | null>(null)
+  const [strikeSel, setStrikeSel] = useState<Set<string> | null>(null)
+  const [strikeN, setStrikeN] = useState(DEFAULT_STRIKE_POOL)   // pool size, nearest spot per expiry
   const all = proj.targets.flatMap((t) => t.contracts)
   const expOpts = [...new Map(all.map((c) => [expKey(c), expText(c)])).entries()]
     .map(([key, text]) => ({ key, text, dte: all.find((c) => expKey(c) === key)?.dte ?? 0 }))
     .sort((a, b) => a.dte - b.dte)
-  const strikeOpts = [...new Set(all.map((c) => c.strike))].sort((a, b) => a - b)
-    .map((s) => {
-      const c = all.find((x) => x.strike === s)
-      const mny = c?.moneyness
-      return { key: String(s), text: mny != null ? `${s} (${pct1(mny)})` : String(s) }
-    })
-  const [expSel, setExpSel] = useState<Set<string> | null>(null)
-  const [strikeSel, setStrikeSel] = useState<Set<string> | null>(null)
   // defaults: every tenor, ATM strike only — recomputed from the payload, so a regenerate
   // (new spot → new ATM strike) doesn't leave a stale selection pinned
   const defExp = new Set(expOpts.filter((o) => o.dte >= 150).map((o) => o.key))   // ~6mo+ (ATM) only
-  const defStrikes = new Set(all.filter((c) => c.kind === 'atm').map((c) => String(c.strike)))
   const exps = expSel ?? defExp
+  // strikeN bounds the CANDIDATE POOL (nearest-to-spot strikes per expiry, unioned into pills);
+  // strikeSel is the user's actual per-strike pick out of that pool — restores individual
+  // strike selection (price + % from spot) while still keeping the pill list pageable.
+  const inExp = all.filter((c) => exps.has(expKey(c)))
+  const strikeVals = [...new Set(inExp.map((c) => c.strike))]
+  // N nearest spot PER EXPIRY, not from the union: expiries list different grids, so a
+  // union-wide "N nearest" collapsed to ~2 rows on some expiries and 4 on others.
+  const perExpiry = (g: ProjRow[]) => [...g]
+    .sort((a, b) => Math.abs(a.strike - (spot ?? 0)) - Math.abs(b.strike - (spot ?? 0)))
+    .slice(0, strikeN)
+  const byExp = new Map<string, ProjRow[]>()
+  for (const c of inExp) {
+    const k = expKey(c)
+    byExp.set(k, [...(byExp.get(k) ?? []), c])
+  }
+  const pool = [...byExp.values()].flatMap(perExpiry)
+  const strikeOpts = [...new Map(pool.map((c) => [String(c.strike), c])).entries()]
+    .sort((a, b) => Number(a[0]) - Number(b[0]))
+    .map(([key, c]) => ({
+      key, text: c.moneyness != null ? `${c.strike} (${pct1(c.moneyness)})` : String(c.strike),
+    }))
+  // default = the strike nearest CURRENT spot per expiry (perExpiry[0], since it sorts by
+  // distance before slicing) — not the server's `kind === 'atm'` tag, which is stamped at
+  // quote time and can drift stale (levelproj's own S70 caveat: a cached quote's "ATM" strike
+  // can sit several % from the report's live spot). Deriving it fresh here also means the
+  // default never depends on strikeN happening to be large enough to catch a distant tag.
+  const defStrikes = new Set(
+    [...byExp.values()].map((g) => perExpiry(g)[0]).filter(Boolean).map((c) => String(c.strike)),
+  )
   const strikes = strikeSel ?? (defStrikes.size ? defStrikes : new Set(strikeOpts.map((o) => o.key)))
+  // DISTINCT strikes per expiry — `all` spans every target, so counting rows would multiply
+  // each expiry's ladder by the number of targets
+  const maxPerExpiry = Math.max(
+    1, ...expOpts.filter((o) => exps.has(o.key))
+      .map((o) => new Set(all.filter((c) => expKey(c) === o.key).map((c) => c.strike)).size),
+  )
 
   // one target → header line + contract table. Shared by the ladder's fixed targets and the
   // custom-price stepper, so the two can never render or filter differently.
@@ -595,6 +675,7 @@ function LadderProjections({ proj, ticker, spot }: {
     let rows = t.contracts.length ? t.contracts : t.synthetic
     if (t.contracts.length) {
       rows = rows.filter((c) => exps.has(expKey(c)) && strikes.has(String(c.strike)))
+        .sort((a, b) => (a.dte - b.dte) || (a.strike - b.strike))
     }
     const ts = t.travel_sessions
     // S71 — the dated leg only exists when a hold date was chosen, so its columns appear only
@@ -654,6 +735,12 @@ function LadderProjections({ proj, ticker, spot }: {
     )
   }
 
+  const stepBtn: CSSProperties = {
+    cursor: 'pointer', border: '1px solid var(--border)', background: 'transparent',
+    color: 'var(--text)', borderRadius: 'var(--r-sm, 4px)', width: 26, height: 26,
+    fontSize: 14, lineHeight: 1,
+  }
+
   return (
     <div style={{ marginTop: 10 }}>
       <div style={{ fontSize: 12, color: 'var(--muted)', marginBottom: 4 }}>
@@ -662,7 +749,47 @@ function LadderProjections({ proj, ticker, spot }: {
       {all.length > 0 && (
         <div style={{ margin: '2px 0 8px' }}>
           <Picker label="expiry" options={expOpts} selected={exps} onChange={setExpSel} />
-          <Picker label="strike" options={strikeOpts} selected={strikes} onChange={setStrikeSel} />
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', margin: '4px 0' }}>
+            <span style={{ color: 'var(--muted)', fontSize: 11.5, minWidth: 46 }}>strike pool</span>
+            <button
+              style={stepBtn}
+              onClick={() => setStrikeN((n) => Math.max(1, n - 1))}
+              aria-label="fewer strikes near spot"
+            >
+              −
+            </button>
+            <input
+              type="number"
+              value={strikeN}
+              min={1}
+              max={maxPerExpiry}
+              step={1}
+              onChange={(e) => {
+                const v = Math.round(Number(e.target.value))
+                if (Number.isFinite(v)) setStrikeN(Math.min(maxPerExpiry, Math.max(1, v)))
+              }}
+              style={{
+                width: 56, textAlign: 'right', padding: '3px 6px', fontSize: 13,
+                background: 'var(--bg)', color: 'var(--text)',
+                border: '1px solid var(--border)', borderRadius: 'var(--r-sm, 4px)',
+              }}
+            />
+            <button
+              style={stepBtn}
+              onClick={() => setStrikeN((n) => Math.min(maxPerExpiry, n + 1))}
+              aria-label="more strikes near spot"
+            >
+              +
+            </button>
+            <span style={{ color: 'var(--faint)', fontSize: 11.5 }}>
+              nearest to spot, per expiry (of up to {maxPerExpiry} quoted)
+            </span>
+          </div>
+          <Picker label="strikes" options={strikeOpts} selected={strikes} onChange={setStrikeSel} />
+          <Caption>
+            {strikes.size} of {strikeOpts.length} pooled strikes selected, across {exps.size}{' '}
+            expir{exps.size === 1 ? 'y' : 'ies'} · {strikeVals.length} distinct strikes available
+          </Caption>
         </div>
       )}
       {ticker && spot != null && (
