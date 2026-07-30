@@ -37,6 +37,13 @@ RISK_FREE = 0.04        # matches gex.RISK_FREE — level, not sensitivity-criti
 SYNTH_DTES = (30, 180, 365)
 MAX_ZONE_TARGETS = 2    # confluence zones beyond user/S/R, nearest by |dist|
 MAX_TRAVEL_SESSIONS = 252
+# S70: the quote's spot vs the report's spot. Beyond this the cached mids were struck somewhere
+# you can no longer enter, so the entry is re-modeled at the CURRENT spot — the same treatment
+# S68 gave a session-STALE cache, which turned out to be only half the problem: a cache taken
+# earlier the SAME session is "fresh" by the session rule yet can be 5% away (probed live —
+# SOFI's 14:08 call3 cache held spot 16.13 against a 15.25 report spot, so every contract read
+# ≈ −19% at a zero-percent move).
+SPOT_DRIFT_TOL = 0.01
 PACE_NOTE = ("sessions = |move| / avg daily move (HV-20/sqrt252) — straight-line; "
              "real paths are noisier and slower")
 
@@ -54,8 +61,17 @@ def travel_sessions(dist_pct, hv20):
     return min(abs(dist_pct) / daily, MAX_TRAVEL_SESSIONS)
 
 
-def _legs(target, strike, iv, dte, r, travel_td):
-    """Instant + paced BS values for one call at `target`. paced None when no pace."""
+def _legs(target, strike, iv, dte, r, travel_td, hold_cal=None):
+    """Instant + paced + dated BS values for one call at `target`. paced None when no pace;
+    dated None when no hold period.
+
+    All three are the same repricing with a different amount of time left:
+      instant — T unchanged (the move happens now)
+      paced   — T minus the HV-20 travel ESTIMATE (a guess at how long the move takes)
+      dated   — T minus a hold the CALLER chose (S71: the date picker; calendar days, no
+                trading-day conversion — a calendar date is already calendar time)
+    Past the contract's own expiry the option is dead, so the value floors to intrinsic
+    (black_scholes_call's degenerate T<=0 guard) and the leg is flagged `expired`."""
     t_inst = max(dte, 0) / 365.0
     instant = black_scholes_call(target, strike, r, t_inst, iv)
     paced = None
@@ -65,53 +81,67 @@ def _legs(target, strike, iv, dte, r, travel_td):
         rem_cal = max(dte - travel_td * 365.0 / 252.0, 0.0)
         paced = {"value": black_scholes_call(target, strike, r, rem_cal / 365.0, iv),
                  "t_rem_days": rem_cal}
-    return instant, paced
+    dated = None
+    if hold_cal is not None:
+        rem = max(dte - float(hold_cal), 0.0)
+        dated = {"value": black_scholes_call(target, strike, r, rem / 365.0, iv),
+                 "t_rem_days": rem, "expired": float(hold_cal) >= dte}
+    return instant, paced, dated
 
 
-def reprice_contract(target, cand, dte, expiry=None, r=RISK_FREE, travel_td=None):
+def reprice_contract(target, cand, dte, expiry=None, r=RISK_FREE, travel_td=None, hold_cal=None):
     """PURE: one callquote candidate dict repriced at `target` (IV held constant).
     Needs cand['iv'] and cand['mid'] — returns None otherwise (missing greeks happen).
     P&L is vs the mid, plus vs the ask when the candidate carries one (S40 at-ask honesty).
-    A downside target prices honestly to a loss."""
+    A downside target prices honestly to a loss. `hold_cal` (S71) adds the dated leg."""
     iv = (cand or {}).get("iv")
     mid = (cand or {}).get("mid")
     strike = (cand or {}).get("strike")
     if not iv or not mid or not strike or target is None or dte is None:
         return None
     ask = cand.get("ask")
-    inst_v, paced = _legs(float(target), float(strike), float(iv), float(dte), r, travel_td)
+    inst_v, paced, dated = _legs(float(target), float(strike), float(iv), float(dte), r,
+                                 travel_td, hold_cal)
     out = {"strike": float(strike), "dte": float(dte), "expiry": expiry, "iv": float(iv),
            "entry_mid": float(mid), "entry_ask": float(ask) if ask else None,
            "instant": {"value": inst_v, "pnl_mid_pct": inst_v / mid - 1.0,
                        "pnl_ask_pct": (inst_v / ask - 1.0) if ask else None},
-           "paced": None}
-    if paced is not None:
-        out["paced"] = {"value": paced["value"], "pnl_mid_pct": paced["value"] / mid - 1.0,
-                        "pnl_ask_pct": (paced["value"] / ask - 1.0) if ask else None,
-                        "t_rem_days": paced["t_rem_days"]}
+           "paced": None, "dated": None}
+    for key, leg in (("paced", paced), ("dated", dated)):
+        if leg is None:
+            continue
+        out[key] = {"value": leg["value"], "pnl_mid_pct": leg["value"] / mid - 1.0,
+                    "pnl_ask_pct": (leg["value"] / ask - 1.0) if ask else None,
+                    "t_rem_days": leg["t_rem_days"]}
+        if "expired" in leg:
+            out[key]["expired"] = leg["expired"]
     return out
 
 
 def synthetic_call(spot, target, iv, dte, r=RISK_FREE, travel_td=None,
-                   iv_src="ATM IV (30d)"):
+                   iv_src="ATM IV (30d)", hold_cal=None):
     """PURE: modeled ATM call — K = spot, premium = BS(spot, spot, r, dte/365, iv).
-    Same instant/paced shapes as reprice_contract, P&L vs the modeled premium (no
+    Same instant/paced/dated shapes as reprice_contract, P&L vs the modeled premium (no
     spread/fees — it is NOT a quote). None when the inputs can't price."""
     if not spot or not iv or iv <= 0 or spot <= 0 or target is None or not dte:
         return None
     premium = black_scholes_call(float(spot), float(spot), r, dte / 365.0, float(iv))
     if premium <= 0:
         return None
-    inst_v, paced = _legs(float(target), float(spot), float(iv), float(dte), r, travel_td)
+    inst_v, paced, dated = _legs(float(target), float(spot), float(iv), float(dte), r,
+                                 travel_td, hold_cal)
     out = {"strike": float(spot), "dte": float(dte), "iv": float(iv), "iv_src": iv_src,
            "premium": premium,
            "instant": {"value": inst_v, "pnl_mid_pct": inst_v / premium - 1.0,
                        "pnl_ask_pct": None},
-           "paced": None}
-    if paced is not None:
-        out["paced"] = {"value": paced["value"],
-                        "pnl_mid_pct": paced["value"] / premium - 1.0,
-                        "pnl_ask_pct": None, "t_rem_days": paced["t_rem_days"]}
+           "paced": None, "dated": None}
+    for key, leg in (("paced", paced), ("dated", dated)):
+        if leg is None:
+            continue
+        out[key] = {"value": leg["value"], "pnl_mid_pct": leg["value"] / premium - 1.0,
+                    "pnl_ask_pct": None, "t_rem_days": leg["t_rem_days"]}
+        if "expired" in leg:
+            out[key]["expired"] = leg["expired"]
     return out
 
 
@@ -182,7 +212,7 @@ def _pick_targets(ladder):
 
 
 def project_targets(ladder, hv20=None, callq=None, iv30=None, iv180=None, r=RISK_FREE,
-                    today=None):
+                    today=None, hold_cal=None):
     """PURE orchestrator: build_ladder output (+ optional --call quote dict, harvested IV
     gauges, HV-20) → the projections dict, or None when there is nothing to project.
     `today` injectable for tests (defaults to date.today() — used only to refresh the
@@ -201,6 +231,11 @@ def project_targets(ladder, hv20=None, callq=None, iv30=None, iv180=None, r=RISK
     # read as a loss). Honesty fix: re-model the ENTRY at the CURRENT spot (same strike/IV,
     # refreshed dte), drop the ask leg (the stale spread is equally dead), and flag the row.
     stale = bool((callq or {}).get("stale"))
+    # S70: session-staleness is not the only way a mid goes un-enterable — spot drift within the
+    # session does it too. Re-model on either. drift is None when the cache carries no spot.
+    q_spot = (callq or {}).get("spot")
+    drift = (q_spot / spot - 1.0) if (q_spot and spot) else None
+    remodel = stale or (drift is not None and abs(drift) > SPOT_DRIFT_TOL)
     quoted = []
     for blk in (callq or {}).get("quotes") or []:
         dte, expiry = blk.get("dte"), blk.get("expiry")
@@ -220,7 +255,7 @@ def project_targets(ladder, hv20=None, callq=None, iv30=None, iv180=None, r=RISK
         for cand in cands:
             kind = cand.get("kind") or "other"
             modeled_entry = False
-            if stale and spot:
+            if remodel and spot:
                 m = black_scholes_call(float(spot), float(cand["strike"]), r,
                                        max(dte or 0, 0) / 365.0, float(cand["iv"]))
                 if m > 0:
@@ -234,7 +269,8 @@ def project_targets(ladder, hv20=None, callq=None, iv30=None, iv180=None, r=RISK
         t["travel_sessions"] = tsess
         t["contracts"], t["synthetic"] = [], []
         for cand, dte, expiry, kind, modeled_entry in quoted:
-            c = reprice_contract(t["price"], cand, dte, expiry=expiry, r=r, travel_td=tsess)
+            c = reprice_contract(t["price"], cand, dte, expiry=expiry, r=r, travel_td=tsess,
+                                 hold_cal=hold_cal)
             if c:
                 c["kind"] = kind
                 c["src"] = "quoted"
@@ -245,7 +281,8 @@ def project_targets(ladder, hv20=None, callq=None, iv30=None, iv180=None, r=RISK
                 t["contracts"].append(c)
         if not t["contracts"]:            # synthetic fallback — modeled, not a quote
             for dte, iv, src in _synth_legs(callq, iv30, iv180, hv20):
-                s = synthetic_call(spot, t["price"], iv, dte, r=r, travel_td=tsess, iv_src=src)
+                s = synthetic_call(spot, t["price"], iv, dte, r=r, travel_td=tsess, iv_src=src,
+                                   hold_cal=hold_cal)
                 if s:
                     s["src"] = "modeled"
                     t["synthetic"].append(s)
@@ -253,6 +290,58 @@ def project_targets(ladder, hv20=None, callq=None, iv30=None, iv180=None, r=RISK
     qm = None
     if quoted and callq:
         qm = {"as_of_str": callq.get("as_of_str"), "age_str": callq.get("age_str"),
-              "stale": bool(callq.get("stale"))}
+              "stale": bool(callq.get("stale")),
+              # S70 — so the renderers can say WHY entries were re-modeled (session-stale vs the
+              # quote's spot having moved away from the report's)
+              "spot_drift": drift, "remodeled": bool(remodel), "quote_spot": q_spot}
     return {"targets": targets, "quote_meta": qm,
             "params": {"hv20": hv20, "r": r}, "pace_note": PACE_NOTE}
+
+
+def project_price(price, spot, hv20=None, callq=None, iv30=None, iv180=None, r=RISK_FREE,
+                  today=None, on_date=None):
+    """PURE: project ONE arbitrary price (S70 — the web's custom-price stepper), rather than the
+    ladder's fixed key levels. Same math, same row shapes, same tenors/strike ladder: a minimal
+    one-target ladder is fed straight through `project_targets`, so there is exactly one pricing
+    path and the stepper can never drift from the block above it.
+
+    `on_date` (S71 — the date picker): an ISO date or `date` to hold until, which adds each
+    contract's `dated` leg — "what is this worth if the price gets there ON that day". Unlike
+    `paced` (an HV-20 ESTIMATE of travel time) this is a hold period the user chose, so it is
+    the honest way to ask "what does waiting cost me". A date past a contract's expiry prices
+    that contract to intrinsic and flags it `expired`. A date in the past is rejected.
+
+    Returns {target, quote_meta, on_date, hold_days} or None. The target's `kind` is 'custom
+    price' so renderers can tell it apart from a real ladder level (a what-if, not a level the
+    tape respects)."""
+    if price is None or not spot:
+        return None
+    try:
+        price, spot = float(price), float(spot)
+    except (TypeError, ValueError):
+        return None
+    if price <= 0 or spot <= 0:
+        return None
+    today = today or date.today()
+    hold_cal = None
+    if on_date:
+        try:
+            d = on_date if isinstance(on_date, date) else date.fromisoformat(str(on_date))
+        except (TypeError, ValueError):
+            return None
+        hold_cal = (d - today).days
+        if hold_cal < 0:                      # the past is not a projection
+            return None
+        on_date = d.isoformat()
+    lad = {"spot": spot, "levels": [], "nearest_support": None, "nearest_resistance": None,
+           "user_level": {"price": price, "dist_pct": price / spot - 1.0, "confluence": []}}
+    out = project_targets(lad, hv20=hv20, callq=callq, iv30=iv30, iv180=iv180, r=r, today=today,
+                          hold_cal=hold_cal)
+    if not out or not out.get("targets"):
+        return None
+    t = dict(out["targets"][0])
+    t["kind"] = "custom price"
+    t["label"] = ""
+    return {"target": t, "quote_meta": out.get("quote_meta"),
+            "params": out.get("params"), "pace_note": out.get("pace_note"),
+            "on_date": on_date or None, "hold_days": hold_cal}

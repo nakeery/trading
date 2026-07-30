@@ -55,6 +55,55 @@ def tickers():
     return sanitize({"tickers": names})
 
 
+@app.get("/api/project/{ticker}")
+def project(ticker: str, price: float, date: str | None = None):
+    """Reprice the level-projection contracts at an ARBITRARY price (S70 — the custom-price
+    stepper under LEVEL PROJECTIONS): {"target": {...}, "quote_meta": {...}} or {"target": null}.
+    `date` (S71) adds the dated leg — what each contract is worth if the price gets there on
+    that day, i.e. what the wait costs in theta. Must be today or later.
+
+    Deliberately a server round-trip rather than pricing in the browser: Black-Scholes stays in
+    modules/levelproj.py so the stepper can never disagree with the table above it (the same
+    one-source-of-truth rule that keeps the candle figure in api/charts.py). The work is pure
+    arithmetic on data already in hand — the ticker's LATEST payload for spot/HV-20/IV gauges and
+    the session `--call` cache for contracts — so there is no chain fetch and no regenerate."""
+    t = ticker.strip().upper()
+    payload = reportgen.LATEST.get(t)
+    if not payload:
+        # nothing generated yet this process — the stepper hides rather than guessing at a spot
+        raise HTTPException(409, f"no generated report for {t} yet — run the report first")
+    if not (price > 0):
+        raise HTTPException(422, f"price must be positive: {price!r}")
+    if date:
+        _check_date("date", date)
+        if pd.Timestamp(date).normalize() < pd.Timestamp.today().normalize():
+            raise HTTPException(422, f"date is in the past: {date!r}")
+    try:
+        from modules.levelproj import project_price
+        lad = payload.get("ladder") or {}
+        spot = lad.get("spot")
+        params = ((lad.get("projections") or {}).get("params")) or {}
+        callq = None
+        if not payload.get("as_of_mode"):
+            from modules.callquote import cached_call_quote
+            callq = cached_call_quote(t, data_dir=DATA_DIR)
+        iv30 = iv180 = None
+        try:
+            from modules.volsetup import gauge_val
+            ctx = payload.get("ctx")
+            iv30, iv180 = gauge_val(ctx, "ATM IV (30d)"), gauge_val(ctx, "ATM IV (180d)")
+        except Exception:
+            pass
+        out = project_price(price, spot, hv20=params.get("hv20"), callq=callq,
+                            iv30=iv30, iv180=iv180,
+                            on_date=pd.Timestamp(date).date().isoformat() if date else None)
+    except HTTPException:
+        raise
+    except Exception:
+        out = None
+    return sanitize(out or {"target": None})
+
+
 @app.get("/api/afterhours/{ticker}")
 def afterhours(ticker: str):
     """The ticker's extended-hours print: {"ah": {...}} or {"ah": null} (S64 fix).

@@ -81,6 +81,17 @@ export interface PlotlyFig {
   layout: object
 }
 
+// S70 — /api/project envelope (custom-price stepper). `target` carries the same shape as a
+// payload projections target; the render-side interfaces live in sections/core.tsx alongside
+// the component that consumes them, so this stays an envelope only.
+export interface ProjectionResponse {
+  target: unknown | null
+  quote_meta?: { as_of_str?: string; age_str?: string; stale?: boolean } | null
+  pace_note?: string
+  on_date?: string | null    // S71 — the held-until date, echoed back
+  hold_days?: number | null  // calendar days from today to that date
+}
+
 export interface Range52 {
   hi: number
   lo: number

@@ -360,6 +360,68 @@ lens_web.py specifics (S48, +S49 native visuals):
     silently truncated away exactly the new long-dated rows — the trap this change had to dodge.
     Labels use `YY-MM-DD` + DTE (`expiry[2:]`); `[5:]` dropped the year and made a 2027 LEAP
     ambiguous.
+  · **S70 custom-price stepper** (user: "add one more option for spot price … a number box with
+    up and down arrows … and an option to select the increment amount"): a ± number box above the
+    projections, defaulting to spot, with a step picker (`STEP_CHOICES`, default ≈0.5% of spot so
+    a $16 and a $680 name both nudge sensibly), 250ms debounce, `placeholderData` to avoid
+    blanking between steps, and a reset button. Backed by `levelproj.project_price` — which
+    builds a one-target ladder and runs it through `project_targets`, so the stepper and the
+    fixed-target table share EXACTLY one pricing path (a bit-equality test pins it; note
+    110/100−1 is 0.10000000000000009, so the test must use the same expression or it near-misses
+    through travel_sessions). Served by `GET /api/project/{tkr}?price=` off `reportgen.LATEST` +
+    the `--call` session cache: no chain fetch, no regenerate, 409 when that ticker hasn't been
+    generated in this process. **Deliberately a server round-trip, not TS math** — porting
+    Black-Scholes to the browser is precisely how the stepper would drift from the table above
+    it (same rule that keeps the candle fig in api/charts.py). CLI equivalent already exists:
+    `--level`.
+  · **S71 date picker** (user: "a date picker, ideally a dropdown calendar form, so we can see
+    what the return will be for spot price on a particular date"): a THIRD leg per contract.
+    `_legs` gained `hold_cal`, so instant / paced / dated are one repricing with three different
+    amounts of time left — instant = T unchanged, paced = T minus the HV-20 travel ESTIMATE,
+    dated = T minus a hold the USER chose (calendar days; a date is already calendar time, so no
+    trading-day conversion). That makes "what does waiting cost me" answerable without the pace
+    guess. Past a contract's own expiry the leg floors to intrinsic and sets `expired` (rendered
+    `4.25 exp`); past dates are refused (422 at the API, None from the pure fn). Web: native
+    `<input type="date">` (the dropdown calendar) + 1w/1m/3m/6m presets + clear; the two dated
+    columns render ONLY when a date is set, so the fixed targets are unchanged. Verified live on
+    SOFI: at no move held 91 days the 169d contract bleeds −38% vs the 322d's −19% (the tenor
+    tradeoff, made visible); a +32.8% move reads instant +154% / paced +149% / on-date +119%.
+  · **S70/S71 spot-drift fix (found BY the stepper)**: the stepper at spot read −19% at a
+    zero-percent move. The math was right — BS reproduced the cached mids to ~1% — but the
+    `--call` cache held spot 16.13 against a 15.25 report spot. S68 only re-modeled entries for a
+    session-STALE cache; a cache from earlier the SAME session is "fresh" by that rule and just
+    as un-enterable. `SPOT_DRIFT_TOL`=1% now triggers the same re-model, and both renderers name
+    the reason ("quoted at 16.13 (+5.8% vs spot), entries re-modeled at current spot"). This
+    corrected the FIXED targets too — every projection in the block had been understated by the
+    drift. Lesson: a what-if control at the no-change point is a free invariant test; if
+    "nothing moves" doesn't read ~0, something upstream is inconsistent.
+- **S72 every-monthly expiry window** (user: "expand the available expiries, and only use
+  monthlies … there are monthlies for SOFI that don't show up as a pill … the math picks a
+  particular date range, lets make it a bit more flexible"). They were right: S69 quoted the
+  nearest expiry to each of 4 target DTEs, so SOFI's 113/141/232-day monthlies never appeared.
+  · `select_expiries` now takes EVERY monthly in `[EXPIRY_MIN_DTE=20, EXPIRY_MAX_DTE=550]`,
+    capped `MAX_EXPIRIES=12` nearest-first. Measured live: 10 SOFI, 5 CRSP, 12 QQQ/AMD. The
+    "~1yr" LABEL is gone with it — the label was the only thing that could lie, and with all
+    expiries offered the user picks the tenor instead of the code guessing. `tenor_tol` /
+    `LONG_DTE_MIN` / the omit-when-off-target rule are all deleted as no longer needed.
+  · **HOLIDAY SHIFT — the trap in "only monthlies".** `pc_oi.is_monthly_expiry` is date-only
+    (Friday, day 15-21), so it cannot see that a monthly moves to the Thursday before when the
+    third Friday is a market holiday. Probed live 2026-07-30: SOFI/QQQ/AMD all list
+    `2027-06-17` (Thu) and NOT `2027-06-18` — Juneteenth 2027 falls on a Saturday and is
+    observed that Friday. A naive monthlies-only filter would have DROPPED the June-2027 LEAP,
+    i.e. exactly the ~1yr contract S69 went to trouble to include. New list-aware
+    `callquote.monthly_expiries`: per (year, month) take the third Friday if listed, else the
+    day before. Deliberately not a bare "Thu in the 15-21 window" test — QQQ lists Thursday
+    weeklies. `is_monthly_expiry` is left alone (pc_oi/gex/volquote/massive still use it; a
+    date-only fn cannot do better without a holiday calendar).
+  · CLI curation: `nearest_to_targets` + the surviving `TARGET_DTES` — a terminal has no picker
+    and 12 expiries × 5 targets = 60 rows, so the CLI prints the 4 closest to 45/90/180/365d
+    and states how many were quoted. Wording avoids tenor names because for CRSP the closest to
+    365 is 540d.
+  · Cost: chain calls = len(select_expiries) exactly (the separate curve-extension pass is
+    deleted — every window monthly is already fetched, so the IV curve went from ≤7 points to
+    all of them for free). ~0.55s per expiry; SOFI 10 calls/6.4s vs 7/~4.5s before. Payload
+    23KB. SCOPEKEY call3→call4.
   · **Also found (NOT fixed, needs a session)**: the Massive harvest looks stalled —
     `atm_iv_30d` last stamped 2026-06-19 (SOFI) / 06-23 (QQQ), and `atm_iv_180d` has never been
     populated since S47 shipped. Degrades every IV gauge and the no---call synthetic path.

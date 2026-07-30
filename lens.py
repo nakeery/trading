@@ -67,9 +67,11 @@ try:
 except Exception:
     earnings_dates = None
 try:
-    from modules.callquote import call_quote, cached_liquidity, cached_call_quote
+    from modules.callquote import (call_quote, cached_liquidity, cached_call_quote,
+                                   nearest_to_targets, TARGET_DTES)  # S72: CLI curation
 except Exception:
-    call_quote = cached_liquidity = cached_call_quote = None
+    call_quote = cached_liquidity = cached_call_quote = nearest_to_targets = None
+    TARGET_DTES = (45, 90, 180, 365)
 try:
     from modules.levelproj import project_targets   # S68: level projections
 except Exception:
@@ -778,8 +780,15 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         proj = ladder.get("projections")
         if proj and proj.get("targets"):
             qm = proj.get("quote_meta")
-            src = (f"quoted contracts as of {qm.get('as_of_str', '?')}"
-                   + (" — STALE, entries re-modeled at current spot" if qm.get("stale") else "")
+            why = ""
+            # `stale` implies re-modeled — payloads predating the S70 key must still explain it
+            if qm and (qm.get("remodeled") or qm.get("stale")):
+                dr = qm.get("spot_drift")
+                why = (" — STALE, entries re-modeled at current spot" if qm.get("stale")
+                       else f" — quoted at {qm.get('quote_spot'):.2f} ({dr:+.1%} vs spot), "
+                            f"entries re-modeled at current spot"
+                       if dr is not None else " — entries re-modeled at current spot")
+            src = (f"quoted contracts as of {qm.get('as_of_str', '?')}" + why
                    ) if qm else "modeled, not a quote"
             print(f"\n    ── level projections ({src} · IV held constant) ──")
             for t in proj["targets"]:
@@ -790,9 +799,10 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
                 print(f"    → {t['kind']} {t['price']:.2f} ({t['dist_pct']:+.1%}{lbl}){pace}")
                 # ONE ATM row per tenor (S69). The old `rows[:4]` cap sliced an expiry-ordered
                 # list, so once callquote gained the 180d/365d tenors it would have silently
-                # truncated away exactly the long-dated rows this block exists to show. Selecting
-                # per tenor is cap-free and keeps every tenor visible; the web offers the full
-                # strike ladder behind its selectors.
+                # truncated away exactly the long-dated rows this block exists to show.
+                # S72: callquote now quotes EVERY monthly in the window (10-12 of them), which
+                # would be 60 rows here — so the CLI curates to the canonical tenors. The web
+                # picker offers the full set; nothing is hidden, it just isn't all printed.
                 rows = t.get("contracts") or t.get("synthetic") or []
                 if t.get("contracts"):
                     by_tenor = {}
@@ -802,6 +812,10 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
                             by_tenor.setdefault(key, c)
                             if c.get("kind") == "atm":
                                 by_tenor[key] = c
+                    if nearest_to_targets is not None:
+                        keep = {k for k, _ in nearest_to_targets(
+                            [(k, v.get("dte") or 0) for k, v in by_tenor.items()])}
+                        by_tenor = {k: v for k, v in by_tenor.items() if k in keep}
                     rows = sorted(by_tenor.values(), key=lambda c: c.get("dte") or 0)
                 if not rows:
                     print("        — (no IV available to model a call)")
@@ -1205,7 +1219,18 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
             if c.get("be_ask") is not None:
                 print(f"            at ask ${c['ask']:.2f} → BE {c['be_ask']:.2f} ({c['be_move_ask']:+.1%})")
 
-        for blk in callq["quotes"]:
+        # S72: every monthly in the window is quoted (10-12), which would be a wall of text
+        # here — the CLI shows the canonical tenors. The full set is in the payload and the
+        # web picker; the count line below says how many were quoted so nothing looks lost.
+        qblocks = callq["quotes"]
+        if nearest_to_targets is not None and len(qblocks) > len(TARGET_DTES):
+            keep = {e for e, _ in nearest_to_targets(
+                [(b["expiry"], b.get("dte") or 0) for b in qblocks])}
+            shown = [b for b in qblocks if b["expiry"] in keep]
+            print(f"    {len(qblocks)} monthlies quoted — showing the {len(shown)} closest to "
+                  f"{'/'.join(str(t) for t in TARGET_DTES)}d; all are in the web expiry picker")
+            qblocks = shown
+        for blk in qblocks:
             mon = "monthly, " if blk.get("monthly") else ""
             print(f"      exp {blk['expiry']} ({mon}{blk['dte']}d):")
             _callln("ATM", blk.get("atm"))

@@ -1,7 +1,10 @@
 // Core report sections (print order): MARKET BACKDROP, MULTI-TIMEFRAME, DIVERGENCES,
 // VOLUME PROFILE, RALLY vs DRAWDOWN, SETUP CHECK — ports of the same-named sec_* renderers
 // in lens_web_sections.py, each mirroring its None/empty guard.
-import { useState, type CSSProperties } from 'react'
+import { useEffect, useState, type CSSProperties, type ReactNode } from 'react'
+import { useQuery } from '@tanstack/react-query'
+
+import { fetchProjection } from '../../api/client'
 import type { Payload } from '../../api/types'
 import {
   AMBER, ARROW, BLUE, BLUEGRAY, GRAY, GREEN, HEAT_DEAD, INK, INTRADAY_TFS, OB, RED,
@@ -282,7 +285,13 @@ interface LadderRow {
   zone: number | null
 }
 // S68 — level projections (all math server-side in modules/levelproj.py; render only)
-interface ProjLeg { value: number; pnl_mid_pct: number; pnl_ask_pct?: number | null; t_rem_days?: number }
+interface ProjLeg {
+  value: number
+  pnl_mid_pct: number
+  pnl_ask_pct?: number | null
+  t_rem_days?: number
+  expired?: boolean   // S71 dated leg — the hold date is past this contract's expiry
+}
 interface ProjRow {
   src: 'quoted' | 'modeled'
   kind?: 'atm' | 'otm' | 'other'
@@ -299,6 +308,7 @@ interface ProjRow {
   premium?: number
   instant: ProjLeg
   paced?: ProjLeg | null
+  dated?: ProjLeg | null   // S71 — value if the price gets there on the chosen date
 }
 interface ProjTarget {
   price: number; dist_pct: number; kind: string; label?: string
@@ -306,9 +316,17 @@ interface ProjTarget {
   contracts: ProjRow[]
   synthetic: ProjRow[]
 }
+interface QuoteMeta {
+  as_of_str?: string
+  age_str?: string
+  stale?: boolean
+  remodeled?: boolean          // S70 — entry re-modeled at current spot (stale OR spot drift)
+  spot_drift?: number | null   // quote's spot / report's spot − 1
+  quote_spot?: number | null
+}
 interface Projections {
   targets: ProjTarget[]
-  quote_meta?: { as_of_str?: string; age_str?: string; stale?: boolean } | null
+  quote_meta?: QuoteMeta | null
   pace_note?: string
 }
 interface Ladder {
@@ -368,15 +386,180 @@ function Picker({ label, options, selected, onChange }: {
   )
 }
 
+/** S70 — custom-price stepper. Steps are absolute dollars; the default is scaled to the
+ *  ticker's price so a $16 name and a $680 name both get a sane first nudge. */
+const STEP_CHOICES = [0.5, 1, 5, 10]
+const defaultStep = (spot: number) =>
+  STEP_CHOICES.reduce((best, s) =>
+    (Math.abs(s - spot * 0.005) < Math.abs(best - spot * 0.005) ? s : best), STEP_CHOICES[0])
+
+// S71 — hold-until date. Local (not UTC) so an evening in the US doesn't offer "tomorrow"
+// as today's date, the same reason utils/dates.localToday exists for the as-of panel.
+const isoInDays = (days: number) => {
+  const d = new Date()
+  d.setDate(d.getDate() + days)
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+const isoToday = () => isoInDays(0)
+const DATE_PRESETS: [string, number][] = [['1w', 7], ['1m', 30], ['3m', 91], ['6m', 182]]
+
+/** "What if it goes to X?" — an arbitrary price, repriced through the SAME server-side math as
+ *  the fixed targets (GET /api/project). Deliberately not computed in the browser: duplicating
+ *  Black-Scholes in TS would let this disagree with the table above it. */
+function CustomPrice({ ticker, spot, render }: {
+  ticker: string
+  spot: number
+  render: (t: ProjTarget, dateLabel?: string | null) => ReactNode
+}) {
+  const [step, setStep] = useState(() => defaultStep(spot))
+  const [price, setPrice] = useState(() => Number(spot.toFixed(2)))
+  const [onDate, setOnDate] = useState<string>('')       // '' = no dated leg
+  const [debounced, setDebounced] = useState(price)
+  useEffect(() => {
+    const id = setTimeout(() => setDebounced(price), 250)   // arrows fire fast; batch them
+    return () => clearTimeout(id)
+  }, [price])
+  // a regenerate (new spot) re-seeds the box, but only while the user hasn't moved it
+  const [touched, setTouched] = useState(false)
+  useEffect(() => {
+    if (!touched) {
+      setPrice(Number(spot.toFixed(2)))
+      setDebounced(Number(spot.toFixed(2)))
+    }
+  }, [spot, touched])
+
+  const q = useQuery({
+    queryKey: ['project', ticker, debounced, onDate],
+    queryFn: () => fetchProjection(ticker, debounced, onDate || null),
+    enabled: !!ticker && debounced > 0,
+    staleTime: 5 * 60_000,
+    placeholderData: (prev) => prev,        // keep the old table while the next one lands
+    retry: false,
+  })
+  const target = (q.data?.target ?? null) as ProjTarget | null
+  const holdDays = q.data?.hold_days ?? null
+  const bump = (dir: number) => {
+    setTouched(true)
+    // round to cents — float addition of 0.1 steps otherwise drifts (16.9 + 0.1 = 17.000000000000004)
+    setPrice((p) => Math.max(0.01, Number((p + dir * step).toFixed(2))))
+  }
+  const btn: CSSProperties = {
+    cursor: 'pointer', border: '1px solid var(--border)', background: 'transparent',
+    color: 'var(--text)', borderRadius: 'var(--r-sm, 4px)', width: 26, height: 26,
+    fontSize: 14, lineHeight: 1,
+  }
+  return (
+    <div style={{ margin: '8px 0 2px' }}>
+      <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap' }}>
+        <span style={{ color: 'var(--muted)', fontSize: 11.5, minWidth: 46 }}>price</span>
+        <button style={btn} onClick={() => bump(-1)} aria-label="decrease price">−</button>
+        <input
+          type="number"
+          value={price}
+          step={step}
+          min={0.01}
+          onChange={(e) => {
+            setTouched(true)
+            const v = Number(e.target.value)
+            if (Number.isFinite(v)) setPrice(v)
+          }}
+          style={{
+            width: 96, textAlign: 'right', padding: '3px 6px', fontSize: 13,
+            background: 'var(--bg)', color: 'var(--text)',
+            border: '1px solid var(--border)', borderRadius: 'var(--r-sm, 4px)',
+          }}
+        />
+        <button style={btn} onClick={() => bump(1)} aria-label="increase price">+</button>
+        <span style={{ color: 'var(--faint)', fontSize: 11.5 }}>
+          {pct1(price / spot - 1)} vs spot {fmt2(spot)}
+        </span>
+        {price !== Number(spot.toFixed(2)) && (
+          <button
+            style={{ ...btn, width: 'auto', padding: '0 8px', fontSize: 11.5 }}
+            onClick={() => { setTouched(false); setPrice(Number(spot.toFixed(2))) }}
+          >
+            reset
+          </button>
+        )}
+      </div>
+      <Picker
+        label="step"
+        options={STEP_CHOICES.map((s) => ({ key: String(s), text: String(s) }))}
+        selected={new Set([String(step)])}
+        onChange={(sel) => {
+          const next = [...sel].map(Number).find((n) => n !== step)
+          if (next != null) setStep(next)
+        }}
+      />
+      {/* S71 — hold-until date. Native <input type="date"> is the dropdown calendar; the
+          presets cover the common horizons without opening it. */}
+      <div style={{ display: 'flex', gap: 6, alignItems: 'center', flexWrap: 'wrap', margin: '4px 0' }}>
+        <span style={{ color: 'var(--muted)', fontSize: 11.5, minWidth: 46 }}>on date</span>
+        <input
+          type="date"
+          value={onDate}
+          min={isoToday()}
+          onChange={(e) => setOnDate(e.target.value)}
+          style={{
+            padding: '3px 6px', fontSize: 12.5, background: 'var(--bg)', color: 'var(--text)',
+            border: '1px solid var(--border)', borderRadius: 'var(--r-sm, 4px)',
+            colorScheme: 'dark',
+          }}
+        />
+        {DATE_PRESETS.map(([label, days]) => (
+          <button
+            key={label}
+            style={{ ...btn, width: 'auto', padding: '0 8px', fontSize: 11.5 }}
+            onClick={() => setOnDate(isoInDays(days))}
+          >
+            {label}
+          </button>
+        ))}
+        {onDate && (
+          <>
+            <button
+              style={{ ...btn, width: 'auto', padding: '0 8px', fontSize: 11.5 }}
+              onClick={() => setOnDate('')}
+            >
+              clear
+            </button>
+            {holdDays != null && (
+              <span style={{ color: 'var(--faint)', fontSize: 11.5 }}>
+                {holdDays === 0 ? 'today' : `${holdDays} calendar day${holdDays === 1 ? '' : 's'} out`}
+              </span>
+            )}
+          </>
+        )}
+      </div>
+      {target ? render(target, onDate || null) : (
+        <Caption>
+          {q.isError
+            ? 'custom price unavailable — generate the report for this ticker first'
+            : '…'}
+        </Caption>
+      )}
+    </div>
+  )
+}
+
 /** S68 — "what would a move there look like": travel estimate + long-call repricing per
  *  key target. Purely additive under the ladder; absent projections render nothing.
  *  S69: four quoted tenors (~45d/~90d/~6mo/~1yr) and a per-expiry strike ladder, surfaced
  *  through the two pickers; defaults to the ATM row of every tenor (the CLI's view). */
-function LadderProjections({ proj }: { proj: Projections }) {
+function LadderProjections({ proj, ticker, spot }: {
+  proj: Projections
+  ticker?: string
+  spot?: number | null
+}) {
   const qm = proj.quote_meta
-  const src = qm
-    ? `quoted contracts as of ${qm.as_of_str ?? '?'}${qm.stale ? ' — STALE, entries re-modeled at current spot' : ''}`
-    : 'modeled, not a quote'
+  // S70: entries are re-modeled when the cache is session-stale OR when the spot it was quoted
+  // at has drifted from the report's — say which, so "entry ≈" is never unexplained
+  const why = !(qm?.remodeled || qm?.stale) ? ''
+    : qm.stale ? ' — STALE, entries re-modeled at current spot'
+      : qm.spot_drift != null
+        ? ` — quoted at ${fmt2(qm.quote_spot ?? 0)} (${pct1(qm.spot_drift)} vs spot), entries re-modeled at current spot`
+        : ' — entries re-modeled at current spot'
+  const src = qm ? `quoted contracts as of ${qm.as_of_str ?? '?'}${why}` : 'modeled, not a quote'
   // YY-MM-DD (slice 2, not 5): a 2027 LEAP is ambiguous without the year
   const expKey = (c: ProjRow) => (c.expiry ?? '') || `${c.dte.toFixed(0)}d`
   const expText = (c: ProjRow) => `${(c.expiry ?? '').slice(2) || `${c.dte.toFixed(0)}d`} · ${c.dte.toFixed(0)}d`
@@ -406,6 +589,71 @@ function LadderProjections({ proj }: { proj: Projections }) {
   const exps = expSel ?? defExp
   const strikes = strikeSel ?? (defStrikes.size ? defStrikes : new Set(strikeOpts.map((o) => o.key)))
 
+  // one target → header line + contract table. Shared by the ladder's fixed targets and the
+  // custom-price stepper, so the two can never render or filter differently.
+  const renderTarget = (t: ProjTarget, dateLabel?: string | null) => {
+    let rows = t.contracts.length ? t.contracts : t.synthetic
+    if (t.contracts.length) {
+      rows = rows.filter((c) => exps.has(expKey(c)) && strikes.has(String(c.strike)))
+    }
+    const ts = t.travel_sessions
+    // S71 — the dated leg only exists when a hold date was chosen, so its columns appear only
+    // then (an always-present "—" column would just be noise on the fixed targets)
+    const hasDated = !!dateLabel && rows.some((c) => c.dated)
+    return (
+      <div key={`${t.kind}-${t.price}`} style={{ margin: '6px 0' }}>
+        <div style={{ fontSize: 13.5 }}>
+          <span style={{ color: t.dist_pct >= 0 ? RED : GREEN, fontWeight: 600 }}>
+            → {t.kind} {fmt2(t.price)} ({pct1(t.dist_pct)})
+          </span>
+          {t.label && <span style={{ color: 'var(--muted)' }}> · {t.label}</span>}
+          {ts != null && (
+            <span style={{ color: 'var(--faint)' }}>
+              {' '}· ~{ts.toFixed(0)} session{ts >= 1.5 ? 's' : ''} at recent pace
+            </span>
+          )}
+        </div>
+        {rows.length ? (
+          <DataTable
+            rows={rows.map((c) => ({
+              contract: contractName(c),
+              delta: c.delta != null ? c.delta.toFixed(2) : '—',
+              entry: c.src === 'quoted'
+                ? (c.entry_modeled ? `entry ≈ ${fmt2(c.entry_mid ?? 0)}` : `mid ${fmt2(c.entry_mid ?? 0)}`)
+                : `prem ≈ ${fmt2(c.premium ?? 0)}`,
+              instant: fmt2(c.instant.value),
+              paced: c.paced ? fmt2(c.paced.value) : '—',
+              pnl: `${pnlS(c.instant.pnl_mid_pct)} / ${pnlS(c.paced?.pnl_mid_pct)}`,
+              ask: c.instant.pnl_ask_pct != null
+                ? `${pnlS(c.instant.pnl_ask_pct)} / ${pnlS(c.paced?.pnl_ask_pct)}` : '—',
+              dated: c.dated ? (c.dated.expired ? `${fmt2(c.dated.value)} exp` : fmt2(c.dated.value)) : '—',
+              datedPnl: c.dated ? pnlS(c.dated.pnl_mid_pct) : '—',
+              _c: c,
+            }))}
+            columns={[
+              { key: 'contract', header: 'Contract' },
+              { key: 'delta', header: 'Δ', align: 'right' },
+              { key: 'entry', header: 'Entry' },
+              { key: 'instant', header: 'At level (instant)', align: 'right' },
+              { key: 'paced', header: 'At level (paced)', align: 'right' },
+              ...(hasDated ? [
+                { key: 'dated', header: `On ${dateLabel}`, align: 'right' as const },
+                { key: 'datedPnl', header: 'P&L on date', align: 'right' as const,
+                  style: (r: { _c: ProjRow }) => pnlStyle(r._c.dated?.pnl_mid_pct) },
+              ] : []),
+              { key: 'pnl', header: 'P&L mid (inst/paced)', align: 'right',
+                style: (r) => pnlStyle(r._c.instant.pnl_mid_pct) },
+              { key: 'ask', header: 'P&L at ask', align: 'right',
+                style: (r) => pnlStyle(r._c.instant.pnl_ask_pct) },
+            ]}
+          />
+        ) : (
+          <Caption>— (no IV available to model a call)</Caption>
+        )}
+      </div>
+    )
+  }
+
   return (
     <div style={{ marginTop: 10 }}>
       <div style={{ fontSize: 12, color: 'var(--muted)', marginBottom: 4 }}>
@@ -417,58 +665,11 @@ function LadderProjections({ proj }: { proj: Projections }) {
           <Picker label="strike" options={strikeOpts} selected={strikes} onChange={setStrikeSel} />
         </div>
       )}
-      {proj.targets.map((t) => {
-        let rows = t.contracts.length ? t.contracts : t.synthetic
-        if (t.contracts.length) {
-          rows = rows.filter((c) => exps.has(expKey(c)) && strikes.has(String(c.strike)))
-        }
-        const ts = t.travel_sessions
-        return (
-          <div key={`${t.kind}-${t.price}`} style={{ margin: '6px 0' }}>
-            <div style={{ fontSize: 13.5 }}>
-              <span style={{ color: t.dist_pct >= 0 ? RED : GREEN, fontWeight: 600 }}>
-                → {t.kind} {fmt2(t.price)} ({pct1(t.dist_pct)})
-              </span>
-              {t.label && <span style={{ color: 'var(--muted)' }}> · {t.label}</span>}
-              {ts != null && (
-                <span style={{ color: 'var(--faint)' }}>
-                  {' '}· ~{ts.toFixed(0)} session{ts >= 1.5 ? 's' : ''} at recent pace
-                </span>
-              )}
-            </div>
-            {rows.length ? (
-              <DataTable
-                rows={rows.map((c) => ({
-                  contract: contractName(c),
-                  delta: c.delta != null ? c.delta.toFixed(2) : '—',
-                  entry: c.src === 'quoted'
-                    ? (c.entry_modeled ? `entry ≈ ${fmt2(c.entry_mid ?? 0)}` : `mid ${fmt2(c.entry_mid ?? 0)}`)
-                    : `prem ≈ ${fmt2(c.premium ?? 0)}`,
-                  instant: fmt2(c.instant.value),
-                  paced: c.paced ? fmt2(c.paced.value) : '—',
-                  pnl: `${pnlS(c.instant.pnl_mid_pct)} / ${pnlS(c.paced?.pnl_mid_pct)}`,
-                  ask: c.instant.pnl_ask_pct != null
-                    ? `${pnlS(c.instant.pnl_ask_pct)} / ${pnlS(c.paced?.pnl_ask_pct)}` : '—',
-                  _c: c,
-                }))}
-                columns={[
-                  { key: 'contract', header: 'Contract' },
-                  { key: 'delta', header: 'Δ', align: 'right' },
-                  { key: 'entry', header: 'Entry' },
-                  { key: 'instant', header: 'At level (instant)', align: 'right' },
-                  { key: 'paced', header: 'At level (paced)', align: 'right' },
-                  { key: 'pnl', header: 'P&L mid (inst/paced)', align: 'right',
-                    style: (r) => pnlStyle(r._c.instant.pnl_mid_pct) },
-                  { key: 'ask', header: 'P&L at ask', align: 'right',
-                    style: (r) => pnlStyle(r._c.instant.pnl_ask_pct) },
-                ]}
-              />
-            ) : (
-              <Caption>— (no IV available to model a call)</Caption>
-            )}
-          </div>
-        )
-      })}
+      {ticker && spot != null && (
+        <CustomPrice ticker={ticker} spot={spot} render={renderTarget} />
+      )}
+      {/* wrapped, not passed by reference — .map would feed the index into dateLabel */}
+      {proj.targets.map((t) => renderTarget(t))}
       <Caption>
         modeled: IV held constant, no skew/vol-path;{' '}
         {proj.pace_note ?? 'pace = |move| ÷ avg daily move (HV-20)'} — heuristic, not advice
@@ -529,7 +730,9 @@ export function SecLadder({ p }: { p: Payload }) {
           {ul.confluence?.length ? `confluence with ${ul.confluence.join(' · ')}` : 'no other known level nearby'}
         </Caption>
       )}
-      {lad.projections?.targets?.length ? <LadderProjections proj={lad.projections} /> : null}
+      {lad.projections?.targets?.length
+        ? <LadderProjections proj={lad.projections} ticker={String(p.ticker ?? '')} spot={lad.spot} />
+        : null}
       {lad.levels.length > above.length + below.length && (
         <Collapsible title={`all ${lad.levels.length} levels`}>
           {lad.levels.map(row)}

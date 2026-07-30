@@ -20,24 +20,21 @@ import os
 import time
 
 from modules.tradier import TRADIER_TOKEN, get_current_price, get_expirations, get_chain
-from modules.pc_oi import _cache_path, cache_stale, _cache_age, _hhmm, is_monthly_expiry
+from modules.pc_oi import _cache_path, cache_stale, _cache_age, _hhmm
 
-SCOPEKEY = "call3"           # bumped when the cached payload shape changes (S69: per-expiry ladder)
-# ~45d/~90d = the research-consensus short tenors (45–60d+ slows theta, ~90d swing). 180/365 (S69)
-# are the tenors this project actually TRADES — archive/ml_pipeline/sizing.py targets MIN_DTE=180 /
-# MAX_DTE=365 — so the level projections can price the instrument the user actually buys.
+SCOPEKEY = "call4"           # bumped when the cached payload shape changes (S72: every monthly)
+# S72 — EXPIRY WINDOW. Superseded the S69 "nearest expiry to each of 4 target DTEs" rule, which
+# quoted only 4 expiries and silently hid the rest: SOFI lists monthlies at 113/141/232 DTE that
+# never appeared. Now every MONTHLY inside the window is quoted, and the picker shows them all —
+# so the user chooses the tenor instead of the code guessing which 4 they meant. Widen/narrow
+# here; each added expiry is one Tradier chain call (~0.55s measured).
+EXPIRY_MIN_DTE = 20          # below this it's weekly/gamma territory, not a long-call tenor
+EXPIRY_MAX_DTE = 550         # ~18mo — past the next Jan LEAP; beyond it OI thins out badly
+MAX_EXPIRIES = 12            # network cap, nearest-first (rarely binds: 10 SOFI / 12 QQQ / 5 CRSP)
+# The tenors the CLI curates down to — a terminal can't have a picker, and 12 expiries × 5 targets
+# would be 60 rows. The WEB gets every expiry; the CLI shows the nearest monthly to each of these.
 TARGET_DTES = (45, 90, 180, 365)
 OTM_DELTA = 0.375            # midpoint of the 0.35–0.40Δ trend band
-CURVE_MAX_DTE = 400          # IV-by-expiry curve horizon — reaches the LEAPS tenors (S47)
-CURVE_MAX_EXPIRIES = 7       # …and its API-call budget (1 chain call per expiry)
-# Long-tenor expiry selection (S69). Out past ~5 months the monthly grid goes sparse and
-# ticker-specific: SOFI jumps 232d → 505d with only a NON-monthly 322d in between, so a
-# monthly-only pick would label 232d (7.6mo) as "~1yr". Past LONG_DTE_MIN the pool widens to every
-# listed expiry, and a pick further than tenor_tol() from target is dropped rather than mislabeled
-# (CRSP has 171d then 542d — it simply has no 1-year tenor).
-LONG_DTE_MIN = 150
-TENOR_TOL_FRAC = 0.35        # ±35% of target (±128d at 365) …
-TENOR_TOL_MIN = 30           # … with a floor so short tenors keep a usable window
 # Per-expiry strike ladder (S69) — the chain rows are already fetched for the ATM/OTM pick, so
 # retaining a bounded ladder costs ZERO extra network. Feeds the web strike selector.
 LADDER_PCT = 0.25            # keep tradeable calls within ±25% of spot …
@@ -171,35 +168,63 @@ def curve_read(points):
     return {"points": [{"label": l, "dte": d, "iv": float(iv)} for l, d, iv in pts], "tag": tag}
 
 
-def tenor_tol(target):
-    """PURE: how far from `target` DTE an expiry may sit and still represent that tenor (S69)."""
-    return max(TENOR_TOL_MIN, TENOR_TOL_FRAC * target)
+def _third_friday(year, month):
+    """PURE: the standard monthly-expiration date for a month — its third Friday."""
+    fridays = [d for d in range(1, 29)
+               if datetime.date(year, month, d).weekday() == 4]
+    return datetime.date(year, month, fridays[2])
 
 
-def _select_expiries(future, targets=TARGET_DTES, long_dte_min=LONG_DTE_MIN):
-    """PURE: nearest expiry to each target DTE, deduped, sorted by dte.
+def monthly_expiries(future):
+    """PURE: the MONTHLY expiries out of `future` [(iso, dte), …], holiday-aware (S72).
 
-    Monthlies (3rd Friday = liquidity) are preferred. For targets at/above `long_dte_min` the pool
-    widens to EVERY listed expiry when no monthly lands within tolerance — out past ~5 months the
-    grid is sparse and ticker-specific, and a non-monthly LEAP that is 43 days off target beats a
-    monthly that is 133 days off (the SOFI 322d-vs-232d case). A target with nothing inside
-    `tenor_tol` is OMITTED, so a tenor is never mislabeled (CRSP: 171d then 542d = no 1yr)."""
-    monthlies = [(e, d) for e, d in future
-                 if is_monthly_expiry(datetime.date.fromisoformat(e))]
+    List-aware on purpose. `pc_oi.is_monthly_expiry` is date-only (Friday, day 15-21) and so
+    cannot see a holiday shift: when the third Friday is a market holiday the monthly moves to
+    the Thursday before it, and that date then reads as "not monthly". Probed live 2026-07-30 —
+    SOFI/QQQ/AMD all list 2027-06-17 (Thu) and NOT 2027-06-18, because Juneteenth 2027 falls on
+    a Saturday and is observed that Friday. Under the old rule the June-2027 LEAP was classified
+    non-monthly and would have been dropped by a monthlies-only filter.
+
+    Rule per (year, month) present in the list: the third Friday if it is listed, else the day
+    before it if THAT is listed. Anything else (weeklies, month-end quarterlies like 26-12-31 or
+    27-03-31) is not a monthly — which a bare "Thursday in the 15-21 window" test would get
+    wrong on tickers that list Thursday weeklies (QQQ lists daily expiries)."""
+    listed = {e for e, _ in future}
+    keep = set()
+    for e, _ in future:
+        d = datetime.date.fromisoformat(e)
+        tf = _third_friday(d.year, d.month)
+        if tf.isoformat() in listed:
+            keep.add(tf.isoformat())
+        else:
+            prev = (tf - datetime.timedelta(days=1)).isoformat()
+            if prev in listed:
+                keep.add(prev)
+    return sorted([(e, d) for e, d in future if e in keep], key=lambda ed: ed[1])
+
+
+def select_expiries(future, min_dte=EXPIRY_MIN_DTE, max_dte=EXPIRY_MAX_DTE, max_n=MAX_EXPIRIES):
+    """PURE: every monthly expiry inside the DTE window, nearest-first, capped (S72).
+
+    Replaces the S69 nearest-to-target rule. Quoting the whole window means the expiry picker
+    offers what the chain actually lists, so no tenor is hidden and none has to be labeled
+    "~1yr" (the label was the thing that could lie — the grid is ticker-specific)."""
+    sel = [(e, d) for e, d in monthly_expiries(future) if min_dte <= d <= max_dte]
+    return sorted(sel[:max_n], key=lambda ed: ed[1])
+
+
+def nearest_to_targets(pairs, targets=TARGET_DTES):
+    """PURE: the subset of [(key, dte), …] nearest each target DTE, deduped, sorted (S72).
+    The CLI's curation — a terminal has no picker, so it shows one row per canonical tenor
+    while the payload (and the web) carry every quoted monthly."""
+    if not pairs:
+        return []
     sel = []
     for t in targets:
-        tol = tenor_tol(t)
-        best = None
-        for pool in ((monthlies or future), future if t >= long_dte_min else []):
-            if not pool:
-                continue
-            e, d = min(pool, key=lambda ed: abs(ed[1] - t))
-            if abs(d - t) <= tol:
-                best = (e, d)
-                break                     # monthly inside tolerance wins — don't widen
-        if best and all(best[0] != s[0] for s in sel):
-            sel.append(best)
-    return sorted(sel, key=lambda s: s[1])
+        k, d = min(pairs, key=lambda kd: abs(kd[1] - t))
+        if all(k != s[0] for s in sel):
+            sel.append((k, d))
+    return sorted(sel, key=lambda kd: kd[1])
 
 
 def strike_ladder(rows, spot, max_n=LADDER_MAX, pct=LADDER_PCT, otm_delta=OTM_DELTA):
@@ -262,14 +287,16 @@ def _fetch(ticker, earnings_date=None, ex_div_date=None):
             exd = None
 
     blocks, curve_pts, grade = [], [], None
-    for e, d in _select_expiries(future):
+    for e, d in select_expiries(future):
         rows = _parse(get_chain(ticker, e))
         atm, otm = pick_call_candidates(rows, spot)
         cand = _candidate(atm, spot)
         if cand is None:
             continue
         blk = {"expiry": e, "dte": d,
-               "monthly": is_monthly_expiry(datetime.date.fromisoformat(e)),
+               # every quoted expiry IS a monthly now (select_expiries filters), but the flag
+               # stays for consumers and old caches — holiday-aware, unlike is_monthly_expiry
+               "monthly": True,
                "atm": cand, "otm": _candidate(otm, spot),
                # S69: the full bounded ladder off the SAME parsed rows (no extra call) — the
                # level-projection strike selector prices any of these
@@ -289,26 +316,10 @@ def _fetch(ticker, earnings_date=None, ex_div_date=None):
     if not blocks:
         return None
 
-    # Extend the IV curve with additional monthlies (budget-capped: 1 chain call per expiry).
-    # The quote expiries above already seeded curve_pts, and this loop skips anything within 2
-    # days of an existing point while breaking at CURVE_MAX_EXPIRIES — so S69's two extra quote
-    # tenors consume curve budget rather than adding to it, and the total chain-call count per
-    # --call run is unchanged (~7). A >CURVE_MAX_DTE quote expiry (a 431d 1yr pick) stays in the
-    # curve: it is a tenor actually being quoted, so the curve should show it.
-    monthlies = [(e, d) for e, d in future
-                 if d <= CURVE_MAX_DTE and is_monthly_expiry(datetime.date.fromisoformat(e))]
-    for e, d in sorted(monthlies, key=lambda ed: ed[1]):
-        if len(curve_pts) >= CURVE_MAX_EXPIRIES:
-            break
-        if any(abs(d - p[1]) < 2 for p in curve_pts):
-            continue
-        try:
-            atm, _ = pick_call_candidates(_parse(get_chain(ticker, e)), spot)
-        except Exception:
-            continue
-        if atm and atm.get("iv"):
-            curve_pts.append((e[2:], d, float(atm["iv"])))
-
+    # The IV curve needs no separate fetch pass any more (S72): every monthly in the window is
+    # already quoted above, so curve_pts is complete and richer than the old 7-point cap — and
+    # strictly cheaper than fetching some expiries twice. Chain calls per --call run = exactly
+    # len(select_expiries(...)).
     return {"spot": spot, "earn_days": earn_days, "quotes": blocks,
             "curve": curve_read(curve_pts), "liquidity": grade}
 

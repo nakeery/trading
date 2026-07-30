@@ -313,3 +313,45 @@ def test_chart_asof_noncanonical_matches_payload(monkeypatch):
     # both retain the payload → both draw the earnings vline
     assert canon["fig"]["layout"].get("shapes")
     assert noncanon["fig"]["layout"].get("shapes")
+
+
+def test_project_endpoint_guards():
+    """S70 custom-price stepper: /api/project reprices through modules/levelproj (no chain
+    fetch, no regenerate). It must refuse cleanly rather than invent a spot when the ticker
+    hasn't been generated in this process, and reject a nonsense price."""
+    reportgen.LATEST.pop("FAKE", None)
+    assert client.get("/api/project/FAKE?price=110").status_code == 409   # nothing generated
+
+    reportgen.LATEST["FAKE"] = {
+        "ticker": "FAKE", "as_of_mode": None, "ctx": None,
+        "ladder": {"spot": 100.0, "projections": {"params": {"hv20": 0.45, "r": 0.04}}},
+    }
+    try:
+        assert client.get("/api/project/FAKE?price=0").status_code == 422
+        assert client.get("/api/project/FAKE?price=-5").status_code == 422
+        assert client.get("/api/project/FAKE?price=abc").status_code == 422   # FastAPI coercion
+        assert client.get("/api/project/FAKE").status_code == 422             # price required
+
+        # no --call cache for FAKE → the synthetic path still prices off the HV-20 proxy
+        body = client.get("/api/project/FAKE?price=110").json()
+        t = body["target"]
+        assert t["kind"] == "custom price" and abs(t["dist_pct"] - 0.10) < 1e-9
+        assert t["synthetic"] and all(s["src"] == "modeled" for s in t["synthetic"])
+        # JSON-safe: the sanitizer must have run (no NaN/numpy leaking through)
+        assert json.loads(json.dumps(body)) == body
+
+        # S71 dated leg — absent without ?date, present with one, past dates refused
+        assert all(s.get("dated") is None for s in t["synthetic"])
+        soon = (dt.date.today() + dt.timedelta(days=30)).isoformat()
+        dated = client.get(f"/api/project/FAKE?price=110&date={soon}").json()
+        assert dated["on_date"] == soon and dated["hold_days"] == 30
+        legs = [s["dated"] for s in dated["target"]["synthetic"]]
+        assert legs and all(g is not None for g in legs)
+        # 30 days of decay makes every leg worth less than the instant one
+        for s in dated["target"]["synthetic"]:
+            assert s["dated"]["value"] < s["instant"]["value"]
+        past = (dt.date.today() - dt.timedelta(days=1)).isoformat()
+        assert client.get(f"/api/project/FAKE?price=110&date={past}").status_code == 422
+        assert client.get("/api/project/FAKE?price=110&date=nope").status_code == 422
+    finally:
+        reportgen.LATEST.pop("FAKE", None)

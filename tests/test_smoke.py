@@ -988,10 +988,10 @@ def test_read_breadth():
 def test_callquote_helpers():
     """modules/callquote (S46): pick_call_candidates takes the tradeable ATM + the OTM call with
     delta nearest 0.375 (no-bid strikes skipped); liquidity_grade bands (tight/ok/wide/dead, OI
-    floor demotion, majority-no-bid → dead); curve_read tags the cheaper tenor; _select_expiries
-    picks the monthlies nearest 45/90 DTE. Pure, no network."""
+    floor demotion, majority-no-bid → dead); curve_read tags the cheaper tenor; select_expiries
+    takes every monthly in the DTE window (S72). Pure, no network."""
     from modules.callquote import (pick_call_candidates, liquidity_grade, curve_read,
-                                   _select_expiries)
+                                   select_expiries)
 
     def row(typ, strike, bid, ask, oi=100, delta=None, theta=None, iv=None, volume=10):
         return {"type": typ, "strike": strike, "bid": bid, "ask": ask, "oi": oi,
@@ -1025,9 +1025,12 @@ def test_callquote_helpers():
     assert curve_read([("Aug21", 46, 0.28)]) is None
     assert curve_read([("A", 30, 0.25), ("B", 90, 0.25)])["tag"] == "flat curve"
 
+    # S72: every MONTHLY inside the DTE window (was: nearest to each of 4 target DTEs).
+    # 07-17 and 08-07 are third-Friday-shaped only for their own months — 07-17 IS July's
+    # third Friday but sits below EXPIRY_MIN_DTE; 08-07 is a weekly.
     future = [("2026-07-17", 10), ("2026-08-07", 31), ("2026-08-21", 45),
               ("2026-09-18", 73), ("2026-10-16", 101)]
-    assert [s[0] for s in _select_expiries(future)] == ["2026-08-21", "2026-10-16"]
+    assert [s[0] for s in select_expiries(future)] == ["2026-08-21", "2026-09-18", "2026-10-16"]
 
 
 # ─── Test 31: beta / ex-div / catalysts helpers (offline) ─────────────────────
@@ -2727,37 +2730,51 @@ def test_projections_render():
                                    out.index("not advice") + len("not advice\n")], "")
 
 
-# ─── S69: long-tenor expiry selection + per-expiry strike ladder (offline) ──────
-def test_s69_long_tenor_expiry_selection():
-    """The ~6mo/~1yr tenors must resolve against REAL, sparse LEAPS grids. Out past ~5 months
-    the monthly ladder is ticker-specific, so: monthlies are preferred while one is inside
-    tolerance, the pool widens to every listed expiry beyond LONG_DTE_MIN, and a target with
-    nothing inside tenor_tol is OMITTED rather than mislabeled."""
-    from modules.callquote import _select_expiries, tenor_tol
+# ─── S72: monthly-window expiry selection, holiday-aware (offline) ──────────────
+def test_s72_monthly_window_selection():
+    """S72 replaced "nearest expiry to each of 4 target DTEs" with "every MONTHLY in a DTE
+    window". The S69 rule quoted 4 expiries and silently hid the rest — SOFI lists monthlies at
+    113/141/232 DTE that never appeared as pills.
 
-    assert tenor_tol(45) == 30 and abs(tenor_tol(365) - 127.75) < 1e-9
+    The load-bearing subtlety is HOLIDAY SHIFT: when a third Friday is a market holiday the
+    monthly moves to the Thursday before, and pc_oi.is_monthly_expiry (Friday, day 15-21) then
+    calls it non-monthly. Probed live 2026-07-30 — SOFI/QQQ/AMD all list 2027-06-17 (Thu) and
+    NOT 2027-06-18, because Juneteenth 2027 is a Saturday, observed that Friday. A naive
+    monthlies-only filter would DROP that LEAP."""
+    from modules.callquote import monthly_expiries, nearest_to_targets, select_expiries
 
-    # SOFI (probed 2026-07-30): monthlies 169/232/505 + a NON-monthly 322d LEAP. The 1yr slot
-    # must take 322 (43 off) and not the monthly 232 (133 off) — the motivating case.
-    sofi = [("2026-08-21", 22), ("2026-09-18", 50), ("2026-10-16", 78), ("2026-11-20", 113),
-            ("2026-12-18", 141), ("2027-01-15", 169), ("2027-03-19", 232),
-            ("2027-06-17", 322), ("2027-12-17", 505), ("2028-01-21", 540)]
-    assert _select_expiries(sofi) == [("2026-09-18", 50), ("2026-10-16", 78),
-                                      ("2027-01-15", 169), ("2027-06-17", 322)]
+    # SOFI's real grid (probed 2026-07-30), weeklies included
+    sofi = [("2026-07-31", 1), ("2026-08-07", 8), ("2026-08-14", 15), ("2026-08-21", 22),
+            ("2026-08-28", 29), ("2026-09-04", 36), ("2026-09-11", 43), ("2026-09-18", 50),
+            ("2026-10-16", 78), ("2026-11-20", 113), ("2026-12-18", 141), ("2027-01-15", 169),
+            ("2027-03-19", 232), ("2027-06-17", 322), ("2027-12-17", 505), ("2028-01-21", 540),
+            ("2028-06-16", 687), ("2028-12-15", 869)]
+    mon = [d for _, d in monthly_expiries(sofi)]
+    assert 322 in mon                                  # the holiday-shifted June-2027 monthly
+    assert mon == [22, 50, 78, 113, 141, 169, 232, 322, 505, 540, 687, 869]
+    assert all(w not in mon for w in (1, 8, 15, 29, 36, 43))     # weeklies excluded
 
-    # CRSP: 171d then 542d — nothing within ±128 of 365, so there is simply NO 1yr row
-    crsp = [("2026-09-18", 50), ("2026-10-16", 78), ("2027-01-15", 171), ("2028-01-21", 542)]
-    assert [d for _, d in _select_expiries(crsp)] == [50, 78, 171]
+    # the window keeps everything tradeable and drops only the 687/869 tail (EXPIRY_MAX_DTE)
+    sel = [d for _, d in select_expiries(sofi)]
+    assert sel == [22, 50, 78, 113, 141, 169, 232, 322, 505, 540]
+    assert all(20 <= d <= 550 for d in sel)
+    # …and the previously-hidden monthlies are now present
+    assert {113, 141, 232} <= set(sel)
 
-    # a liquid monthly inside tolerance beats a closer non-monthly (QQQ: 414 monthly vs 335
-    # quarterly — 414 is 49 off, inside ±128, so the pool never widens)
-    qqq = [("2026-09-18", 50), ("2026-10-16", 78), ("2027-01-15", 169),
-           ("2027-06-30", 335), ("2027-09-17", 414)]
-    assert [d for _, d in _select_expiries(qqq)] == [50, 78, 169, 414]
+    # month-end quarterlies are NOT monthlies (QQQ lists 26-12-31 Thu and 27-03-31 Wed), and
+    # a Thursday weekly in the 15-21 window must not be mistaken for a holiday shift
+    qqq = [("2026-08-13", 14), ("2026-08-20", 21), ("2026-08-21", 22), ("2026-12-31", 154),
+           ("2027-03-31", 244), ("2027-09-17", 414)]
+    qmon = [e for e, _ in monthly_expiries(qqq)]
+    assert qmon == ["2026-08-21", "2027-09-17"]        # 08-20 Thu ignored: 08-21 Fri is listed
 
-    # dedup: one expiry can only serve one tenor
-    thin = [("2026-09-18", 50), ("2027-01-15", 169)]
-    assert [d for _, d in _select_expiries(thin)] == [50, 169]
+    # cap is nearest-first
+    assert [d for _, d in select_expiries(sofi, max_n=3)] == [22, 50, 78]
+
+    # CLI curation picks one per canonical tenor out of the full set
+    assert [d for _, d in nearest_to_targets([(e, d) for e, d in select_expiries(sofi)])] == [
+        50, 78, 169, 322]
+    assert nearest_to_targets([]) == []
 
 
 def test_s69_strike_ladder():
@@ -2821,6 +2838,125 @@ def test_s69_ladder_repricing():
     p2 = project_targets(ladder, hv20=0.45, callq={"quotes": [old]})
     assert [(c["strike"], c["kind"]) for c in p2["targets"][0]["contracts"]] == [
         (100.0, "atm"), (110.0, "otm")]
+
+
+def test_s70_project_price():
+    """The custom-price stepper (S70) must go through the SAME pricing path as the fixed
+    targets — one Black-Scholes implementation, server-side — so the two can never disagree."""
+    from modules.levelproj import project_price, project_targets
+
+    blk = {"expiry": "2027-06-17", "dte": 322, "ladder": [
+        {"strike": 100.0, "mid": 9.5, "iv": 0.5, "delta": 0.55, "kind": "atm", "moneyness": 0.0},
+        {"strike": 115.0, "mid": 4.5, "iv": 0.52, "delta": 0.375, "kind": "otm", "moneyness": 0.15}]}
+    callq = {"quotes": [blk]}
+
+    out = project_price(110.0, 100.0, hv20=0.45, callq=callq)
+    t = out["target"]
+    assert t["kind"] == "custom price"
+    assert abs(t["dist_pct"] - 0.10) < 1e-12 and t["price"] == 110.0
+    assert len(t["contracts"]) == 2 and {c["kind"] for c in t["contracts"]} == {"atm", "otm"}
+
+    # identical to the ladder path at the same price — the anti-drift guarantee. dist_pct uses
+    # the SAME expression project_price does: 110/100 - 1 is 0.10000000000000009, not 0.10, and
+    # that 1e-17 feeds travel_sessions, so a hardcoded 0.10 makes this a near-miss not a match.
+    lad = {"spot": 100.0, "levels": [], "nearest_support": None, "nearest_resistance": None,
+           "user_level": {"price": 110.0, "dist_pct": 110.0 / 100.0 - 1.0, "confluence": []}}
+    ref = project_targets(lad, hv20=0.45, callq=callq)["targets"][0]
+    assert ([c["instant"]["value"] for c in t["contracts"]]
+            == [c["instant"]["value"] for c in ref["contracts"]])
+    assert t["travel_sessions"] == ref["travel_sessions"]
+
+    # stepping the price down is monotonically worth less (a call is increasing in spot) — the
+    # invariant that matters for a stepper, and independent of the fixture's entry mids
+    down = project_price(90.0, 100.0, hv20=0.45, callq=callq)["target"]
+    flat = project_price(100.0, 100.0, hv20=0.45, callq=callq)["target"]
+    assert down["dist_pct"] < 0 and flat["dist_pct"] == 0
+    for i in range(len(t["contracts"])):
+        assert (down["contracts"][i]["instant"]["value"]
+                < flat["contracts"][i]["instant"]["value"]
+                < t["contracts"][i]["instant"]["value"])
+    # travel is distance-symmetric, and zero distance costs zero sessions
+    assert abs(down["travel_sessions"] - t["travel_sessions"]) < 1e-9
+    assert flat["travel_sessions"] == 0
+
+    # S70 SPOT-DRIFT re-model. The S68 fix only re-modeled a session-STALE cache, but a cache
+    # taken earlier the SAME session is "fresh" and can still be struck at a far-away spot —
+    # probed live: SOFI's call3 cache held spot 16.13 against a 15.25 report spot, so EVERY
+    # contract read ≈ −19% at a zero-percent move. Projecting at spot must be ≈ break-even.
+    drifted = {"quotes": [blk], "spot": 110.0, "stale": False}      # quoted 10% above spot
+    at_spot = project_price(100.0, 100.0, hv20=0.45, callq=drifted)
+    assert at_spot["quote_meta"]["remodeled"] is True
+    assert abs(at_spot["quote_meta"]["spot_drift"] - 0.10) < 1e-9
+    for c in at_spot["target"]["contracts"]:
+        assert c["entry_modeled"] is True
+        assert abs(c["instant"]["pnl_mid_pct"]) < 1e-9      # no move → no P&L
+        assert c["entry_ask"] is None                       # the stale spread is dead too
+
+    # inside the tolerance nothing is re-modeled (a 0.5% drift is just noise)
+    near = project_price(100.0, 100.0, hv20=0.45,
+                         callq={"quotes": [blk], "spot": 100.5, "stale": False})
+    assert near["quote_meta"]["remodeled"] is False
+    assert all(c["entry_modeled"] is False for c in near["target"]["contracts"])
+    # a cache with no spot at all can't drift-check — unchanged pre-S70 behaviour
+    assert project_price(100.0, 100.0, hv20=0.45,
+                         callq={"quotes": [blk]})["quote_meta"]["remodeled"] is False
+
+    # guards — never raises, never invents a projection
+    assert project_price(None, 100.0) is None
+    assert project_price(110.0, 100.0, callq=callq, on_date="not-a-date") is None
+    assert project_price(110.0, None) is None
+    assert project_price(0, 100.0) is None and project_price(-5, 100.0) is None
+    assert project_price("abc", 100.0) is None
+
+
+def test_s71_dated_leg():
+    """The date picker (S71): a third leg holding until a chosen DATE. Same repricing as
+    instant/paced, just an explicit hold instead of the HV-20 travel estimate — so it must
+    decay monotonically with time and collapse to intrinsic past the contract's expiry."""
+    from datetime import date, timedelta
+
+    from modules.levelproj import project_price
+
+    today = date(2026, 7, 30)
+    blk = {"expiry": "2027-06-17", "dte": 322, "ladder": [
+        {"strike": 100.0, "mid": 9.5, "iv": 0.5, "delta": 0.55, "kind": "atm", "moneyness": 0.0}]}
+    callq = {"quotes": [blk]}
+
+    def leg(days, price=110.0):
+        out = project_price(price, 100.0, hv20=0.45, callq=callq, today=today,
+                            on_date=(today + timedelta(days=days)).isoformat())
+        return out["target"]["contracts"][0]
+
+    # no date → no dated leg at all (the column must not appear on the fixed targets)
+    plain = project_price(110.0, 100.0, hv20=0.45, callq=callq, today=today)
+    assert plain["target"]["contracts"][0]["dated"] is None
+    assert plain["on_date"] is None and plain["hold_days"] is None
+
+    # date == today → zero hold → identical to the instant leg
+    d0 = leg(0)
+    assert d0["dated"]["value"] == d0["instant"]["value"]
+    assert d0["dated"]["t_rem_days"] == d0["dte"] and d0["dated"]["expired"] is False
+
+    # holding longer is worth strictly less (theta), and time left shrinks day for day
+    vals = [leg(d)["dated"] for d in (0, 30, 120, 300)]
+    assert all(a["value"] > b["value"] for a, b in zip(vals, vals[1:]))
+    assert [v["t_rem_days"] for v in vals] == [322, 292, 202, 22]
+
+    # past the contract's own expiry: dead, floored to intrinsic, and flagged
+    gone = leg(400)["dated"]
+    assert gone["expired"] is True and gone["t_rem_days"] == 0
+    assert abs(gone["value"] - 10.0) < 1e-9          # max(110 − 100, 0)
+    # …and below the strike it expires worthless, not at a negative value
+    worthless = leg(400, price=90.0)["dated"]
+    assert worthless["value"] == 0.0 and worthless["pnl_mid_pct"] == -1.0
+
+    # echoed metadata drives the column header + "N days out" caption
+    out = project_price(110.0, 100.0, hv20=0.45, callq=callq, today=today,
+                        on_date=(today + timedelta(days=45)).isoformat())
+    assert out["on_date"] == "2026-09-13" and out["hold_days"] == 45
+    # the past is not a projection
+    assert project_price(110.0, 100.0, callq=callq, today=today,
+                         on_date=(today - timedelta(days=1)).isoformat()) is None
 
 
 def test_s63_tf_order_and_ltf_gate(monkeypatch):

@@ -1,7 +1,9 @@
 // Typed fetchers for the LENS API. Always relative "/api/..." URLs — the Vite dev proxy
 // (vite.config.ts) forwards them to FastAPI on :8000; in prod both share one origin.
 
-import type { AhRead, ChartResponse, Flags, IvHistoryResponse, ReportBundle } from './types'
+import type {
+  AhRead, ChartResponse, Flags, IvHistoryResponse, ProjectionResponse, ReportBundle,
+} from './types'
 
 export async function getJson<T>(url: string): Promise<T> {
   const res = await fetch(url)
@@ -17,6 +19,17 @@ export function fetchTickers(): Promise<{ tickers: string[] }> {
  *  null during regular hours, so the client never needs its own session clock. */
 export function fetchAfterhours(ticker: string): Promise<{ ah: AhRead | null }> {
   return getJson(`/api/afterhours/${encodeURIComponent(ticker)}`)
+}
+
+/** Level projections repriced at an arbitrary price (S70 custom-price stepper). Server-side on
+ *  purpose — Black-Scholes lives in modules/levelproj.py and is never duplicated here, so the
+ *  stepper cannot drift from the table above it. Cheap: no chain fetch, no regenerate. */
+export function fetchProjection(
+  ticker: string, price: number, date?: string | null,
+): Promise<ProjectionResponse> {
+  const q = new URLSearchParams({ price: String(price) })
+  if (date) q.set('date', date)   // S71 dated leg — what the wait costs in theta
+  return getJson(`/api/project/${encodeURIComponent(ticker)}?${q}`)
 }
 
 /** Query string for the report flags — omits defaults so URLs stay short/shareable. */
