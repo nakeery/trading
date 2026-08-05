@@ -265,10 +265,42 @@ def earnings_dates(ticker, limit=16, data_dir="data"):
         return []
 
 
+EARN_EST_GRACE = 14   # a cadence estimate may sit up to this many days in the PAST — "a print
+                      # is due about now" — before rolling forward a whole cycle (S74)
+
+
+def estimate_next_earnings(past_dates, today=None):
+    """PURE (S74): next earnings estimated from PAST prints — last print + median cadence,
+    mirroring estimate_next_ex_div. Needs ≥4 dates with a median gap in (0, 400d] (tolerates
+    semi-annual reporters, rejects irregular). Deliberate divergence from the ex-div roll: the
+    estimate is rolled forward only while MORE than EARN_EST_GRACE days past `today`, so on the
+    print day itself it lands ≈today (days ≈ 0, possibly slightly negative) instead of jumping a
+    whole quarter — that near-zero read IS the flag. Returns a normalized Timestamp or None."""
+    if past_dates is None or len(past_dates) < 4:
+        return None
+    idx = pd.DatetimeIndex(past_dates)
+    if idx.tz is not None:
+        idx = idx.tz_convert(None)
+    idx = idx.normalize().sort_values()
+    med = idx.to_series().diff().median()
+    if med is None or pd.isna(med) or med > pd.Timedelta(days=400) or med <= pd.Timedelta(0):
+        return None
+    today = pd.Timestamp(today).normalize() if today is not None else pd.Timestamp.today().normalize()
+    nxt = idx[-1] + med
+    while nxt < today - pd.Timedelta(days=EARN_EST_GRACE):
+        nxt += med
+    return nxt.normalize()
+
+
 def next_earnings(ticker, daily=None, data_dir="data"):
     """Next scheduled earnings for `ticker` via yfinance + the typical historical earnings move.
-    Returns {date: 'YYYY-MM-DD'|None, days: int|None, hist_move: float|None} or None (ETF / no data).
-    `hist_move` = median |close-to-close| % around the last few past earnings (needs `daily` OHLCV).
+    Returns {date: 'YYYY-MM-DD'|None, days: int|None, hist_move: float|None, est: bool} or None
+    (ETF / no data — the EMPTY yfinance list). S74: when the list is non-empty but holds no
+    FUTURE date (yfinance drops the upcoming print around earnings day — the AMD 2026-08-04
+    blind spot), the date/days are filled from the cadence ESTIMATE with est=True (+ last_date/
+    last_days for display); consumers that must not act on an estimate (post-earnings expiry
+    anchoring, event-IV harvest, vol-catalyst factor) gate on `not est`. `hist_move` = median
+    |close-to-close| % around the last few past earnings (needs `daily` OHLCV).
     Best-effort: never raises (mirrors add_earnings_proximity's yfinance access)."""
     ed = earnings_dates(ticker, data_dir=data_dir)
     if not ed:
@@ -296,8 +328,15 @@ def next_earnings(ticker, daily=None, data_dir="data"):
             hist = float(pd.Series(moves).median())
 
     if nxt is None:
-        return {"date": None, "days": None, "hist_move": hist}
-    return {"date": nxt.date().isoformat(), "days": int((nxt - today).days), "hist_move": hist}
+        est = estimate_next_earnings(past, today=today)
+        if est is not None:
+            return {"date": est.date().isoformat(), "days": int((est - today).days),
+                    "hist_move": hist, "est": True,
+                    "last_date": past[-1].date().isoformat(),
+                    "last_days": int((today - past[-1]).days)}
+        return {"date": None, "days": None, "hist_move": hist, "est": False}
+    return {"date": nxt.date().isoformat(), "days": int((nxt - today).days), "hist_move": hist,
+            "est": False}
 
 
 def estimate_next_ex_div(ex_dates, today=None):

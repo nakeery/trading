@@ -33,8 +33,15 @@ IV_EVENT_COLS   = ["atm_iv_event", "event_expiry", "event_dte"]
 #                  front. Percentile accumulates FORWARD-ONLY (no backfill — long-dated
 #                  contracts trade too thinly historically for the trades-only inversion).
 IV_LONG_COLS    = ["atm_iv_180d", "atm_dte_180d"]
+#   IV_SOURCE_COLS — which vendor stamped the row's IV cells (S74): "massive" (quote-mid
+#                  snapshots) or "tradier" (smv_vol fallback via modules/iv_fallback.py, used
+#                  when the Massive snapshot endpoint fails, e.g. the 2026-07 403 plan
+#                  downgrade). String column; values accumulate in the SAME IV columns so the
+#                  percentile history stays continuous — the source label makes the mixed
+#                  basis visible. Never a model feature (meta).
+IV_SOURCE_COLS  = ["iv_source"]
 IV_META_COLS    = (["atm_strike", "atm_expiry", "atm_dte", "put_call_oi_ratio"]
-                   + IV_EVENT_COLS + IV_LONG_COLS)
+                   + IV_EVENT_COLS + IV_LONG_COLS + IV_SOURCE_COLS)
 IV_COLS         = IV_FEATURE_COLS + IV_META_COLS
 #   IV_INDICATOR_COLS — binary missing-indicators added by features.impute_iv_features()
 #                     (present only under --iv-features). Treated like IV_FEATURE_COLS:
@@ -242,8 +249,10 @@ def get_chain_summary(ticker, underlying_price, target_dte=30):
         )
         long_atm = _atm_at_tenor(_parse_snapshot_rows(long_rows), underlying_price,
                                  LONG_TENOR_TARGET)
-    except Exception:
-        pass
+    except Exception as e:
+        # S74: was a silent pass — a 180d-only failure (the S47 column that never populated)
+        # must be visible like every other fetch failure.
+        print(f"  180d IV fetch failed: {_fetch_fail_msg(e)}")
 
     return {
         "atm_iv_30d":        float(atm["iv"]),

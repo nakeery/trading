@@ -20,7 +20,13 @@ python sizing.py
 `indicators.py` requires a Massive API key for the chain harvest. Set `$env:MASSIVE_API_KEY` and
 add it to `$PROFILE` for persistence across PowerShell sessions. If the env var is unset, the
 Massive client raises `RuntimeError` on the first API call; IV columns are written as NaN and
-`entry.py` warns to re-run.
+`entry.py` warns to re-run. **S74: when the Massive snapshot fetch fails** (unset key, or the
+2026-07 plan change that 403s `/v3/snapshot/options/` while the reference endpoint still works),
+the harvest falls back to a **Tradier chain summary** (`modules/iv_fallback.py` — same dict keys
+off smv_vol, 1 expirations + ≤3 chain calls) and stamps the row `iv_source="tradier"`; sentiment
+gauges then carry a "(Tradier)" label so the mixed vendor basis stays visible. The lens
+auto-refresh re-emits the harvest warnings from the subprocess (they were silently captured
+before — the 403 went unseen for a month).
 
 Weekly maintenance:
 
@@ -249,7 +255,7 @@ Run smoke tests:
 
 ```powershell
 .\trade\Scripts\python.exe -m pytest tests/ -v
-# 123 tests (S72; 3 skipped), ~3-12s. Requires data/QQQ_indicators.csv + data/QQQ_backtest_results.csv.
+# 132 tests (S74; 3 skipped), ~3-12s. Requires data/QQQ_indicators.csv + data/QQQ_backtest_results.csv.
 ```
 
 ### Prompt counts per script (for piped input via Claude Code)
@@ -541,7 +547,8 @@ CLI flags (default OFF; available on direction/entry/volatility/exit/backtest):
 
 ### IV column structure
 - `IV_FEATURE_COLS = [atm_iv_30d, iv_skew_25d, term_structure]` — usable as ML features after backfill
-- `IV_META_COLS = [atm_strike, atm_expiry, atm_dte, put_call_oi_ratio]` — always excluded from features
+- `IV_META_COLS = [atm_strike, atm_expiry, atm_dte, put_call_oi_ratio] + IV_EVENT_COLS + IV_LONG_COLS + IV_SOURCE_COLS` — always excluded from features
+- `IV_SOURCE_COLS = [iv_source]` (S74) — which vendor stamped the row ("massive"/"tradier" fallback); string, meta-excluded, merge-preserved
 - `IV_COLS = IV_FEATURE_COLS + IV_META_COLS` — full list for CSV column management
 
 ### Backfill quality filters (post-S13/S14 hardening)

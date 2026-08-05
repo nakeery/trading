@@ -271,6 +271,17 @@ def gather_context(ticker, data_dir="data", with_vix=True, as_of=None):
         stale_ages.append(age)
         return f" (stale {age}d)"
 
+    def _src(d):
+        """' (Tradier)' when the gauge's last valid row was stamped by the S74 Tradier fallback
+        harvest (iv_source column) — smv_vol basis differs from Massive's quote-mid IV, so a
+        mixed series must say so. '' for Massive rows / pre-S74 rows without the column."""
+        try:
+            if d is not None and "iv_source" in df.columns and df.loc[d, "iv_source"] == "tradier":
+                return " (Tradier)"
+        except Exception:
+            pass
+        return ""
+
     atm_iv, atm_iv_d = last_valid("atm_iv_30d")
     atm_iv_l, atm_iv_l_d = last_valid("atm_iv_180d")
     skew,   skew_d   = last_valid("iv_skew_25d")
@@ -284,7 +295,7 @@ def gather_context(ticker, data_dir="data", with_vix=True, as_of=None):
     if atm_iv is not None and hv_20:
         ratio = atm_iv / hv_20
         ratio_series = df["atm_iv_30d"] / df["HV_20"]
-        iv_stale = _stale(atm_iv_d)
+        iv_stale = _stale(atm_iv_d) + _src(atm_iv_d)
         gauges.append({"group": "OPTIONS", "name": "IV/HV ratio", "value": ratio, "fmt": "{:.2f}",
                        "label": iv_hv_label(ratio) + iv_stale,
                        "pct": percentile_of(ratio_series, ratio),
@@ -294,7 +305,7 @@ def gather_context(ticker, data_dir="data", with_vix=True, as_of=None):
                        "spark": spark_of(df["atm_iv_30d"])})
     else:
         notes.append("atm_iv_30d NaN — options-IV block skipped (re-run indicators.py to "
-                     "harvest; requires an active Massive subscription).")
+                     "harvest; Massive first, Tradier fallback since S74).")
 
     # ~180d ATM IV (S47) — the LEAPS-entry tenor. Label shows the ratio to the front tenor
     # (long-dated vol blends quiet weeks, so an event-bid front reads >1x its 180d). Percentile
@@ -302,29 +313,30 @@ def gather_context(ticker, data_dir="data", with_vix=True, as_of=None):
     if atm_iv_l is not None:
         ratio_lbl = f"{atm_iv_l / atm_iv:.2f}x front" if atm_iv else ""
         gauges.append({"group": "OPTIONS", "name": "ATM IV (180d)", "value": atm_iv_l,
-                       "fmt": "{:.1%}", "label": (ratio_lbl + _stale(atm_iv_l_d)).strip(),
+                       "fmt": "{:.1%}",
+                       "label": (ratio_lbl + _stale(atm_iv_l_d) + _src(atm_iv_l_d)).strip(),
                        "pct": percentile_of(df["atm_iv_180d"], atm_iv_l),
                        "spark": spark_of(df["atm_iv_180d"])})
 
     if skew is not None:
         gauges.append({"group": "OPTIONS", "name": "25Δ skew (P-C)", "value": skew, "fmt": "{:+.3f}",
-                       "label": skew_label(skew) + _stale(skew_d),
+                       "label": skew_label(skew) + _stale(skew_d) + _src(skew_d),
                        "pct": percentile_of(df["iv_skew_25d"], skew),
                        "spark": spark_of(df["iv_skew_25d"])})
     if term is not None:
         gauges.append({"group": "OPTIONS", "name": "Term structure", "value": term, "fmt": "{:.2f}",
-                       "label": term_label(term) + _stale(term_d),
+                       "label": term_label(term) + _stale(term_d) + _src(term_d),
                        "pct": percentile_of(df["term_structure"], term),
                        "spark": spark_of(df["term_structure"])})
     if pc_oi is not None:
         gauges.append({"group": "OPTIONS", "name": "Put/Call OI", "value": pc_oi, "fmt": "{:.2f}",
-                       "label": pc_label(pc_oi) + _stale(pc_oi_d),
+                       "label": pc_label(pc_oi) + _stale(pc_oi_d) + _src(pc_oi_d),
                        "pct": percentile_of(df["put_call_oi_ratio"], pc_oi),
                        "spark": spark_of(df["put_call_oi_ratio"])})
     if stale_ages:
         notes.append(f"harvested options gauges lag the CSV by up to {max(stale_ages)} sessions "
-                     f"(flagged 'stale') — re-run indicators.py to refresh the Massive harvest "
-                     f"(requires an active Massive subscription).")
+                     f"(flagged 'stale') — re-run indicators.py to refresh the harvest "
+                     f"(Massive first, Tradier fallback since S74).")
 
     n_hist = int(df["iv_skew_25d"].dropna().shape[0]) if "iv_skew_25d" in df.columns else 0
     if 0 < n_hist < 63:

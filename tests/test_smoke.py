@@ -1215,11 +1215,105 @@ def test_setup_check():
     assert m2["Relative strength"] == "–"                     # n/a degrade
     assert s2["n_bad"] == 2
 
+    # S74: est (cadence) date near/inside the window → "–", never a confident ✓; the text names
+    # the last confirmed print + the ~estimate. A far-out estimate keeps ✓ with an (est) label.
+    s3 = setup_check(reads(), profile=profile, ctx=ctx,
+                     earn={"days": 1, "date": "2026-08-05", "est": True,
+                           "last_date": "2026-05-05", "last_days": 91}, rs=None)
+    row3 = next(r for r in s3["rows"] if r[0] == "Catalyst timing")
+    assert row3[1] == "–"
+    assert "last confirmed print 91d ago" in row3[2] and "~2026-08-05 (est)" in row3[2]
+    s3b = setup_check(reads(), profile=profile, ctx=ctx,
+                      earn={"days": 60, "date": "2026-10-03", "est": True}, rs=None)
+    row3b = next(r for r in s3b["rows"] if r[0] == "Catalyst timing")
+    assert row3b[1] == "✓" and "~60d out (est)" in row3b[2]
+
+    # S74: earn=None (ETF — empty yfinance list) keeps the plain ✓ "no earnings date"
+    s4 = setup_check(reads(), profile=profile, ctx=ctx, earn=None, rs=None)
+    row4 = next(r for r in s4["rows"] if r[0] == "Catalyst timing")
+    assert row4[1] == "✓" and "no earnings date" in row4[2]
+
     # rel_strength math
     c = pd.Series(range(100, 200), dtype=float)               # steady climber
     b = pd.Series([100.0] * 100)                              # flat benchmark
     rs = rel_strength(c, b, horizons=(20,))
     assert rs and rs[20] > 0
+
+
+def test_estimate_next_earnings():
+    """features.estimate_next_earnings (S74): quarterly cadence ending ~91d ago estimates a print
+    ≈today (the AMD earnings-day scenario — the grace window stops a whole-quarter jump); older
+    history rolls forward; thin (<4) or irregular (>400d median) history → None."""
+    import pandas as pd
+    from modules.features import estimate_next_earnings, EARN_EST_GRACE
+
+    today = pd.Timestamp("2026-08-04")
+
+    # AMD scenario: last print exactly one median-gap ago → estimate lands ≈ today, NOT +91d
+    q = [today - pd.Timedelta(days=91 * k) for k in (4, 3, 2, 1)]
+    est = estimate_next_earnings(q, today=today)
+    assert est is not None and abs((est - today).days) <= EARN_EST_GRACE
+
+    # print day itself: estimate == today is allowed to sit AT today (days == 0)
+    q0 = [today - pd.Timedelta(days=91 * k) for k in (4, 3, 2, 1)]
+    assert (estimate_next_earnings(q0, today=today) - today).days <= 0 + EARN_EST_GRACE
+
+    # stale history (last print ~200d ago) rolls forward past the grace window
+    old = [today - pd.Timedelta(days=200 + 91 * k) for k in (3, 2, 1, 0)]
+    est2 = estimate_next_earnings(old, today=today)
+    assert est2 is not None and (est2 - today).days > -EARN_EST_GRACE
+
+    # thin history / irregular cadence → None
+    assert estimate_next_earnings(q[:3], today=today) is None
+    yearly_plus = [today - pd.Timedelta(days=500 * k) for k in (4, 3, 2, 1)]
+    assert estimate_next_earnings(yearly_plus, today=today) is None
+
+
+def test_next_earnings_est_shape(monkeypatch):
+    """features.next_earnings (S74): non-empty all-past list → est=True with filled date/days +
+    last_date/last_days (guards keep passing); future date → est=False; empty list → None."""
+    import pandas as pd
+    from modules import features
+
+    today = pd.Timestamp.today().normalize()
+
+    # all-past quarterly list (the AMD 2026-08-04 case)
+    past = [today - pd.Timedelta(days=91 * k) for k in (5, 4, 3, 2, 1)]
+    monkeypatch.setattr(features, "earnings_dates", lambda *a, **k: past)
+    e = features.next_earnings("TST")
+    assert e["est"] is True and e["date"] is not None and e["days"] is not None
+    assert e["last_days"] == 91 and e["last_date"] == past[-1].date().isoformat()
+
+    # future date present → est False, unchanged semantics
+    monkeypatch.setattr(features, "earnings_dates",
+                        lambda *a, **k: past + [today + pd.Timedelta(days=30)])
+    e2 = features.next_earnings("TST")
+    assert e2["est"] is False and e2["days"] == 30
+
+    # empty list (ETF) → None
+    monkeypatch.setattr(features, "earnings_dates", lambda *a, **k: [])
+    assert features.next_earnings("TST") is None
+
+    # all-past but too thin for a cadence estimate → date/days None, est False
+    monkeypatch.setattr(features, "earnings_dates", lambda *a, **k: past[-2:])
+    e3 = features.next_earnings("TST")
+    assert e3["est"] is False and e3["date"] is None and e3["days"] is None
+
+
+def test_volsetup_est_demoted_to_note():
+    """vol_setup (S74): a cadence-estimated earnings date ≤45d is a NOTE, never the
+    verdict-moving 'known vol catalyst' long-vol factor, and never the catalyst hint."""
+    from modules.volsetup import vol_setup
+
+    est_earn = {"days": 2, "date": "2026-08-06", "est": True}
+    v = vol_setup({}, {}, None, earnings=est_earn)
+    assert not any("known vol catalyst" in f for f in v["long_vol"])
+    assert any("est, cadence" in n and "unconfirmed" in n for n in v["notes"])
+    assert "exit BEFORE the print" not in v["hint"]           # est never drives the catalyst hint
+
+    real_earn = {"days": 2, "date": "2026-08-06", "est": False}
+    v2 = vol_setup({}, {}, None, earnings=real_earn)
+    assert any("known vol catalyst" in f for f in v2["long_vol"])
 
 
 # ─── Test 24: fng parser (offline) ────────────────────────────────────────────
@@ -2662,6 +2756,54 @@ def test_cached_call_quote(tmp_path):
         json.dump({"as_of": time.time(), "quote": {"spot": 1.0, "quotes": []}}, f)
     assert cached_call_quote("QQQ", data_dir=str(tmp_path)) is None      # empty quotes
 
+    # S74: the rth session flag rides the liquidity dict through cached_liquidity untouched;
+    # an old cache WITHOUT the key degrades to .get("rth") is None (grade renders normally).
+    from modules.callquote import cached_liquidity
+    liq_new = {"grade": "dead", "spread_pct": 0.126, "oi": 9047, "volume": 5456,
+               "n_no_bid": 0, "n": 10, "rth": False}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"as_of": time.time(),
+                   "quote": {"spot": 1.0, "quotes": [{"expiry": "2099-01-15"}],
+                             "liquidity": liq_new}}, f)
+    got = cached_liquidity("QQQ", data_dir=str(tmp_path))
+    assert got["rth"] is False
+    liq_old = {k: v for k, v in liq_new.items() if k != "rth"}
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"as_of": time.time(),
+                   "quote": {"spot": 1.0, "quotes": [{"expiry": "2099-01-15"}],
+                             "liquidity": liq_old}}, f)
+    assert cached_liquidity("QQQ", data_dir=str(tmp_path)).get("rth") is None
+
+
+# ─── Test 69b (S74): after-hours liquidity grade suppressed at render ───────────
+def test_liquidity_rth_render_guard(capsys):
+    """A liquidity dict quoted outside RTH (rth=False) renders 'n/a — quoted after hours' with
+    the numbers kept — never a confident grade; without the key the old line is unchanged."""
+    import lens
+
+    def _payload(liq):
+        risk = lens.rally_drawdown_risk({}, profile=None, ctx=None, divergences={})
+        ctx = {"regime": "calm", "net": "fixture", "notes": [],
+               "gauges": [{"name": "HV-20 (annualized)", "group": "VOL", "fmt": "{:.1%}",
+                           "value": 0.30, "pct": None, "label": ""}]}
+        return {"ticker": "TST", "reads": {}, "divs": {}, "summary": {"synthesis": "fixture"},
+                "profile": None, "notes": [], "last_bar": None, "as_of": "2026-07-07",
+                "panel_bars": [], "ctx": ctx, "backdrop": None, "geo": None, "pcoi": None,
+                "vol": None, "live": None, "setup": None, "squeeze": None, "insider": None,
+                "callq": None, "liq": liq, "cats": [], "risk": risk, "macro_events": {},
+                "thesis": None, "level": None, "live_iv": None}
+
+    base = {"grade": "dead", "spread_pct": 0.126, "oi": 9047, "as_of_str": "21:41"}
+    lens.render_payload(_payload({**base, "rth": False}), use_color=False, candle_style="none")
+    ah = capsys.readouterr().out
+    assert "options liquidity: n/a — quoted after hours" in ah
+    assert "options liquidity: dead" not in ah
+    assert "ATM spread 12.6%" in ah                          # numbers stay visible
+
+    lens.render_payload(_payload(dict(base)), use_color=False, candle_style="none")
+    old = capsys.readouterr().out
+    assert "options liquidity: dead  (ATM spread 12.6%, OI 9,047) — as of 21:41" in old
+
 
 # ─── Test 70 (S68): projections render regression (offline) ─────────────────────
 def test_projections_render():
@@ -2825,6 +2967,7 @@ def test_s69_ladder_repricing():
     """project_targets reprices the WHOLE ladder (the web selectors filter rows that already
     exist — no BS in TypeScript), carrying kind/moneyness/delta for the selector labels, and
     still handles a pre-S69 cache that only has atm/otm."""
+    import datetime as _dt
     from modules.levelproj import project_targets, curve_iv
 
     ladder = {"spot": 100.0, "levels": [], "nearest_support": None, "nearest_resistance": None,
@@ -2834,7 +2977,9 @@ def test_s69_ladder_repricing():
         {"strike": 100.0, "mid": 9.5, "iv": 0.5, "delta": 0.55, "kind": "atm", "moneyness": 0.0},
         {"strike": 115.0, "mid": 4.5, "iv": 0.52, "delta": 0.375, "kind": "otm", "moneyness": 0.15}]}
     curve = {"points": [{"label": "27-01-15", "dte": 169, "iv": 0.6}]}
-    p = project_targets(ladder, hv20=0.45, callq={"quotes": [blk], "curve": curve})
+    # today injected — dte is refreshed from the expiry, so a wall-clock today drifts the pin
+    p = project_targets(ladder, hv20=0.45, callq={"quotes": [blk], "curve": curve},
+                        today=_dt.date(2026, 7, 30))
     rows = p["targets"][0]["contracts"]
     assert len(rows) == 3                                    # every ladder strike repriced
     assert {c["kind"] for c in rows} == {"atm", "otm", "other"}
@@ -3730,3 +3875,260 @@ def test_s70_report_session_cache(monkeypatch):
             api_cache._REPORT_MAX = old_max
     finally:
         api_cache.report_cache.clear()
+
+
+# ─── Test 77 (S74): chain caches auto-refresh when stale — prompts removed ─────
+def _write_chain_cache(path, payload):
+    import json as _json
+    import os as _os
+    _os.makedirs(_os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        _json.dump(payload, f)
+
+
+def test_chain_cache_stale_auto_refresh(monkeypatch, tmp_path):
+    """A stale cache (a market close has passed) triggers an automatic Tradier re-fetch in
+    every mode — no [y/N] prompt (S74). Verified on gather_pc_oi; the gate is shared."""
+    import time
+    import pandas as pd
+    from modules import pc_oi
+
+    d = str(tmp_path)
+    old = time.time() - 86400 * 10
+    _write_chain_cache(pc_oi._cache_path("TST", "all", d),
+                       {"as_of": old, "price": 100.0,
+                        "rows": [{"expiry": "2099-01-15", "dte": 5, "call_oi": 1, "put_oi": 1,
+                                  "call_vol": 1, "put_vol": 1}]})
+    monkeypatch.setattr(pc_oi, "TRADIER_TOKEN", "x")
+    monkeypatch.setattr(pc_oi, "get_current_price", lambda t: 101.0)
+    fresh_rows = [{"expiry": "2099-02-19", "dte": 40, "call_oi": 9, "put_oi": 9,
+                   "call_vol": 9, "put_vol": 9}]
+    monkeypatch.setattr(pc_oi, "pc_by_expiry", lambda *a, **k: list(fresh_rows))
+    # input() would raise if the old prompt path were still reachable
+    monkeypatch.setattr("builtins.input", lambda *a: (_ for _ in ()).throw(AssertionError("prompted")))
+
+    out = pc_oi.gather_pc_oi("TST", interactive=True, data_dir=d)
+    assert out["cached"] is False and out["stale"] is False
+    assert out["rows"][0]["expiry"] == "2099-02-19"
+    cache = pc_oi.load_cache("TST", "all", d)
+    assert cache["as_of"] > old                              # cache file advanced
+
+
+def test_chain_cache_stale_fetch_fail_serves_cached(monkeypatch, tmp_path):
+    """Stale cache + failing fetch → the cache is served with stale=True, dtes rehydrated
+    and expired expiries DROPPED (S74 safety net)."""
+    import time
+    import datetime as dt
+    from modules import volquote
+
+    d = str(tmp_path)
+    future = (dt.date.today() + dt.timedelta(days=30)).isoformat()
+    _write_chain_cache(volquote._cache_path("TST", volquote.SCOPEKEY, d),
+                       {"as_of": time.time() - 86400 * 20,
+                        "quote": {"spot": 100.0, "earnings_date": None, "earn_days": None,
+                                  "notes": [],
+                                  "quotes": [{"expiry": "2020-01-17", "dte": 25},
+                                             {"expiry": future, "dte": 999}]}})
+    monkeypatch.setattr(volquote, "TRADIER_TOKEN", "x")
+    monkeypatch.setattr(volquote, "_fetch",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("net down")))
+    out = volquote.straddle_quote("TST", data_dir=d)
+    assert out["cached"] is True and out["stale"] is True
+    assert len(out["quotes"]) == 1                           # the 2020 expiry was dropped
+    assert out["quotes"][0]["expiry"] == future
+    assert out["quotes"][0]["dte"] == 30                     # rehydrated, not the cached 999
+
+
+def test_chain_cache_fresh_no_fetch(monkeypatch, tmp_path):
+    """A session-fresh cache is served with zero network — auto-refresh only fires on stale."""
+    import time
+    from modules import gex
+
+    d = str(tmp_path)
+    _write_chain_cache(gex._cache_path("TST", gex.SCOPEKEY, d),
+                       {"as_of": time.time(),
+                        "gex": {"spot": 100.0, "net_gex": 1e6, "by_strike": [[100.0, 1e6]],
+                                "expiries": [{"expiry": "2099-01-15", "dte": 5}],
+                                "call_wall": None, "call_wall_gex": None,
+                                "put_wall": None, "put_wall_gex": None, "zero_gamma": None,
+                                "max_pain": None, "unusual": []}})
+    calls = []
+    monkeypatch.setattr(gex, "TRADIER_TOKEN", "x")
+    monkeypatch.setattr(gex, "_fetch", lambda *a, **k: calls.append(1) or None)
+    out = gex.gather_gex("TST", data_dir=d)
+    assert out["cached"] is True and out["stale"] is False
+    assert calls == []                                       # no fetch attempted
+
+
+def test_gex_expired_max_pain_suppressed(monkeypatch, tmp_path, capsys):
+    """A served-stale gex cache rehydrates: expired unusual entries dropped, max pain keeps a
+    negative dte — and print_report suppresses the max-pain line + drops the 'today' claim."""
+    import time
+    from modules import gex
+
+    d = str(tmp_path)
+    _write_chain_cache(gex._cache_path("TST", gex.SCOPEKEY, d),
+                       {"as_of": time.time() - 86400 * 20,
+                        "gex": {"spot": 100.0, "net_gex": 1e6, "by_strike": [[100.0, 1e6]],
+                                "expiries": [{"expiry": "2020-01-17", "dte": 4},
+                                             {"expiry": "2099-01-15", "dte": 30}],
+                                "call_wall": 110.0, "call_wall_gex": 1e6,
+                                "put_wall": 90.0, "put_wall_gex": -1e6, "zero_gamma": 95.0,
+                                "max_pain": {"expiry": "2020-01-17", "dte": 4, "strike": 95.0},
+                                "unusual": [{"strike": 95.0, "type": "put", "expiry": "2020-01-17",
+                                             "dte": 4, "volume": 1000, "oi": 10, "ratio": 100.0},
+                                            {"strike": 105.0, "type": "call", "expiry": "2099-01-15",
+                                             "dte": 30, "volume": 900, "oi": 10, "ratio": 90.0}]}})
+    monkeypatch.setattr(gex, "TRADIER_TOKEN", "x")
+    monkeypatch.setattr(gex, "_fetch",
+                        lambda *a, **k: (_ for _ in ()).throw(RuntimeError("net down")))
+    out = gex.gather_gex("TST", data_dir=d)
+    assert out["stale"] is True
+    assert [e["expiry"] for e in out["expiries"]] == ["2099-01-15"]
+    assert len(out["unusual"]) == 1 and out["unusual"][0]["expiry"] == "2099-01-15"
+    assert out["max_pain"]["dte"] < 0                        # kept, negative → renderer suppresses
+
+    import lens
+    last_bar = {"open": 100.0, "high": 103.0, "low": 99.0, "close": 102.0, "prev_close": 100.5}
+    risk = lens.rally_drawdown_risk({}, profile=None, ctx=None, divergences={})
+    payload = {"ticker": "TST", "reads": {}, "divs": {}, "summary": {"synthesis": "fixture"},
+               "profile": None, "notes": [], "last_bar": last_bar, "as_of": "2026-07-07",
+               "panel_bars": [], "ctx": None, "backdrop": None, "geo": None, "pcoi": None,
+               "gex": out, "vol": None, "live": None, "setup": None, "squeeze": None,
+               "insider": None, "callq": None, "liq": None, "cats": [], "risk": risk,
+               "macro_events": {}, "thesis": None, "level": None, "live_iv": None}
+    lens.render_payload(payload, use_color=False, candle_style="none")
+    text = capsys.readouterr().out
+    assert "max pain" not in text
+    assert "unusual activity today" not in text
+    assert "unusual activity (as of" in text and "stale)" in text
+
+
+# ─── Test 78 (S74): Tradier IV fallback harvest ────────────────────────────────
+def _tradier_chain_df(expiry, spec):
+    """REAL-SHAPED Tradier chain DataFrame (the S64 fixture lesson): flat columns
+    option_type/strike/expiration_date/open_interest + a greeks dict with smv_vol/delta.
+    spec = [(type, strike, iv, delta, oi), …]."""
+    import pandas as pd
+    return pd.DataFrame([{"option_type": t, "strike": s, "expiration_date": expiry,
+                          "bid": 1.0, "ask": 1.2, "open_interest": oi, "volume": 10,
+                          "greeks": {"smv_vol": iv, "mid_iv": iv, "delta": d}}
+                         for t, s, iv, d, oi in spec])
+
+
+def test_iv_fallback_summary():
+    """iv_fallback.parse_chain_rows + summarize_rows mirror massive.get_chain_summary's math and
+    RETURN KEYS off Tradier-shaped rows: ATM pick, 25Δ skew = put−call, term = front/back ATM IV,
+    P/C OI over front+back, atm_iv_180d off the long rows."""
+    import datetime as dt
+    from modules.iv_fallback import parse_chain_rows, summarize_rows
+    from modules.massive import get_chain_summary  # noqa: F401 — key-parity reference
+
+    today = dt.date(2026, 8, 4)
+    e30 = (today + dt.timedelta(days=30)).isoformat()
+    e70 = (today + dt.timedelta(days=70)).isoformat()
+    e180 = (today + dt.timedelta(days=182)).isoformat()
+
+    front = parse_chain_rows(_tradier_chain_df(e30, [
+        ("call", 100.0, 0.50, 0.52, 500),      # ATM
+        ("call", 110.0, 0.48, 0.25, 300),      # the 25Δ call
+        ("put",  100.0, 0.52, -0.48, 400),
+        ("put",  90.0,  0.58, -0.25, 600),     # the 25Δ put
+    ]), today=today)
+    back = parse_chain_rows(_tradier_chain_df(e70, [
+        ("call", 100.0, 0.40, 0.55, 200),
+        ("put",  100.0, 0.42, -0.45, 100),
+    ]), today=today)
+    long_rows = parse_chain_rows(_tradier_chain_df(e180, [
+        ("call", 100.0, 0.35, 0.58, 80),
+    ]), today=today)
+
+    s = summarize_rows(front, back, long_rows, spot=100.0)
+    assert s["atm_iv_30d"] == 0.50 and s["atm_strike"] == 100.0
+    assert s["atm_expiry"] == e30 and s["atm_dte"] == 30
+    assert abs(s["iv_skew_25d"] - (0.58 - 0.48)) < 1e-12      # put 25Δ − call 25Δ
+    assert abs(s["term_structure"] - 0.50 / 0.40) < 1e-12     # front ATM / back ATM
+    assert abs(s["put_call_oi_ratio"] - (400 + 600 + 100) / (500 + 300 + 200)) < 1e-12
+    assert s["atm_iv_180d"] == 0.35 and s["atm_dte_180d"] == 182
+
+    # key parity with the Massive summary — the fallback must be drop-in
+    massive_keys = {"atm_iv_30d", "atm_strike", "atm_expiry", "atm_dte", "iv_skew_25d",
+                    "term_structure", "put_call_oi_ratio", "atm_iv_180d", "atm_dte_180d"}
+    assert set(s.keys()) == massive_keys
+
+    # no usable calls → None; empty long rows → 180d fields None
+    assert summarize_rows([], [], [], spot=100.0) is None
+    s2 = summarize_rows(front, back, [], spot=100.0)
+    assert s2["atm_iv_180d"] is None and s2["atm_dte_180d"] is None
+
+
+def test_iv_source_excluded():
+    """iv_source (S74) is meta — in IV_META_COLS/IV_COLS (so every ML exclude-splat drops it and
+    the CSV merge preserves it) and NEVER in IV_FEATURE_COLS."""
+    from modules.massive import IV_META_COLS, IV_COLS, IV_FEATURE_COLS, IV_SOURCE_COLS
+
+    assert IV_SOURCE_COLS == ["iv_source"]
+    assert "iv_source" in IV_META_COLS and "iv_source" in IV_COLS
+    assert "iv_source" not in IV_FEATURE_COLS
+
+
+def test_harvest_fallback_stamps_source(monkeypatch, tmp_path):
+    """harvest_iv_snapshot (S74): Massive None → Tradier fallback dict stamps the IV cells +
+    iv_source='tradier'; the string column round-trips the CSV; both-fail leaves NaN."""
+    import pandas as pd
+    import indicators
+
+    idx = pd.bdate_range("2026-06-01", periods=30)
+    df = pd.DataFrame({"Close": [100.0 + i for i in range(30)]}, index=idx)
+    csv = str(tmp_path / "tst_indicators.csv")
+
+    fallback = {"atm_iv_30d": 0.44, "atm_strike": 130.0, "atm_expiry": "2026-09-04",
+                "atm_dte": 31, "iv_skew_25d": 0.02, "term_structure": 1.01,
+                "put_call_oi_ratio": 0.8, "atm_iv_180d": 0.39, "atm_dte_180d": 185}
+    monkeypatch.setattr(indicators, "get_chain_summary", lambda *a, **k: None)
+    monkeypatch.setattr(indicators, "get_chain_summary_tradier", lambda *a, **k: dict(fallback))
+    monkeypatch.setattr(indicators, "next_earnings", lambda *a, **k: None)  # no event stamp
+
+    out = indicators.harvest_iv_snapshot(df.copy(), "TST", csv)
+    last = out.index[-1]
+    assert out.loc[last, "iv_source"] == "tradier"
+    assert out.loc[last, "atm_iv_30d"] == 0.44 and out.loc[last, "atm_iv_180d"] == 0.39
+
+    out.to_csv(csv)                                           # string column survives round-trip
+    back = pd.read_csv(csv, index_col=0, parse_dates=True)
+    assert back["iv_source"].dropna().iloc[-1] == "tradier"
+
+    # both vendors down → warning path, columns stay NaN
+    monkeypatch.setattr(indicators, "get_chain_summary_tradier", lambda *a, **k: None)
+    out2 = indicators.harvest_iv_snapshot(df.copy(), "TST2", str(tmp_path / "tst2.csv"))
+    assert pd.isna(out2["atm_iv_30d"]).all()
+
+
+def test_gauge_tradier_label(tmp_path):
+    """gather_context (S74): a last harvested row stamped iv_source='tradier' labels the
+    harvested OPTIONS gauges '(Tradier)'; rows without the column stay unlabeled."""
+    import numpy as np
+    import pandas as pd
+    from modules.sentiment import gather_context
+
+    idx = pd.bdate_range("2026-05-01", periods=70)
+    df = pd.DataFrame({
+        "Close": 100.0 + np.arange(70) * 0.3,
+        "atm_iv_30d": [np.nan] * 69 + [0.45],
+        "iv_skew_25d": [np.nan] * 69 + [0.03],
+        "term_structure": [np.nan] * 69 + [1.02],
+        "put_call_oi_ratio": [np.nan] * 69 + [0.7],
+        "iv_source": [np.nan] * 69 + ["tradier"],
+    }, index=idx)
+    df.to_csv(tmp_path / "tst_indicators.csv")
+
+    ctx = gather_context("TST", data_dir=str(tmp_path), with_vix=False)
+    g = {x["name"]: x for x in ctx["gauges"]}
+    assert "(Tradier)" in g["ATM IV (30d)"]["label"]
+    assert "(Tradier)" in g["25Δ skew (P-C)"]["label"]
+
+    df2 = df.drop(columns=["iv_source"])                      # pre-S74 CSV: no column, no label
+    df2.to_csv(tmp_path / "tst2_indicators.csv")
+    ctx2 = gather_context("TST2", data_dir=str(tmp_path), with_vix=False)
+    g2 = {x["name"]: x for x in ctx2["gauges"]}
+    assert "(Tradier)" not in g2["ATM IV (30d)"]["label"]

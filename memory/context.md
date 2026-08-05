@@ -444,9 +444,63 @@ lens_web.py specifics (S48, +S49 native visuals):
     STRIKE_COUNTS is exactly 5 entries so that picker never needs arrows of its own.
   · Cost: SOFI 12 chain calls ~9s / 366KB report; QQQ 14 calls ~16s / 783KB. The DOM stays
     small — only SELECTED rows render. SCOPEKEY call4→call5.
-  · **Also found (NOT fixed, needs a session)**: the Massive harvest looks stalled —
-    `atm_iv_30d` last stamped 2026-06-19 (SOFI) / 06-23 (QQQ), and `atm_iv_180d` has never been
-    populated since S47 shipped. Degrades every IV gauge and the no---call synthetic path.
+  · **Also found (FIXED S74)**: the Massive harvest was stalled. S74 correction to this note's
+    dates: the real last stamps were 2026-07-06 (AMD/NVDA/SOFI/INTC/RIVN) / 07-07 (QQQ/CRSP/
+    CAVA/GOOG/ZS…), and `atm_iv_180d` DID populate exactly once (2026-07-07, cava/crsp/goog/zs)
+    — S47 worked for one day. Root cause (probed live 2026-08-04): Massive returns **403
+    NOT_AUTHORIZED ("upgrade your plan") on `/v3/snapshot/options/`** while
+    `/v3/reference/options/contracts` still returns 200 — a plan entitlement change, not a
+    code bug. See the S74 entry for the fix (loud surfacing + Tradier fallback harvest).
+
+- **S74 honesty pass** (motivated by a fresh-eyes AMD run on 2026-08-04 — AMD's actual earnings
+  day, which the lens MISSED: "✓ Catalyst timing — no earnings date" hours before a −8.8% AH
+  earnings move; plus 528h-stale GEX/straddle caches served silently with an already-expired
+  max-pain expiry, a "dead" liquidity grade computed off 21:41 post-close quotes, and the
+  Massive harvest dead since 07-06 with zero visible warning). Five workstreams:
+  · **Chain caches AUTO-REFRESH when stale** — the [y/N] prompts in pc_oi/gex/volquote/callquote
+    are GONE (`refresh = cache is None or force or stale`); `interactive` params kept for
+    back-compat, unused. Fetch failure → serve the cache REHYDRATED: `pc_oi.rehydrate_blocks`
+    (public) recomputes dtes and DROPS expired expiries in gex/volquote/callquote serve paths;
+    gex `_rehydrate_gex` keeps max_pain with a negative dte and print_report suppresses the
+    line; "unusual activity today" says "(as of …, stale)" on a served-stale cache. The three
+    "run in a terminal to refresh" notes → "Tradier refresh failed — showing cache from …";
+    the --vol straddle gained its previously-MISSING stale note. NB the S73 --call
+    "fetched fresh without prompting" asymmetry was just the SCOPEKEY bump orphaning its cache.
+  · **Earnings cadence fallback** — yfinance's earnings list can hold NO future date (probed:
+    AMD's list ended 2026-05-05 ON earnings day 2026-08-04). `features.estimate_next_earnings`
+    (mirrors estimate_next_ex_div; ≥4 prints, median gap ≤400d) with `EARN_EST_GRACE=14`: the
+    roll-forward stops within 14d PAST today, so on print day the estimate lands ≈today instead
+    of jumping a quarter. `next_earnings` now returns `est: bool` (+ last_date/last_days when
+    est); date/days are FILLED from the estimate so existing guards pass. Estimates are
+    DISPLAY-ONLY: setupcheck catalyst row (est near → "–" "earnings date unavailable — last
+    confirmed print Nd ago, next ~date (est)"; far → ✓ "(est)"), the ≤10d harvest warning
+    ("earnings likely due"), chart marker "earnings~", web SecEvents/SecVol "~"+est. Explicit
+    `not est` guards at: volquote anchoring + callquote notes (lens call sites), the
+    indicators.py event-IV gate, volsetup's catalyst factor + _synthesize (est ≤45d → a
+    "date unconfirmed" NOTE). Empty list (ETF) still → None → plain ✓ "no earnings date".
+    One-time snapshot-diff ✓→– flips expected on affected tickers.
+  · **Massive 403 surfaced + Tradier fallback harvest** — root cause above. massive.py's 180d
+    bare `except: pass` now prints; lens `_refresh_indicators` re-emits harvest-health lines
+    (WARNING/Massive/IV harvest/Tradier fallback) from the captured subprocess stdout — the
+    month-long silent failure can't recur. NEW `modules/iv_fallback.py`:
+    `get_chain_summary_tradier(ticker, spot)` = 1 expirations + ≤3 chain calls (≈30d front,
+    55-90d back, 150-240d LEAPS when listed), pure `summarize_rows` mirroring
+    massive.get_chain_summary's math/keys off Tradier smv_vol. indicators.py: Massive None →
+    fallback → stamps the SAME IV columns + NEW `iv_source` column ("massive"/"tradier";
+    in IV_SOURCE_COLS ⊂ IV_META_COLS → auto-excluded from all models, merge-preserved).
+    sentiment gauges append "(Tradier)" via `_src` when the last valid row is
+    fallback-stamped — mixed vendor basis visible, percentile history continuous.
+  · **Liquidity grade RTH honesty** — `callquote._fetch` stamps `grade["rth"] =
+    session_open()` (deferred timeframes import); when rth is False both print sites + web
+    render "n/a — quoted after hours, spreads unreliable (spread/OI kept)" instead of a
+    confident grade (the AMD "dead at 12.6% spread, 21:41" case). Old caches without the key
+    render unchanged.
+  · Tests 77-78 + extensions (~12 new asserts): auto-refresh/fetch-fail/fresh-no-fetch/expired-
+    max-pain; estimator math incl. the grace window; next_earnings est shape; setupcheck est
+    rows; volsetup demotion; iv_fallback summary key-parity vs Massive; iv_source exclusion +
+    CSV round-trip; gauge labels. Latent test bug fixed in passing: test_s69_ladder_repricing
+    pinned dte==322 against the wall clock (levelproj refreshes dte from expiry) — now injects
+    `today`.
 
 Modules the lens/web stack uses
 -------------------------------

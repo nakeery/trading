@@ -20,7 +20,7 @@ import os
 import time
 
 from modules.tradier import TRADIER_TOKEN, get_current_price, get_expirations, get_chain
-from modules.pc_oi import _cache_path, cache_stale, _cache_age, _hhmm
+from modules.pc_oi import _cache_path, cache_stale, _cache_age, _hhmm, rehydrate_blocks
 
 SCOPEKEY = "call5"           # bumped when the cached payload shape changes (S73: wider ladder)
 # S72 — EXPIRY WINDOW. Superseded the S69 "nearest expiry to each of 4 target DTEs" rule, which
@@ -333,6 +333,12 @@ def _fetch(ticker, earnings_date=None, ex_div_date=None):
     # already quoted above, so curve_pts is complete and richer than the old 7-point cap — and
     # strictly cheaper than fetching some expiries twice. Chain calls per --call run = exactly
     # len(select_expiries(...)).
+    if grade is not None:
+        # S74: quotes fetched outside RTH carry mechanically blown-out spreads — the grade must
+        # know its session so renderers can refuse a confident "dead" off post-close quotes.
+        # Deferred import: timeframes pulls pandas/yfinance; keep callquote's module-load flat.
+        from modules.timeframes import session_open
+        grade["rth"] = bool(session_open())
     return {"spot": spot, "earn_days": earn_days, "quotes": blocks,
             "curve": curve_read(curve_pts), "liquidity": grade}
 
@@ -347,27 +353,26 @@ def _wrap(quote, as_of, stale, cached):
 def call_quote(ticker, earnings_date=None, ex_div_date=None, interactive=False,
                data_dir="data", force=False):
     """Long-call viability quote off the live Tradier chain (see module docstring). Cached per
-    ticker session-stale; `force=True` (lens --live) requotes fresh. Returns the quote dict
-    (+ as_of/as_of_str/age_str/stale/cached) or None. Best-effort: never raises."""
+    ticker session-stale; stale caches AUTO-REFRESH (S74 — `interactive` accepted for back-compat,
+    unused); `force=True` (lens --live) requotes fresh. Returns the quote dict
+    (+ as_of/as_of_str/age_str/stale/cached) or None. Best-effort: never raises; a fetch failure
+    serves the cache with dtes rehydrated and expired expiries dropped."""
     if not TRADIER_TOKEN or TRADIER_TOKEN == "YOUR_TOKEN_HERE":
         return None
     cache = _load(ticker, data_dir)
     stale = cache is not None and cache_stale(cache)
 
-    refresh = cache is None or force
-    if not force and cache is not None and stale:
-        if interactive:
-            try:
-                ans = input(f"  {ticker} call quote cached {_cache_age(cache['as_of'])}; a market "
-                            f"close has passed — refresh from Tradier? [y/N]: ")
-                refresh = ans.strip().lower().startswith("y")
-            except EOFError:
-                refresh = False
-        else:
-            refresh = False
+    def _serve_cached():
+        q = dict(cache["quote"])
+        q["quotes"] = rehydrate_blocks(q.get("quotes"))
+        if not q["quotes"]:
+            return None
+        return _wrap(q, cache["as_of"], stale, True)
+
+    refresh = cache is None or force or stale              # stale → auto-refresh (prompts removed, S74)
 
     if not refresh and cache is not None:
-        return _wrap(cache["quote"], cache["as_of"], stale, True)
+        return _serve_cached()
 
     print(f"  call: fetching {ticker} chain from Tradier…")
     try:
@@ -376,7 +381,7 @@ def call_quote(ticker, earnings_date=None, ex_div_date=None, interactive=False,
         quote = None
     if quote is None or not quote.get("quotes"):
         if cache is not None:
-            return _wrap(cache["quote"], cache["as_of"], stale, True)
+            return _serve_cached()
         return None
     _save(ticker, data_dir, quote)
     return _wrap(quote, time.time(), False, False)

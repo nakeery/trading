@@ -78,6 +78,7 @@ interface Liq {
   oi: number
   as_of_str: string
   stale?: boolean
+  rth?: boolean
 }
 
 export function SecOptions({ p }: { p: Payload }) {
@@ -91,7 +92,9 @@ export function SecOptions({ p }: { p: Payload }) {
       <GaugeTable gauges={ctx.gauges} groups={['OPTIONS', 'VOL', 'MARKET']} />
       {liq && (
         <Caption>
-          options liquidity: {liq.grade}  (ATM spread {spr}, OI {liq.oi.toLocaleString()}) —
+          {/* S74: rth === false → after-hours quotes, spreads mechanically wide — no grade */}
+          options liquidity: {liq.rth === false ? 'n/a — quoted after hours, spreads unreliable' : liq.grade}
+          {'  '}(ATM spread {spr}, OI {liq.oi.toLocaleString()}) —
           as of {liq.as_of_str}{liq.stale ? '  (stale)' : ''}
         </Caption>
       )}

@@ -148,6 +148,25 @@ def _rehydrate(rows):
     return out
 
 
+def rehydrate_blocks(blocks, today=None):
+    """Public sibling of _rehydrate for cached per-expiry dicts (volquote/callquote/gex serve-stale
+    paths, S74): recompute each block's `dte` from its `expiry` vs today and DROP expired blocks
+    (dte < 0) — a cache served after its expiry passed must not present dead contracts as live.
+    Blocks without a parseable expiry are kept as-is. Never raises."""
+    today = today or datetime.date.today()
+    out = []
+    for b in blocks or []:
+        b = dict(b)
+        try:
+            b["dte"] = (datetime.date.fromisoformat(str(b["expiry"])) - today).days
+            if b["dte"] < 0:
+                continue
+        except Exception:
+            pass
+        out.append(b)
+    return out
+
+
 # ─────────────────────────────────────────
 # LABEL — same bands as entry.py OPTIONS-MARKET CHECK
 # ─────────────────────────────────────────
@@ -293,9 +312,10 @@ def gather_pc_oi(ticker, preset="all", monthly=False, interactive=False, data_di
     """Resolve a tenor preset and return {ticker, price, rows, total, scope, as_of, as_of_str,
     age_str, stale, cached} — or None on no token / no data. Cached per (ticker, scope) under
     data/pc_oi_cache/; re-fetches only when a market close has occurred since the cache
-    (session-stale). When stale: prompts to refresh if `interactive` (a TTY), else serves the cached
-    rows with stale=True. `force=True` (lens --live) skips the cache/prompt and fetches fresh —
-    option volume moves intraday. Best-effort: never raises; a fetch failure falls back to any cache."""
+    (session-stale). Stale caches AUTO-REFRESH (S74 — the [y/N] prompt is gone; `interactive` is
+    accepted for back-compat and unused). `force=True` (lens --live) skips the cache and fetches
+    fresh — option volume moves intraday. Best-effort: never raises; a fetch failure falls back to
+    any cache (stale=True flags it)."""
     if not TRADIER_TOKEN or TRADIER_TOKEN == "YOUR_TOKEN_HERE":
         return None
     scope    = " · ".join([preset] + (["monthly"] if monthly else []))
@@ -308,17 +328,7 @@ def gather_pc_oi(ticker, preset="all", monthly=False, interactive=False, data_di
                 "scope": scope, "as_of": as_of, "as_of_str": _hhmm(as_of),
                 "age_str": _cache_age(as_of), "stale": is_stale, "cached": cached}
 
-    refresh = cache is None or force                       # first time / forced → fetch (no prompt)
-    if not force and cache is not None and stale:
-        if interactive:
-            try:
-                ans = input(f"  {ticker} put/call OI cached {_cache_age(cache['as_of'])}; a market "
-                            f"close has passed — refresh from Tradier? [y/N]: ")
-                refresh = ans.strip().lower().startswith("y")
-            except EOFError:
-                refresh = False
-        else:
-            refresh = False                                # piped → serve cached (stale flag set)
+    refresh = cache is None or force or stale              # stale → auto-refresh (prompts removed, S74)
 
     if not refresh and cache is not None:
         return _result(cache.get("price"), _rehydrate(cache["rows"]), cache["as_of"], stale, True)

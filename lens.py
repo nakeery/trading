@@ -924,8 +924,12 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         if liq:
             spr = f"{liq['spread_pct']:.1%}" if liq.get("spread_pct") is not None else "n/a"
             stale_s = "  (stale)" if liq.get("stale") else ""
-            print(f"    options liquidity: {liq['grade']}  (ATM spread {spr}, OI {liq['oi']:,}) "
-                  f"— as of {liq['as_of_str']}{stale_s}")
+            if liq.get("rth") is False:      # S74: post-close spreads are mechanically wide — no grade
+                print(f"    options liquidity: n/a — quoted after hours, spreads unreliable "
+                      f"(ATM spread {spr}, OI {liq['oi']:,}) — as of {liq['as_of_str']}{stale_s}")
+            else:
+                print(f"    options liquidity: {liq['grade']}  (ATM spread {spr}, OI {liq['oi']:,}) "
+                      f"— as of {liq['as_of_str']}{stale_s}")
         print(f"    NET: {ctx['net']}")
 
     # 6a. SHORT POSITIONING / SQUEEZE (--squeeze; S41 — fuel context, not an ignition forecast)
@@ -1068,7 +1072,8 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
                 return f"{s}${a / 1e6:.0f}m"
             return f"{s}${a / 1e3:.0f}k"
 
-        _hdr = f"(≤{max(e['dte'] for e in gex['expiries'])}d, {len(gex['expiries'])} expiries)"
+        _hdr = (f"(≤{max(e['dte'] for e in gex['expiries'])}d, {len(gex['expiries'])} expiries)"
+                if gex.get("expiries") else "(cached expiries all expired)")
         if gex.get("as_of_str"):
             _hdr += f" · as of {gex['as_of_str']}" + ("  (stale)" if gex.get("stale") else "")
         _section(f"GAMMA EXPOSURE — dealer positioning, Tradier chain  {_hdr}", color)
@@ -1086,13 +1091,15 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         if segs:
             print(f"    {'  ·  '.join(segs)}")
         mp = gex.get("max_pain")
-        if mp:
+        if mp and (mp.get("dte") is None or mp["dte"] >= 0):   # an expired max pain is dead data (S74)
             print(f"    max pain ({mp['expiry']}, {mp['dte']}d): {mp['strike']:g}")
         if gex.get("unusual"):
             ua = " · ".join(f"{u['strike']:g}{u['type'][0]} "
                             + (f"×{u['ratio']:.1f} OI" if u["ratio"] is not None else "NEW")
                             + f" (vol {u['volume']:,})" for u in gex["unusual"])
-            print(f"    unusual activity today: {ua}")
+            # "today" is only true for a fresh fetch — a served-stale cache's volume is old (S74)
+            ua_when = (f"(as of {gex.get('as_of_str', '?')}, stale)" if gex.get("stale") else "today")
+            print(f"    unusual activity {ua_when}: {ua}")
         print(f"    · assumes dealers long calls / short puts (standard convention) — real "
               f"inventory unknown")
         print(f"    · OI settles once daily (start-of-day) — intraday flow shifts walls first")
@@ -1112,7 +1119,9 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
             print(line)
         if eg and eg.get("date"):
             hm = f", typ. ±{eg['hist_move']:.1%}" if eg.get("hist_move") else ""
-            print(f"    earnings: {eg['date']} ({eg['days']}d{hm})")
+            est = ", est — cadence" if eg.get("est") else ""       # S74: unconfirmed date labeled
+            pre = "~" if eg.get("est") else ""
+            print(f"    earnings: {pre}{eg['date']} ({eg['days']}d{hm}{est})")
         hist = vol.get("history")
         if hist and hist.get("status") == "ok":
             print(f"    history ({hist['usable']} earnings): {hist['summary']}")
@@ -1204,8 +1213,12 @@ def print_report(ticker, reads, divs, summary, profile, notes, last_bar=None, as
         cliq = callq.get("liquidity")
         if cliq:
             spr = f"{cliq['spread_pct']:.1%}" if cliq.get("spread_pct") is not None else "n/a"
-            print(f"    chain liquidity: {cliq['grade'].upper()}  (ATM-region spread {spr}, "
-                  f"OI {cliq['oi']:,}, day vol {cliq['volume']:,})")
+            if cliq.get("rth") is False:     # S74: after-hours quotes → no confident grade
+                print(f"    chain liquidity: n/a — quoted after hours, spreads unreliable "
+                      f"(ATM-region spread {spr}, OI {cliq['oi']:,}, day vol {cliq['volume']:,})")
+            else:
+                print(f"    chain liquidity: {cliq['grade'].upper()}  (ATM-region spread {spr}, "
+                      f"OI {cliq['oi']:,}, day vol {cliq['volume']:,})")
 
         def _callln(kind, c):
             if not c:
@@ -1488,6 +1501,13 @@ def _refresh_indicators(ticker, data_dir):
             tail = ((r.stderr or r.stdout or "").strip().splitlines() or [""])[-1]
             print(f"    refresh failed for {ticker} — using existing data ({tail})")
             return False
+        # S74: a returncode-0 run can still have a silently degraded harvest (the Massive 403
+        # went unseen for a month because capture_output swallowed the warnings). Re-emit the
+        # harvest-health lines so they reach the CLI and the web preamble.
+        for ln in (r.stdout or "").splitlines():
+            if any(k in ln for k in ("WARNING", "Massive auth rejected", "Massive chain",
+                                     "IV harvest", "Tradier fallback", "IV fetch failed")):
+                print(f"    {ln.strip()}")
         return True
     except Exception as e:
         print(f"    refresh skipped for {ticker} ({type(e).__name__}) — using existing data")
@@ -1661,7 +1681,7 @@ def gather_report(ticker, args, interactive, backdrop_base):
             if pc is None:
                 notes.append("put/call OI unavailable (no Tradier token or no chain data).")
             elif pc.get("cached") and pc.get("stale"):
-                notes.append(f"put/call OI cached {pc['age_str']} and stale — run in a terminal to refresh.")
+                notes.append(f"put/call OI: Tradier refresh failed — showing cache from {pc['age_str']}.")
 
     # GAMMA EXPOSURE (--gex; S56) — dealer positioning off the live chain, cached like pc-oi.
     gex = None
@@ -1675,7 +1695,8 @@ def gather_report(ticker, args, interactive, backdrop_base):
             if gex is None:
                 notes.append("gamma exposure unavailable (no Tradier token or no chain data).")
             elif gex.get("cached") and gex.get("stale"):
-                notes.append(f"gamma exposure cached {gex['age_str']} and stale — run in a terminal to refresh.")
+                notes.append(f"gamma exposure: Tradier refresh failed — showing cache from {gex['age_str']} "
+                             f"(expired expiries dropped).")
 
     # earnings date — shared by the --vol block and the SETUP CHECK (S41)
     earn = None
@@ -1691,7 +1712,8 @@ def gather_report(ticker, args, interactive, backdrop_base):
                 fut = [e for e in eds if e >= asof_ts]
                 if fut and (fut[0] - asof_ts).days <= 120:
                     earn = {"date": fut[0].date().isoformat(),
-                            "days": int((fut[0] - asof_ts).days), "hist_move": None}
+                            "days": int((fut[0] - asof_ts).days), "hist_move": None,
+                            "est": False}
             except Exception:
                 earn = None
     elif next_earnings is not None:
@@ -1713,13 +1735,19 @@ def gather_report(ticker, args, interactive, backdrop_base):
     # harvest is UNRECOVERABLE for the vol study (Massive history is trades-only — thin names
     # can't be backfilled). Surface a missing harvest the same day instead of post-print.
     # (Current-data check — meaningless against a historical as-of.)
-    if asof_ts is None and earn and earn.get("days") is not None and 0 <= earn["days"] <= 10:
+    if (asof_ts is None and earn and earn.get("days") is not None
+            and earn["days"] <= 10 and (earn.get("est") or earn["days"] >= 0)):
         try:
             _csv = os.path.join(args.data_dir, f"{ticker.lower()}_indicators.csv")
             _iv = pd.read_csv(_csv, index_col=0, parse_dates=True)["atm_iv_30d"].dropna()
             _last_iv = _iv.index.max() if len(_iv) else None
             if _last_iv is None or pd.Timestamp(_last_iv).normalize() < _expected_last_session():
-                notes.append(f"earnings in {earn['days']}d and the latest session's IV harvest is "
+                # S74: an est-imminent print (yfinance list has no future date but cadence says
+                # one is due — days may sit slightly negative inside the grace window) is
+                # precisely when a missing harvest matters most.
+                when = (f"earnings likely due (~{earn['date']} est)" if earn.get("est")
+                        else f"earnings in {earn['days']}d")
+                notes.append(f"{when} and the latest session's IV harvest is "
                              f"missing — run `indicators.py --ticker {ticker}` (missed pre-earnings "
                              f"sessions cannot be backfilled).")
         except Exception:
@@ -1759,7 +1787,11 @@ def gather_report(ticker, args, interactive, backdrop_base):
             vol = {"squeeze": squeeze, "em": em, "earnings": earn,
                    "setup": vol_setup(reads, squeeze, ctx, earnings=earn, em=em,
                                       macro_days=macro_t1),
-                   "quote": (straddle_quote(ticker, earnings_date=(earn or {}).get("date"),
+                   # S74: a cadence-ESTIMATED date must never anchor "post-earnings" expiries —
+                   # a ±few-day estimate can label a pre-earnings weekly as post-earnings.
+                   "quote": (straddle_quote(ticker,
+                                            earnings_date=((earn or {}).get("date")
+                                                           if not (earn or {}).get("est") else None),
                                             interactive=interactive,
                                             data_dir=args.data_dir,
                                             force=args.live)
@@ -1769,12 +1801,19 @@ def gather_report(ticker, args, interactive, backdrop_base):
                                if pre_earnings_vol_study and asof_ts is None else None)}
         except Exception as e:
             notes.append(f"vol setup unavailable ({type(e).__name__}).")
+        else:
+            vq = (vol or {}).get("quote")
+            if vq and vq.get("cached") and vq.get("stale"):   # S74: the missing straddle stale note
+                notes.append(f"straddle quote: Tradier refresh failed — showing cache from {vq['age_str']}.")
 
     # LONG CALL VIABILITY (--call; S46) — the directional instrument's carry math, cached.
     callq = None
     if args.call and asof_ts is None and call_quote is not None:
         try:
-            callq = call_quote(ticker, earnings_date=(earn or {}).get("date"),
+            # S74: estimated dates don't drive the per-expiry crush-risk notes (see straddle note)
+            callq = call_quote(ticker,
+                               earnings_date=((earn or {}).get("date")
+                                              if not (earn or {}).get("est") else None),
                                ex_div_date=(exd or {}).get("date"),
                                interactive=interactive, data_dir=args.data_dir,
                                force=args.live)
@@ -1784,7 +1823,7 @@ def gather_report(ticker, args, interactive, backdrop_base):
             if callq is None:
                 notes.append("call viability unavailable (no Tradier token or no chain data).")
             elif callq.get("cached") and callq.get("stale"):
-                notes.append(f"call quote cached {callq['age_str']} and stale — run in a terminal to refresh.")
+                notes.append(f"call quote: Tradier refresh failed — showing cache from {callq['age_str']}.")
 
     # chain liquidity grade (S46) — default-on, ZERO network: reads the freshest --call cache.
     # The cache is a TODAY snapshot → omitted in as-of mode.

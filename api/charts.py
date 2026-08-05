@@ -208,7 +208,7 @@ def event_markers(p, horizon_days=EVENT_HORIZON_D):
     earn = p.get("earn")
     if earn and earn.get("date") and earn.get("days") is not None \
             and 0 <= earn["days"] <= horizon_days:
-        out.append((earn["date"], "earnings", "#e0a63a"))
+        out.append((earn["date"], "earnings" + ("~" if earn.get("est") else ""), "#e0a63a"))
     exd = p.get("exd")
     if exd and exd.get("date") and exd.get("days") is not None \
             and 0 <= exd["days"] <= horizon_days:

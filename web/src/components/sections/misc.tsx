@@ -262,8 +262,8 @@ export function SecSectors({ p }: { p: Payload }) {
 const TIER1 = new Set(['FOMC', 'CPI', 'NFP', 'PCE'])
 const EVENTS_HORIZON = 30
 
-interface EarnLike { date?: string | null; days?: number | null }
-interface ExdLike extends EarnLike { est?: boolean }
+interface EarnLike { date?: string | null; days?: number | null; est?: boolean }
+interface ExdLike extends EarnLike {}
 
 /** Mirrors SecEvents' render-vs-null decision — the nav must not link a section that
  *  renders nothing (e.g. earnings 60d out, no catalysts, macro cache empty). Keep in
@@ -310,7 +310,8 @@ export function SecEvents({ p }: { p: Payload }) {
     })
   }
   if (earn?.days != null && earn.days <= EVENTS_HORIZON) {
-    events.push({ label: 'earnings', days: earn.days, date: earn.date ?? undefined, color: AMBER })
+    // S74: est = cadence-estimated date (yfinance has no future date) — the ex-div '~' convention
+    events.push({ label: `earnings${earn.est ? '~' : ''}`, days: earn.days, date: earn.date ?? undefined, color: AMBER })
   } else if (earn?.days != null) beyond += 1
   if (exd?.days != null && exd.days <= EVENTS_HORIZON) {
     events.push({ label: `ex-div${exd.est ? '~' : ''}`, days: exd.days, date: exd.date ?? undefined, color: GRAY })

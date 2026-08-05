@@ -23,7 +23,8 @@ import os
 import time
 
 from modules.tradier import TRADIER_TOKEN, get_current_price, get_expirations, get_chain
-from modules.pc_oi import _cache_path, cache_stale, _cache_age, _hhmm, is_monthly_expiry
+from modules.pc_oi import _cache_path, cache_stale, _cache_age, _hhmm, is_monthly_expiry, \
+    rehydrate_blocks
 from modules.bs_invert import bs_gamma
 
 SCOPEKEY = "gex1"        # bump when the cached payload shape changes
@@ -257,30 +258,39 @@ def _wrap(payload, as_of, stale, cached):
     return out
 
 
+def _rehydrate_gex(payload):
+    """Recompute a cached payload's date-derived fields vs today (S74 — served-stale safety net):
+    expiries/unusual entries get fresh dtes and expired ones are DROPPED; max_pain keeps its
+    (possibly negative) recomputed dte so the renderer can annotate it as expired. Never raises."""
+    p = dict(payload)
+    p["expiries"] = rehydrate_blocks(p.get("expiries"))
+    p["unusual"] = rehydrate_blocks(p.get("unusual"))
+    mp = p.get("max_pain")
+    if mp:
+        mp = dict(mp)
+        try:
+            mp["dte"] = (datetime.date.fromisoformat(str(mp["expiry"])) - datetime.date.today()).days
+        except Exception:
+            pass
+        p["max_pain"] = mp
+    return p
+
+
 def gather_gex(ticker, interactive=False, data_dir="data", force=False):
     """Dealer GEX snapshot for `ticker` off the live Tradier chain (expiries ≤ MAX_DTE, capped).
-    Cached session-stale like pc-oi (TTY-gated refresh; `force=True` under lens --live skips
-    the cache). Returns the payload dict (+ as_of/as_of_str/age_str/stale/cached) or None
-    (no token / no chain). Best-effort: never raises."""
+    Cached session-stale like pc-oi; stale caches AUTO-REFRESH (S74 — `interactive` accepted for
+    back-compat, unused; `force=True` under lens --live skips the cache). Returns the payload dict
+    (+ as_of/as_of_str/age_str/stale/cached) or None (no token / no chain). Best-effort: never
+    raises; a fetch failure serves the cache rehydrated (expired entries dropped)."""
     if not TRADIER_TOKEN or TRADIER_TOKEN == "YOUR_TOKEN_HERE":
         return None
     cache = _load(ticker, data_dir)
     stale = cache is not None and cache_stale(cache)
 
-    refresh = cache is None or force
-    if not force and cache is not None and stale:
-        if interactive:
-            try:
-                ans = input(f"  {ticker} GEX cached {_cache_age(cache['as_of'])}; a market "
-                            f"close has passed — refresh from Tradier? [y/N]: ")
-                refresh = ans.strip().lower().startswith("y")
-            except EOFError:
-                refresh = False
-        else:
-            refresh = False
+    refresh = cache is None or force or stale              # stale → auto-refresh (prompts removed, S74)
 
     if not refresh and cache is not None:
-        return _wrap(cache["gex"], cache["as_of"], stale, True)
+        return _wrap(_rehydrate_gex(cache["gex"]), cache["as_of"], stale, True)
 
     print(f"  gex: fetching {ticker} chains from Tradier…")
     try:
@@ -289,7 +299,7 @@ def gather_gex(ticker, interactive=False, data_dir="data", force=False):
         payload = None
     if payload is None:
         if cache is not None:
-            return _wrap(cache["gex"], cache["as_of"], stale, True)
+            return _wrap(_rehydrate_gex(cache["gex"]), cache["as_of"], stale, True)
         return None
     _save(ticker, data_dir, payload)
     return _wrap(payload, time.time(), False, False)

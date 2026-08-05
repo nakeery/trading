@@ -283,7 +283,18 @@ def setup_check(reads, profile=None, ctx=None, earn=None, macro_tier1_days=None,
     # 7. catalyst timing — flagged, not failed: sitting on a print may be intentional (vol plays)
     parts, mark = [], "✓"
     if earn and earn.get("days") is not None:
-        if 0 <= earn["days"] <= EARN_FLAG_DAYS:
+        if earn.get("est"):
+            # S74: the date is a cadence ESTIMATE — yfinance has no future date but the past
+            # prints say one is due. Near the estimate (incl. slightly past — the grace window)
+            # this is exactly the blind spot the row exists to catch; never a confident ✓.
+            if earn["days"] <= EARN_FLAG_DAYS:
+                mark = "–"
+                last = (f"last confirmed print {earn['last_days']}d ago, "
+                        if earn.get("last_days") is not None else "")
+                parts.append(f"earnings date unavailable — {last}next ~{earn.get('date')} (est)")
+            else:
+                parts.append(f"earnings ~{earn['days']}d out (est)")
+        elif 0 <= earn["days"] <= EARN_FLAG_DAYS:
             mark = "–"
             parts.append(f"earnings in {earn['days']}d ({earn.get('date')}) — inside the holding window")
         else:

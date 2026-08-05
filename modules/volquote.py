@@ -18,7 +18,8 @@ import time
 import datetime
 
 from modules.tradier import TRADIER_TOKEN, get_current_price, get_expirations, get_chain
-from modules.pc_oi import _cache_path, cache_stale, _cache_age, _hhmm, is_monthly_expiry
+from modules.pc_oi import _cache_path, cache_stale, _cache_age, _hhmm, is_monthly_expiry, \
+    rehydrate_blocks
 
 SCOPEKEY = "straddle7"       # bumped when the cached payload shape changes (no_bid combo flag, S43)
 EM_MULT = 1.0                # "auto" strangle wings at ±(EM_MULT × expected move); exp move = straddle/spot
@@ -225,29 +226,28 @@ def straddle_quote(ticker, target_dte=30, earnings_date=None, interactive=False,
     """ATM straddle + auto ±expected-move strangle off the live Tradier chain. When `earnings_date`
     (ISO 'YYYY-MM-DD') is within EARN_WINDOW days, anchors to POST-earnings expiries — the nearest
     one and the nearest post-earnings monthly when they differ — for a pre-earnings long-vol setup;
-    otherwise the near ~target_dte expiry. Cached per ticker (session-stale, TTY-gated refresh) like
-    pc-oi; `force=True` (lens --live) skips the cache/prompt and quotes fresh — option prices move
-    intraday. Returns the quote dict (spot/earn_days/quotes[…]/notes + as_of/as_of_str/age_str/stale/
-    cached) or None (no token / no data). Best-effort: never raises."""
+    otherwise the near ~target_dte expiry. Cached per ticker (session-stale) like pc-oi; stale
+    caches AUTO-REFRESH (S74 — `interactive` accepted for back-compat, unused); `force=True`
+    (lens --live) skips the cache and quotes fresh — option prices move intraday. Returns the
+    quote dict (spot/earn_days/quotes[…]/notes + as_of/as_of_str/age_str/stale/cached) or None
+    (no token / no data). Best-effort: never raises; a fetch failure serves the cache with dtes
+    rehydrated and expired expiries dropped."""
     if not TRADIER_TOKEN or TRADIER_TOKEN == "YOUR_TOKEN_HERE":
         return None
     cache = _load(ticker, data_dir)
     stale = cache is not None and cache_stale(cache)
 
-    refresh = cache is None or force
-    if not force and cache is not None and stale:
-        if interactive:
-            try:
-                ans = input(f"  {ticker} straddle quote cached {_cache_age(cache['as_of'])}; a market "
-                            f"close has passed — refresh from Tradier? [y/N]: ")
-                refresh = ans.strip().lower().startswith("y")
-            except EOFError:
-                refresh = False
-        else:
-            refresh = False
+    def _serve_cached():
+        q = dict(cache["quote"])
+        q["quotes"] = rehydrate_blocks(q.get("quotes"))
+        if not q["quotes"]:
+            return None
+        return _wrap(q, cache["as_of"], stale, True)
+
+    refresh = cache is None or force or stale              # stale → auto-refresh (prompts removed, S74)
 
     if not refresh and cache is not None:
-        return _wrap(cache["quote"], cache["as_of"], stale, True)
+        return _serve_cached()
 
     print(f"  straddle: fetching {ticker} chain from Tradier…")
     try:
@@ -256,7 +256,7 @@ def straddle_quote(ticker, target_dte=30, earnings_date=None, interactive=False,
         quote = None
     if quote is None or not quote.get("quotes"):
         if cache is not None:
-            return _wrap(cache["quote"], cache["as_of"], stale, True)
+            return _serve_cached()
         return None
     _save(ticker, data_dir, quote)
     return _wrap(quote, time.time(), False, False)

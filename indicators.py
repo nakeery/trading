@@ -29,6 +29,10 @@ from matplotlib.ticker import MaxNLocator, FuncFormatter
 
 from modules.massive import IV_COLS, get_chain_summary, get_event_iv, EVENT_EARN_WINDOW
 from modules.features import next_earnings
+try:                                            # S74: Tradier fallback for the IV harvest
+    from modules.iv_fallback import get_chain_summary_tradier
+except ImportError:
+    get_chain_summary_tradier = None
 
 # ─────────────────────────────────────────
 # CONFIG — adjust these to your preference
@@ -448,15 +452,23 @@ def harvest_iv_snapshot(df, ticker, csv_path):
         return df
     spot = float(spot_series.iloc[-1])
 
-    summary = get_chain_summary(ticker, spot)
+    summary, iv_source = get_chain_summary(ticker, spot), "massive"
     last_idx = df.index[-1]
+    if summary is None and get_chain_summary_tradier is not None:
+        # S74: Massive down (e.g. the 2026-07 snapshot-endpoint 403) → Tradier fallback.
+        # Same dict keys off Tradier smv_vol; the row is stamped iv_source="tradier" so the
+        # mixed vendor basis stays visible in every gauge that reads it.
+        print(f"  Massive chain unavailable — trying Tradier fallback for the IV harvest…")
+        summary, iv_source = get_chain_summary_tradier(ticker, spot), "tradier"
     if summary is None:
-        print(f"  WARNING: Massive chain unavailable — IV columns left NaN for {last_idx.date()}")
+        print(f"  WARNING: chain unavailable (Massive AND Tradier fallback) — IV columns left "
+              f"NaN for {last_idx.date()}")
         return df
 
     for k in IV_COLS:
         if k in summary:                        # event cols (S44) aren't in the chain summary —
             df.loc[last_idx, k] = summary.get(k)   # leave them for the event stamp below
+    df.loc[last_idx, "iv_source"] = iv_source
 
     skew_s = f"{summary['iv_skew_25d']:+.3f}" if summary["iv_skew_25d"] is not None else "n/a"
     term_s = f"{summary['term_structure']:.2f}" if summary["term_structure"] is not None else "n/a"
@@ -473,7 +485,10 @@ def harvest_iv_snapshot(df, ticker, csv_path):
     # thin names (CRSP) whose trades-based history can't be backfilled. Best-effort, never fatal.
     try:
         earn = next_earnings(ticker)
-        if earn and earn.get("days") is not None and 0 <= earn["days"] <= EVENT_EARN_WINDOW:
+        # S74: never stamp atm_iv_event off a cadence-ESTIMATED date — a ±few-day estimate can
+        # pick the wrong "post-earnings" expiry and pollute the vol study's tenor integrity.
+        if (earn and not earn.get("est") and earn.get("days") is not None
+                and 0 <= earn["days"] <= EVENT_EARN_WINDOW):
             ev = get_event_iv(ticker, spot, earn["days"])
             if ev:
                 for k, v in ev.items():

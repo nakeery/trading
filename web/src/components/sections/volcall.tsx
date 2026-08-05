@@ -50,7 +50,7 @@ function quoteCaveats(cb: ComboQuote): string[] {
 interface Vol {
   setup?: { net?: string; notes?: string[]; long_vol?: string[]; short_vol?: string[]; hint?: string } | null
   em?: { dte: number; pct: number; dollars: number; lo: number; hi: number; hv_pct?: number | null } | null
-  earnings?: { date?: string | null; days?: number; hist_move?: number | null } | null
+  earnings?: { date?: string | null; days?: number; hist_move?: number | null; est?: boolean } | null
   squeeze?: Record<string, { squeeze_on?: boolean }> | null
   history?: { status: string; usable?: number; summary?: string; ticker?: string } | null
   quote?: {
@@ -130,7 +130,9 @@ export function SecVol({ p }: { p: Payload }) {
       })()}
       {eg?.date && (
         <Caption>
-          earnings: {eg.date} ({eg.days}d{eg.hist_move ? `, typ. ±${(eg.hist_move * 100).toFixed(1)}%` : ''})
+          earnings: {eg.est ? '~' : ''}{eg.date} ({eg.days}d
+          {eg.hist_move ? `, typ. ±${(eg.hist_move * 100).toFixed(1)}%` : ''}
+          {eg.est ? ', est — cadence' : ''})
         </Caption>
       )}
       {hist?.status === 'ok' && <Caption>history ({hist.usable} earnings): {hist.summary}</Caption>}
@@ -232,7 +234,7 @@ interface CallQ {
   spot: number
   as_of_str: string
   stale?: boolean
-  liquidity?: { grade: string; spread_pct: number | null; oi: number; volume: number } | null
+  liquidity?: { grade: string; spread_pct: number | null; oi: number; volume: number; rth?: boolean } | null
   quotes: {
     expiry: string
     dte: number
@@ -294,7 +296,9 @@ export function SecCall({ p }: { p: Payload }) {
       <Caption>spot {cq.spot.toFixed(2)}, as of {cq.as_of_str}{cq.stale ? '  (stale)' : ''}</Caption>
       {cliq && (
         <Caption>
-          chain liquidity: {cliq.grade.toUpperCase()}  (ATM-region spread{' '}
+          {/* S74: rth === false → after-hours quotes, spreads mechanically wide — no grade */}
+          chain liquidity: {cliq.rth === false ? 'n/a — quoted after hours, spreads unreliable' : cliq.grade.toUpperCase()}
+          {'  '}(ATM-region spread{' '}
           {cliq.spread_pct != null ? `${(cliq.spread_pct * 100).toFixed(1)}%` : 'n/a'}, OI{' '}
           {cliq.oi.toLocaleString()}, day vol {cliq.volume.toLocaleString()})
         </Caption>

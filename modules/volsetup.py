@@ -111,7 +111,13 @@ def vol_setup(reads, squeeze, ctx, earnings=None, em=None, macro_days=None):
 
     # catalysts — an upcoming print is only a reason to BUY vol while it's still cheap; once IV
     # already ranks high the event premium is priced, so it becomes a note, not a factor (S40).
-    if earnings and earnings.get("days") is not None and 0 <= earnings["days"] <= 45:
+    # S74: a cadence-ESTIMATED date is never a verdict-moving "known vol catalyst" — the date is
+    # unconfirmed, so it demotes to a note (S43: no confident factor from uncertain data).
+    if (earnings and earnings.get("est")
+            and earnings.get("days") is not None and earnings["days"] <= 45):
+        notes.append(f"earnings likely ~{earnings['days']}d ({earnings['date']} est, cadence) — "
+                     f"date unconfirmed")
+    elif earnings and earnings.get("days") is not None and 0 <= earnings["days"] <= 45:
         hm = f", typ. ±{earnings['hist_move']:.1%}" if earnings.get("hist_move") else ""
         if iv_pct is not None and iv_pct >= IV_PCT_HIGH:
             notes.append(f"earnings in {earnings['days']}d ({earnings['date']}{hm}) but ATM IV already "
@@ -132,7 +138,8 @@ def vol_setup(reads, squeeze, ctx, earnings=None, em=None, macro_days=None):
 
 def _synthesize(long_v, short_v, earnings):
     nl, ns = len(long_v), len(short_v)
-    catalyst = bool(earnings and earnings.get("days") is not None and 0 <= earnings["days"] <= 45)
+    catalyst = bool(earnings and not earnings.get("est")            # S74: est ≠ confirmed catalyst
+                    and earnings.get("days") is not None and 0 <= earnings["days"] <= 45)
     if nl >= ns + 2:
         net = (f"conditions favor BUYING vol (long straddle/strangle): "
                f"{nl} long-vol vs {ns} short-vol factors")
